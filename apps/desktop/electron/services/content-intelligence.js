@@ -1,0 +1,464 @@
+// @ts-check
+/**
+ * Content Intelligence — 跨平台内容情报引擎
+ *
+ * 基于 last30days 架构精简实现，提供面向发布者的社交情报功能。
+ *
+ * 功能：
+ *   1. search(query)       — 跨平台搜索主题讨论
+ *   2. searchTitles(title) — 标题优化（搜索同类标题互动数据）
+ *   3. searchMentions(keywords) — 发布后提及追踪
+ *
+ * 数据源（免费，无需 API Key）：
+ *   - Reddit: 公开 JSON API
+ *   - Hacker News: Algolia API
+ *   - GitHub: Issues/Releases API（60 req/h 未认证足够 MVP）
+ *
+ * ⛔ 三个源检索的都是**正文**而非标题。相关性门禁（search 出口）因此是
+ * 全引擎的硬约束，不是标题助手局部的补丁：实测中文视频标题查 GitHub issues
+ * 命中 3595 条、首条标题「旧文归档 · 2024 年 2 月」与查询零重叠。
+ *
+ * 架构重构（2026-07-16）：按职责拆分为 2 个 mixin，通过 Object.assign 注入 prototype。
+ *   - content-intelligence-sources.js   — 数据源 fetch 逻辑（_engagementScore / _search* / _fetch*Trending）
+ *   - content-intelligence-analysis.js  — 分析逻辑（_extractPatterns / _extractKeywords / suggestTags / findReferences / getBenchmark / getOptimalTime）
+ *
+ * 主文件保留核心方法：constructor / _getAxios / _getCached / _setCache / search / searchTitles /
+ * searchMentions / fetchTrending / saveImpactSnapshot / getImpactHistory / registerIpcHandlers
+ *
+ * 与 rpa-view-manager.js 和 store/index.js 的 mixin 模式一致，保证 require('./content-intelligence') 接口不变。
+ */
+const { tokenizeContentWords, sharesContentWord } = require('./content-intelligence-utils')
+const log = require('./logger')
+const EC = require('../core/error-codes').ERROR
+const { withSenderCheck } = require('../ipc-handlers/helpers')
+
+const sourcesMixin = require('./content-intelligence-sources')
+const analysisMixin = require('./content-intelligence-analysis')
+
+/**
+ * 「同类标题」可用的数据源白名单。
+ *
+ * GitHub 是代码托管站，其 issue 标题由仓库维护者书写（实测命中：Gitalk 演示仓库
+ * 置顶 issue「申请加入请在这里评论 （也可以直接发 Pull Request）」、
+ * 「Gitalk Demo」「ActNotify~>Bilibili」「Daily weather email」），
+ * 对内容创作者的标题优化没有任何参考价值，故标题助手不启用该源。
+ * 主题情报页（search 默认源）保留 GitHub —— 那里用户找的是"讨论"而非"标题"。
+ */
+const TITLE_SOURCES = ['reddit', 'hackernews']
+
+/**
+ * 提及追踪的相关性判据字段。
+ *
+ * ⚠️ 与标题助手**刻意不同**：别人转载/提到我的内容时，我的标题词通常出现在
+ * **正文**里而不是对方的标题里。若沿用只看 title 的判据，会把真实提及全部丢掉，
+ * totalMentions / topSource / topEngagement 随之静默少算。
+ */
+const MENTION_RELEVANCE_ON = ['title', 'snippet', 'author']
+
+class ContentIntelligence {
+  constructor (store) {
+    this._axios = null
+    this._searchCache = new Map()   // cacheKey -> { results, timestamp }
+    this._cacheTTL = 5 * 60 * 1000  // 5 minutes
+    this._store = store             // Store instance for impact tracking persistence
+  }
+
+  /**
+   * 注入 AIGenerator 实例（智能标签建议 LLM 生成使用）。
+   * 延迟注入避免与 AIGenerator 循环依赖。
+   * @param {object} aiGenerator
+   */
+  setAIGenerator (aiGenerator) {
+    this._aiGenerator = aiGenerator
+  }
+
+  _getAxios () {
+    if (!this._axios) {
+      this._axios = require('axios')
+    }
+    return this._axios
+  }
+
+  // ── Cache ───────────────────────────────────────────────────────
+
+  _getCached (key) {
+    const entry = this._searchCache.get(key)
+    if (entry && Date.now() - entry.timestamp < this._cacheTTL) {
+      return entry.results
+    }
+    return null
+  }
+
+  _setCache (key, results) {
+    // Limit cache size
+    if (this._searchCache.size > 50) {
+      const oldest = this._searchCache.keys().next().value
+      this._searchCache.delete(oldest)
+    }
+    this._searchCache.set(key, { results, timestamp: Date.now() })
+  }
+
+  // ── Main search ──────────────────────────────────────────────────
+
+  /**
+   * Search across all sources for a topic query.
+   * @param {string} query — Search keywords
+   * @param {object} [opts]
+   * @param {string[]} [opts.sources] — ['reddit','hackernews','github'] or subset
+   * @param {number} [opts.limit=10] — Results per source
+   * @param {boolean} [opts.noCache=false] — Skip cache
+   * @param {string[]} [opts.relevanceOn=['title']] — 相关性门禁看哪些字段
+   * @returns {Promise<object>} { results, sources, total }
+   */
+  async search (query, opts = {}) {
+    const sources = opts.sources || ['reddit', 'hackernews', 'github']
+    const limit = opts.limit || 10
+    // 门禁的判据字段是**按消费者**变化的（见 relevanceOn 注释），因此它必须进缓存键 ——
+    // 否则 searchMentions 与 searchTitles 用了同一个 query 就会互相串用对方的过滤结果。
+    const relevanceOn = (Array.isArray(opts.relevanceOn) && opts.relevanceOn.length > 0)
+      ? opts.relevanceOn
+      : ['title']
+    const cacheKey = `search:${query}:${sources.join(',')}:${limit}:${relevanceOn.join('+')}`
+
+    if (!opts.noCache) {
+      const cached = this._getCached(cacheKey)
+      if (cached) return cached
+    }
+
+    const tasks = []
+    if (sources.includes('reddit')) tasks.push(this._searchReddit(query, limit))
+    if (sources.includes('hackernews')) tasks.push(this._searchHN(query, limit))
+    if (sources.includes('github')) tasks.push(this._searchGitHub(query, limit))
+
+    let results = (await Promise.allSettled(tasks))
+      .flatMap(r => r.status === 'fulfilled' ? r.value : [])
+
+    // ── 相关性门禁 ────────────────────────────────────────────────
+    // 三个源检索的都是正文：判据字段与查询零重叠的结果不是"相关内容"，是噪声。
+    // 放在 sort 之前，保证按下标取 results[0] 的下游拿到的也是相关的。
+    // 查询本身切不出内容词时不设判据、原样放行（无判据可依不得改变既有语义）。
+    const queryTokens = new Set(tokenizeContentWords(query))
+    let droppedIrrelevant = 0
+    if (queryTokens.size > 0) {
+      const before = results.length
+      results = results.filter(r =>
+        relevanceOn.some(field => sharesContentWord(r[field], queryTokens)))
+      droppedIrrelevant = before - results.length
+      if (droppedIrrelevant > 0) {
+        // 只记计数与形状，**不记 query 原文**：searchTitles 的 query 就是用户的草稿标题，
+        // 是尚未发布的业务内容，而 logger 只脱敏凭证、不脱敏用户文本。
+        log.info('ContentIntelligence',
+          `relevance gate: dropped ${droppedIrrelevant}/${before} results ` +
+          `(queryLen=${String(query == null ? '' : query).length}, ` +
+          `tokens=${queryTokens.size}, on=${relevanceOn.join('+')})`)
+      }
+    }
+
+    // Sort by engagement
+    results.sort((a, b) => b.engagement - a.engagement)
+
+    // Dedup by title (fuzzy same-title detection)
+    const seen = new Set()
+    const deduped = []
+    for (const r of results) {
+      // 兜底空标题：门禁在「查询切不出内容词」时按设计跳过判据，此时 title 缺失的
+      // 结果会一路走到这里（utils 的 deduplicateResults 本就有该兜底，内联版此前没有）。
+      const key = (r.title || '').slice(0, 40).toLowerCase().trim()
+      if (!seen.has(key)) {
+        seen.add(key)
+        deduped.push(r)
+      }
+    }
+
+    const output = {
+      query,
+      sources: sources.filter(s => {
+        if (s === 'reddit') return sources.includes('reddit')
+        if (s === 'hackernews') return sources.includes('hackernews')
+        if (s === 'github') return sources.includes('github')
+        return true
+      }),
+      total: deduped.length,
+      // 被相关性门禁判为"正文命中但标题不相关"而剔除的条数。渲染层用它区分
+      // 「一个源都没响应」与「有结果但都不算同类」，两者给用户的解释不同。
+      droppedIrrelevant,
+      results: deduped.slice(0, limit * 2),
+      timestamp: new Date().toISOString(),
+    }
+
+    this._setCache(cacheKey, output)
+    return output
+  }
+
+  // ── Title assistant: search for similar titles ───────────────────
+  //
+  // Takes the draft title and searches for similar content.
+  // Returns engagement data for similar titles to guide optimization.
+  //
+  // 源域比通用 search() 窄：GitHub 的 issue 标题是仓库维护产物，不是内容标题
+  // （见 TITLE_SOURCES 注释里的实测命中），放进「高互动参考」等于给用户看垃圾。
+
+  async searchTitles (title, opts = {}) {
+    // Use the title itself as the query
+    const result = await this.search(title, {
+      ...opts,
+      sources: opts.sources || TITLE_SOURCES,
+      limit: 6,
+    })
+
+    // Extract key patterns
+    const patterns = this._extractPatterns(result.results)
+
+    return {
+      ...result,
+      titleAnalysis: {
+        patterns,
+        suggestion: this._generateTitleSuggestion(title, patterns),
+      }
+    }
+  }
+
+  // ── Mention tracking (post-publish impact) ────────────────────────
+  //
+  // Search for mentions of published content across platforms.
+
+  async searchMentions (keywords, opts = {}) {
+    // keywords can be: title + brand name + author name
+    // 判据放宽到正文/作者：真实提及往往只在对方正文里出现我的词（见 MENTION_RELEVANCE_ON）
+    const result = await this.search(keywords, {
+      ...opts,
+      relevanceOn: opts.relevanceOn || MENTION_RELEVANCE_ON,
+      limit: 8,
+    })
+
+    // After T+24h, mark vs earlier results for trend direction
+    return {
+      ...result,
+      analysis: {
+        totalMentions: result.total,
+        topSource: result.results[0]?.source || null,
+        topEngagement: result.results[0]?.engagement || 0,
+        sentiment: 'unknown',  // would need LLM for real sentiment
+      }
+    }
+  }
+
+  // ── Impact tracking persistence ──────────────────────────────────
+
+  /**
+   * Save an impact snapshot for a published article.
+   * Called after publish, then at T+1h / T+24h / T+72h intervals.
+   */
+  async saveImpactSnapshot (articleId, title, keywords, snapshot) {
+    if (!this._store || !this._store._ready) return false
+    try {
+      this._store.db.prepare(`
+        INSERT INTO impact_snapshots (article_id, title, keywords, total_mentions, top_source, top_engagement, snapshot_data, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      `).run(
+        articleId,
+        title,
+        JSON.stringify(keywords),
+        snapshot.total || 0,
+        snapshot.results?.[0]?.source || '',
+        snapshot.results?.[0]?.engagement || 0,
+        JSON.stringify(snapshot)
+      )
+      return true
+    } catch (e) {
+      log.error('ContentIntelligence', `saveImpactSnapshot error: ${e.message}`)
+      return false
+    }
+  }
+
+  /**
+   * Get impact history for a published article.
+   */
+  getImpactHistory (articleId) {
+    if (!this._store || !this._store._ready) return []
+    try {
+      return this._store.db.prepare(
+        'SELECT * FROM impact_snapshots WHERE article_id = ? ORDER BY checked_at ASC'
+      ).all(articleId)
+    } catch (e) {
+      log.error('ContentIntelligence', `getImpactHistory error: ${e.message}`)
+      return []
+    }
+  }
+
+  /**
+   * Fetch trending content across sources — no keyword filter.
+   * @param {object} [opts]
+   * @param {string[]} [opts.sources] — Default all
+   * @param {number} [opts.limit=10] — Per source
+   * @returns {Promise<object>} Grouped by source + merged sorted
+   */
+  async fetchTrending (opts = {}) {
+    const sources = opts.sources || ['reddit', 'hackernews', 'github']
+    const limit = opts.limit || 10
+    const cacheKey = `trending:${sources.join(',')}:${limit}`
+
+    const cached = this._getCached(cacheKey)
+    if (cached) return cached
+
+    const tasks = []
+    if (sources.includes('reddit')) tasks.push(this._fetchRedditTrending(limit))
+    if (sources.includes('hackernews')) tasks.push(this._fetchHNTrending(limit))
+    if (sources.includes('github')) tasks.push(this._fetchGitHubTrending(limit))
+
+    const allResults = (await Promise.allSettled(tasks))
+      .flatMap(r => r.status === 'fulfilled' ? r.value : [])
+
+    allResults.sort((a, b) => b.engagement - a.engagement)
+
+    const seen = new Set()
+    const deduped = []
+    for (const r of allResults) {
+      const key = r.title.slice(0, 40).toLowerCase().trim()
+      if (!seen.has(key)) { seen.add(key); deduped.push(r) }
+    }
+
+    // Group by source for the frontend panel
+    const bySource = {}
+    for (const r of deduped) {
+      if (!bySource[r.source]) bySource[r.source] = []
+      bySource[r.source].push(r)
+    }
+
+    const output = {
+      total: deduped.length,
+      results: deduped.slice(0, limit * 3),
+      bySource,
+      timestamp: new Date().toISOString(),
+    }
+
+    this._setCache(cacheKey, output)
+    return output
+  }
+
+  // ── IPC Handlers ─────────────────────────────────────────────────
+
+  registerIpcHandlers (injectedIpcMain) {
+    // P1-14：必须注入 access-controlled ipcMain（createAccessControlledIpcMain）。
+    // 禁止回退全局 ipcMain —— 那会同时绕过 isTrustedSender 来源校验与许可证/权益门禁，
+    // 且在纯 Node（单测）下退化成无信息量的 TypeError。未注入即 fail-closed 抛错。
+    if (!injectedIpcMain) {
+      throw new Error('[IPC] content-intelligence registerIpcHandlers 需要注入受控 ipcMain（禁止使用全局 ipcMain）');
+    }
+    const ipcMain = injectedIpcMain;
+    // R52 修复：所有 handler 统一为 { code, data, message } 格式
+    // Search for topic intelligence (方案 A)
+    ipcMain.handle('intelligence:search', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { query, opts } = arg
+      try {
+        return { code: 0, data: await this.search(query, opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: { results: [], total: 0 } }
+      }
+    })
+
+    // Title assistant search (方案 B)
+    ipcMain.handle('intelligence:search-titles', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { title, opts } = arg
+      try {
+        return { code: 0, data: await this.searchTitles(title, opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: { results: [], total: 0 } }
+      }
+    })
+
+    // Impact tracking — save snapshot (方案 C)
+    ipcMain.handle('intelligence:save-impact', withSenderCheck(async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { articleId, title, keywords, snapshot } = arg
+      try {
+        const ok = await this.saveImpactSnapshot(articleId, title, keywords, snapshot)
+        return { code: 0, data: ok }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: false }
+      }
+    }))
+
+    // Impact tracking — get history (方案 C)
+    ipcMain.handle('intelligence:get-impact', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { articleId } = arg
+      try {
+        return { code: 0, data: this.getImpactHistory(articleId) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: [] }
+      }
+    })
+
+    // Impact tracking — search mentions (方案 C)
+    ipcMain.handle('intelligence:search-mentions', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { keywords, opts } = arg
+      try {
+        return { code: 0, data: await this.searchMentions(keywords, opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: { results: [], total: 0 } }
+      }
+    })
+    // ── Trending Discovery ────────────────────────────────────────
+    ipcMain.handle('intelligence:fetch-trending', async (event, opts) => {
+      try {
+        return { code: 0, data: await this.fetchTrending(opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: { results: [], total: 0 } }
+      }
+    })
+
+    // ── Smart Tag Suggestion ─────────────────────────────────────
+    ipcMain.handle('intelligence:suggest-tags', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { content, opts } = arg
+      try {
+        return { code: 0, data: await this.suggestTags(content, opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: { keywords: [], byPlatform: {} } }
+      }
+    })
+
+    // ── Reference Finder ─────────────────────────────────────────
+    ipcMain.handle('intelligence:find-references', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { text, opts } = arg
+      try {
+        return { code: 0, data: await this.findReferences(text, opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: { references: [], total: 0 } }
+      }
+    })
+
+    // ── Benchmark ────────────────────────────────────────────────
+    ipcMain.handle('intelligence:get-benchmark', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { title, opts } = arg
+      try {
+        return { code: 0, data: await this.getBenchmark(title, opts || {}) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: null }
+      }
+    })
+
+    // ── Optimal Time ─────────────────────────────────────────────
+    ipcMain.handle('intelligence:get-optimal-time', async (event, arg) => {
+      if (!arg || typeof arg !== 'object') return { code: EC.VALIDATION_ERROR, message: '缺少参数对象' }
+      const { keyword } = arg
+      try {
+        return { code: 0, data: await this.getOptimalTime(keyword) }
+      } catch (e) {
+        return { code: EC.REQUEST_ERROR, message: e.message, data: null }
+      }
+    })
+
+  }
+}
+
+// 把 2 个 mixin 方法注入 ContentIntelligence.prototype
+Object.assign(ContentIntelligence.prototype, sourcesMixin, analysisMixin)
+
+module.exports = ContentIntelligence

@@ -1,0 +1,320 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+    # tag(v*) 推送不受路径过滤影响（GitHub 官方行为），发布触发保留
+    paths-ignore:
+      # 文档/流程改动不触发 CI（清单与 .github/scripts/workflow-contract.test.js 的 CI_IGNORED_PATHS 保持同步）
+      - '01-docs/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.ccg/**'
+      - '.claude/**'
+      - '.hermes/**'
+      - '.agents/**'
+      - '.quality-rhythm/**'
+      - 'openspec/**'
+      - '.adversarial/**'
+      - 'scripts/gate-record-debt-ledger.json'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # --- docs-only 短路判定（change: docs-only-ci-shortcircuit；与 quality-gate.yml 同模式）---
+  # 红线不变：pull_request 触发级 paths-ignore 仍被 workflow-contract.test.js 禁止（PR #2151 死锁）。
+  # build job 的快速检查（冒烟/deps/circular/build Vue）对纯文档 PR 无意义 => job 级短路；
+  # job 内既有的 package-relevant 步骤级检测保留不动（管打包步骤，与本短路正交）。
+  # tag push（v*）是非 PR 事件 => 恒 false => 发布链路不变。
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # merge-base diff 需要完整历史
+
+      - name: Detect docs-only changes
+        id: classify
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs-only=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only=false (non-PR event: full run)"
+            exit 0
+          fi
+          BASE="${{ github.event.pull_request.base.sha }}"
+          node scripts/classify-docs-only.js --base="$BASE" --repo="$PWD"
+
+  build:
+    runs-on: windows-latest
+    needs: [changes]
+    # docs-only 短路：纯文档 PR 跳过（skipped 满足 required check；混合 PR 全量不变）
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 60
+    outputs:
+      package-relevant: ${{ steps.changes.outputs.package-relevant }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # merge-base diff 需要完整历史（Detect packaging-relevant changes）
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      # 打包相关性检测：PR 未触及主进程/依赖/打包配置时，跳过 30-60 分钟的
+      # Windows electron-builder 完整打包（QM-1 场景），快速检查照常执行。
+      # push(main/tag) 恒为打包相关，保证发布链路不变。
+      - name: Detect packaging-relevant changes
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "package-relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASE="${{ github.event.pull_request.base.sha }}"
+          # PR 同步后 base 可能落后于 main，用 merge-base 防止漏检
+          MERGE_BASE=$(git merge-base "$BASE" HEAD)
+          if git diff --name-only "$MERGE_BASE" HEAD -- \
+            'apps/desktop/electron/**' \
+            'apps/desktop/package.json' \
+            'packages/**' \
+            'config/**' \
+            'pnpm-lock.yaml' \
+            '.github/workflows/build.yml' | grep -q .; then
+            echo "package-relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "package-relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 让安装包文件名与 tag 版本号保持一致
+      # electron-builder 的 artifactName 模板用 package.json 的 version 字段
+      # 这里仅在 tag 触发时覆盖（bash 兼容 Windows/Linux runner）
+      - name: Release gate (version == tag + CHANGELOG 收口)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: node scripts/release-gate.mjs --tag "${{ github.ref_name }}"
+
+      - name: Sync package version with tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          # 根 package.json 是版本唯一真相源：先把根对齐到 tag，再同步到 apps/desktop
+          node -e "const fs=require('fs');const p='package.json';const t=fs.readFileSync(p,'utf8').replace(/\"version\":\s*\"[^\"]*\"/, '\"version\": \"'+process.env.VERSION+'\"');fs.writeFileSync(p,t);"
+          node scripts/sync-version.mjs
+          VERSION_AFTER=$(node -p "require('./apps/desktop/package.json').version")
+          echo "package version = ${VERSION_AFTER}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # electron@43 无 postinstall，先确保二进制就绪，避免启动冒烟的 require 链在 10s hook 内触发下载超时
+      - name: Ensure Electron binary
+        run: node scripts/ensure-electron.js
+
+      # 1. 启动冒烟测试 — 验证 require 路径、路由表、配置一致性
+      #    不依赖 Electron 运行时，在非 Electron 环境自动 mock
+      - name: Startup smoke test
+        run: pnpm --filter @multi-publish/desktop test:startup
+
+      # 2. 依赖声明一致性检查 — 检测未声明/未使用的 dependencies
+      - name: Dependency check
+        run: pnpm run check:deps
+
+      # 3. 循环依赖检查 — 防止模块间循环引用
+      - name: Circular dependency check
+        run: pnpm run check:circular
+
+      - name: Build Vue frontend
+        run: pnpm --filter @multi-publish/desktop build:vue
+
+      # 安装 Playwright Chromium 并捆绑到安装包（避免离线用户无法下载）
+      - name: Install Playwright chromium (bundled)
+        if: steps.changes.outputs.package-relevant == 'true'
+        shell: bash
+        run: |
+          cd apps/desktop
+          mkdir -p .playwright-browsers
+          PLAYWRIGHT_BROWSERS_PATH=.playwright-browsers pnpm exec playwright install chromium
+
+      - name: Build Electron app (Windows)
+        if: runner.os == 'Windows' && steps.changes.outputs.package-relevant == 'true'
+        run: cd apps/desktop && pnpm exec electron-builder --win --x64 -p never
+        env:
+          NODE_OPTIONS: "--max_old_space_size=4096"
+
+      # 产物侧实证（#2702）：apps/desktop/package.json 的测试文件排除必须真的把单测挡在 app.asar 之外。
+      # quality-gate.yml Gate 2b 只守「声明还在」（静态读 build.files），对本步骤的失败模式完全失明 ——
+      # electron-builder 对 node_modules 另走依赖遍历收集，实测 462 条里有 44 条来自 node_modules，
+      # 把排除写窄成只管 electron 目录时静态检查看不出来，只有真清单能。
+      # 条件与打包步骤**逐字一致**：打包被跳过时本步骤也必须跳过，否则读不到产物会误红。
+      # 步骤名一并改名，因为现在它测的是整个 resources 目录，不只是 asar。
+      - name: Verify packaged resources contain no unit tests
+        if: runner.os == 'Windows' && steps.changes.outputs.package-relevant == 'true'
+        shell: bash
+        run: |
+          # 两条通道各一次：app.asar 与 asar 之外的 extraResources 松散树（#2765 实测后者曾带 189 个测试文件）。
+          # 必须是 bash 而不是 pwsh：一个 run 块里多条命令在 PowerShell 下不 fail-fast（见 scripts/check-step-failfast.js）。
+          node .github/scripts/check-asar-test-files.js --asar apps/desktop/dist-electron/win-unpacked/resources/app.asar
+          node .github/scripts/check-asar-test-files.js --resources apps/desktop/dist-electron/win-unpacked/resources
+
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows' && steps.changes.outputs.package-relevant == 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: Multi-Publish-Windows
+          path: apps/desktop/dist-electron/Multi-Publish*.exe
+          retention-days: 7
+
+      - name: Run film engineering E2E contract
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        run: node apps/desktop/tests/e2e/film-engineering-real.test.js
+
+      # 打包产物真实 E2E：覆盖电影工程入口/场景/分镜/详情/复制/导出/套用/方法论/生成
+      # L1+L2: 仅发布 tag 触发，并带进程级硬看门狗，防止 Electron 在 CI 虚拟环境僵尸化挂死整小时
+      - name: Run film engineering real E2E (release-only, with watchdog)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $e2eProcess = Start-Process -FilePath "pnpm.cmd" \
+            -ArgumentList "--filter", "@multi-publish/desktop", "test:e2e:film-engineering" \
+            -NoNewWindow -PassThru
+          $timeoutMs = 480000
+          $e2eProcess.WaitForExit($timeoutMs) | Out-Null
+          if (-not $e2eProcess.HasExited) {
+            Write-Host "::warning::Film engineering E2E hung after 480s, killing process tree"
+            taskkill /PID $e2eProcess.Id /T /F
+            exit 124
+          }
+          exit $e2eProcess.ExitCode
+        env:
+          FILM_E2E_OUTPUT: apps/desktop/tests/e2e/reports/film-engineering-real
+
+      - name: Upload film engineering E2E report
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: film-engineering-real-e2e
+          path: apps/desktop/tests/e2e/reports/film-engineering-real/**
+          if-no-files-found: warn
+          retention-days: 5
+
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows asset
+        uses: actions/download-artifact@v4
+        with:
+          name: Multi-Publish-Windows
+          path: release-assets
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          NOTES="## What's Changed in v${VERSION}"
+          printf -v NL '\n\n'
+          NOTES="${NOTES}${NL}Full changelog: https://github.com/${{ github.repository }}/compare/v${VERSION}...HEAD"
+          if [ -f CHANGELOG.md ]; then
+            # extract from "## [vX.Y.Z]" up to next "## [" section
+            CHUNK=$(awk -v ver="$VERSION" '
+              BEGIN { capture=0 }
+              /^## \[v/ {
+                if (index($0, "v"ver"]") > 0) { capture=1; next }
+                if (capture==1) { capture=0 }
+              }
+              capture==1 { print }
+            ' CHANGELOG.md)
+            if [ -n "$CHUNK" ]; then
+              NOTES=$(printf '%s\n\n%s' "$NOTES" "$CHUNK")
+            fi
+          fi
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Multi-Publish ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.notes }}
+          files: release-assets/*
+          draft: false
+          prerelease: false
+
+      # 同步 .exe 到 Gitee Release（国内加速，330MB 文件下载速度从 50KB/s → 5MB/s）
+      - name: Sync to Gitee Release
+        if: env.GITEE_TOKEN != ''
+        shell: bash
+        env:
+          GITEE_OWNER: ColinChiu007
+          GITEE_REPO: Multi-Publish
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          RELEASE_API="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases"
+
+          # 1) 确保 Gitee 仓库 release 存在
+          if release_json=$(curl -fsS "${RELEASE_API}/tags/${TAG}?access_token=${GITEE_TOKEN}"); then
+            echo "Gitee release ${TAG} already exists"
+          else
+            release_json=$(curl -fsS -X POST "${RELEASE_API}" \
+              -H "Content-Type: application/json" \
+              -d "{\"access_token\":\"${GITEE_TOKEN}\",\"tag_name\":\"${TAG}\",\"name\":\"Multi-Publish ${TAG}\",\"body\":\"Gitee mirror of https://github.com/${GITEE_OWNER}/${GITEE_REPO}/releases/tag/${TAG}\"}")
+          fi
+          release_id=$(printf '%s' "$release_json" | node -e "const fs=require('fs'); const release=JSON.parse(fs.readFileSync(0, 'utf8')); if (!release.id) throw new Error('Gitee release response missing id'); process.stdout.write(String(release.id));")
+
+          # 2) 上传构建产物；配置了 Gitee Token 时，上传失败必须阻塞发布
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found"
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            echo "Uploading ${asset} to Gitee"
+            curl -fsS -X POST "${RELEASE_API}/${release_id}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${asset}"
+          done
+          echo "Gitee sync completed"

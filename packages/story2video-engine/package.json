@@ -1,0 +1,24 @@
+{
+  "name": "@multi-publish/story2video-engine",
+  "version": "1.0.0",
+  "description": "Story2Video 核心视频合成引擎 - 从 Story2Video 提取的纯 TS 逻辑",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./template-library": "./src/template-library.ts",
+    "./effects-library": "./src/effects-library.ts",
+    "./subtitle-aligner": "./src/subtitle-aligner.ts",
+    "./subtitle-rules": "./subtitle-rules.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "segmentit": "^2.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

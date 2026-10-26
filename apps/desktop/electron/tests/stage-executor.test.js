@@ -1,0 +1,1515 @@
+// stage-executor + orchestrator mode tests
+import { describe, expect, it, vi } from 'vitest'
+
+const http = require('http')
+
+function eq(actual, expected, message) {
+  expect(actual, message).toEqual(expected)
+}
+
+function ok(value, message) {
+  expect(value, message).toBeTruthy()
+}
+
+const { StageExecutor, STAGE_TYPES, normalizeStageProgress } = require('../services/stage-executor');
+const { PipelineEngine } = require('../services/pipeline-engine');
+const PromptBridge = require('../services/prompt-bridge');
+const ServiceBus = require('../services/service-bus');
+
+// ---------- Mock ServiceBus ----------
+function makeMockServiceBus(overrides) {
+  const bus = {
+    splitText: vi.fn(async (text) => ({ code: 0, data: { sentences: text.split(/[。！？]/).filter(Boolean) } })),
+    optimizePrompt: vi.fn(async (prompt) => ({ optimized_prompt: prompt + ' [optimized]', platform: 'generic', model_used: 'mock' })),
+    optimizePromptsBatch: vi.fn(async (prompts) => ({ code: 0, data: prompts.map(p => p + ' [opt]') })),
+    composeVideo: vi.fn(async () => ({ code: 0, data: { videoPath: '/tmp/out.mp4' } })),
+    callPythonSkill: vi.fn(async (name) => ({ code: 0, data: { skill: name, result: 'ok' } })),
+    fetchPipeline: vi.fn(async (name) => ({ code: 0, data: { name, stages: [] } })),
+  };
+  return Object.assign(bus, overrides || {});
+}
+
+// ---------- Mock Container ----------
+function makeMockContainer(services) {
+  return { get: vi.fn((name) => services[name]) };
+}
+
+describe('StageExecutor 与 PipelineEngine 编排模式', () => {
+
+// ============================================================
+// 1. StageExecutor 基础功能
+// ============================================================
+
+it('STAGE_TYPES 枚举完整', function () {
+  eq(typeof STAGE_TYPES.SPLIT, 'string');
+  eq(STAGE_TYPES.SPLIT, 'split');
+  eq(STAGE_TYPES.OPTIMIZE_BATCH, 'optimize_batch');
+  eq(STAGE_TYPES.MANUAL_CHECKPOINT, 'manual_checkpoint');
+  eq(STAGE_TYPES.CUSTOM, 'custom');
+  ok(Object.keys(STAGE_TYPES).length >= 10, '应有至少 10 种阶段类型');
+});
+
+it('StageExecutor 构造函数需要 serviceBus', function () {
+  expect(() => new StageExecutor({})).toThrow(/serviceBus/);
+});
+
+it('StageExecutor 无参构造应抛错', function () {
+  expect(() => new StageExecutor()).toThrow(/serviceBus/);
+});
+
+// ============================================================
+// 2. 内置执行器测试
+// ============================================================
+
+it('SPLIT 阶段调用 serviceBus.splitText', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'split', type: STAGE_TYPES.SPLIT, inputFrom: 'input' },
+    params: {},
+    context: { input: '第一句。第二句！第三句？' },
+  });
+  eq(result.success, true);
+  ok(Array.isArray(result.output.sentences), 'output 应包含 sentences 数组');
+  eq(result.output.sentences.length, 3);
+  expect(bus.splitText).toHaveBeenCalledOnce();
+});
+
+it('SPLIT 阶段使用结构化 key 上报开始与完成摘要', async function () {
+  const bus = makeMockServiceBus();
+  const progress = vi.fn();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'split-progress',
+    stage: { name: 'split', type: STAGE_TYPES.SPLIT, inputFrom: 'input' },
+    params: {},
+    context: { input: '第一句。第二句！' },
+    onProgress: progress,
+  });
+  expect(result.success).toBe(true);
+  expect(progress.mock.calls[0][0]).toMatchObject({ percent: 0, messageKey: 'stageProgress.splitWorking' });
+  expect(progress.mock.calls.at(-1)[0]).toMatchObject({
+    percent: 100,
+    summaryKey: 'stageProgress.splitSummary',
+    summaryParams: { count: 2 },
+    detail: { done: 2, total: 2, kind: 'scene' },
+  });
+});
+
+it('Story2Video SPLIT 保留服务场景，并在场景内生成本地字幕块', async function () {
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => ({
+      tier_used: 'tier3_rule',
+      scenes: [{ text: '第一幕包含足够长的画面说明，随后继续补充细节。' }],
+      sentences: ['第一幕包含足够长的画面说明，', '随后继续补充细节。'],
+    })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'story-service',
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: {
+        language: 'zh',
+        mode: 'precise',
+        max_sentence_length: 120,
+        target_duration: 4,
+        base_words_per_second: 2.8,
+        speech_rate: 1.2,
+        target_chars_per_scene: 20,
+        min_words: 12,
+        max_words: 40,
+        enforce_sentence_boundary: false,
+        overflow_to_next: false,
+        fallback_to_local: true,
+        require_scene_output: true,
+        subtitle_min_chars: 8,
+        subtitle_max_chars: 15,
+      },
+    },
+    params: { text: '第一幕包含足够长的画面说明，随后继续补充细节。' },
+    context: {},
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    output: {
+      sceneSource: 'smart-sentence-splitter',
+      subtitleSource: 'local-typescript',
+      degraded: false,
+    },
+  });
+  // v0.15.2 本地分块清理块尾标点（引擎离线/缺字幕回退路径）
+  expect(result.output.scenes[0].subtitleBlocks.join('')).toBe('第一幕包含足够长的画面说明随后继续补充细节');
+  const sentOptions = bus.splitText.mock.calls[0][1];
+  expect(sentOptions).toMatchObject({
+    language: 'zh',
+    mode: 'precise',
+    config: {
+      sentence_tokenizer: {
+        max_sentence_length: 120,
+        language_specific: {
+          zh: { max_sentence_length: 120 },
+          en: { max_sentence_length: 120 },
+        },
+      },
+      scene: {
+        target_seconds: 4,
+        base_words_per_second: 2.8,
+        speech_rate: 1.2,
+        min_words_per_segment: 12,
+        max_words_per_segment: 40,
+        enforce_sentence_boundary: false,
+        allow_single_sentence_overflow: false,
+      },
+    },
+  });
+  expect(sentOptions).not.toHaveProperty('fallback_to_local');
+  expect(sentOptions).not.toHaveProperty('require_scene_output');
+  expect(sentOptions).not.toHaveProperty('target_duration');
+  // 字幕分块参数必须透传到 config.subtitle（v1.2），且不得泄漏为顶层键
+  expect(sentOptions.config.subtitle).toMatchObject({
+    min_chars_per_block: 8,
+    max_chars_per_block: 15,
+  });
+  expect(sentOptions).not.toHaveProperty('subtitle_min_chars');
+  expect(sentOptions).not.toHaveProperty('subtitle_max_chars');
+  // 分镜字数主控只走本地 fallback（snake_case 键），8002 请求不得包含（双模型审查 W2）
+  expect(sentOptions).not.toHaveProperty('target_chars_per_scene');
+  expect(sentOptions.config.scene).not.toHaveProperty('target_chars_per_scene');
+});
+
+it('Story2Video SPLIT 仅在 8002 不可用时降级到本地双层分句', async function () {
+  const unavailable = new Error('connect ECONNREFUSED 127.0.0.1:8002');
+  unavailable.code = 'ECONNREFUSED';
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => { throw unavailable; }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const text = '第一句话用于建立场景。第二句话继续补充信息。第三句话切换画面。';
+  const result = await exec.execute({
+    runId: 'story-fallback',
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: { fallback_to_local: true, require_scene_output: true },
+    },
+    params: { text },
+    context: {},
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    output: {
+      sceneSource: 'local-typescript-fallback',
+      subtitleSource: 'local-typescript',
+      degraded: true,
+      fallbackReason: expect.stringContaining('ECONNREFUSED'),
+    },
+  });
+  expect(result.output.scenes.map(scene => scene.text).join('')).toBe(text);
+});
+
+it.each([
+  ['请求超时', Object.assign(new Error('splitterbridge request timeout'), { code: 'ETIMEDOUT' }), 'ETIMEDOUT'],
+  ['连接重置', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 'ECONNRESET'],
+])('Story2Video SPLIT 在 8002 %s时允许本地降级', async function (_label, unavailable, reason) {
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => { throw unavailable; }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const text = '第一句话用于建立场景。第二句话继续补充信息。';
+  const result = await exec.execute({
+    runId: 'story-fallback-' + reason.toLowerCase(),
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: { fallback_to_local: true, require_scene_output: true },
+    },
+    params: { text },
+    context: {},
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    output: {
+      sceneSource: 'local-typescript-fallback',
+      subtitleSource: 'local-typescript',
+      degraded: true,
+      fallbackReason: expect.stringContaining(reason),
+    },
+  });
+  expect(result.output.scenes.map(scene => scene.text).join('')).toBe(text);
+});
+
+it.each([
+  ['code/message', { code: -1, message: 'connect ECONNREFUSED 127.0.0.1:8002' }, 'ECONNREFUSED'],
+  ['success/error', { success: false, error: 'SplitterBridge is not running' }, 'not running'],
+])('Story2Video SPLIT 在 8002 返回 %s 失败对象时允许本地降级', async function (_label, unavailable, reason) {
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => unavailable),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const text = '第一句话用于建立场景。第二句话继续补充信息。';
+  const result = await exec.execute({
+    runId: 'story-returned-fallback-' + _label,
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: { fallback_to_local: true, require_scene_output: true },
+    },
+    params: { text },
+    context: {},
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    output: {
+      sceneSource: 'local-typescript-fallback',
+      subtitleSource: 'local-typescript',
+      degraded: true,
+      fallbackReason: expect.stringContaining(reason),
+    },
+  });
+  expect(result.output.scenes.map(scene => scene.text).join('')).toBe(text);
+});
+
+it('Story2Video SPLIT 对 8002 业务错误禁止本地降级', async function () {
+  const businessError = Object.assign(new Error('splitter service rejected invalid mode'), {
+    code: 'ERR_BAD_REQUEST',
+  });
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => { throw businessError; }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'story-business-error',
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: { fallback_to_local: true, require_scene_output: true },
+    },
+    params: { text: '业务错误必须暴露给调用方。' },
+    context: {},
+  });
+
+  expect(result.success).toBe(false);
+  expect(result.error).toContain('invalid mode');
+  expect(result.output).toBeUndefined();
+});
+
+it('Story2Video SPLIT 对 8002 返回的业务错误对象禁止本地降级', async function () {
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => ({ code: -1, message: 'splitter service rejected invalid mode' })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'story-returned-business-error',
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: { fallback_to_local: true, require_scene_output: true },
+    },
+    params: { text: '返回的业务错误也必须暴露给调用方。' },
+    context: {},
+  });
+
+  expect(result.success).toBe(false);
+  expect(result.error).toContain('invalid mode');
+  expect(result.output).toBeUndefined();
+});
+
+it('Story2Video SPLIT 对服务非法响应明确失败，不静默降级', async function () {
+  const bus = makeMockServiceBus({
+    splitText: vi.fn(async () => ({ code: 0, data: { unexpected: true } })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'story-malformed',
+    stage: {
+      name: 'split',
+      type: STAGE_TYPES.SPLIT,
+      options: { fallback_to_local: true, require_scene_output: true },
+    },
+    params: { text: '服务合同不能被静默掩盖。' },
+    context: {},
+  });
+
+  expect(result.success).toBe(false);
+  expect(result.error).toMatch(/场景|响应|scenes/i);
+});
+
+it('SPLIT 音频模式在无文案时按音频数量生成场景', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'audio-run',
+    stage: { name: 'split', type: STAGE_TYPES.SPLIT },
+    params: {
+      inputMode: 'audio',
+      audio: [{ name: 'part-a.mp3', transcript: '识别后的第一段' }, { name: 'part-b.mp3' }],
+    },
+    context: {},
+  });
+  eq(result.success, true);
+  eq(result.output.sentences.length, 2);
+  eq(result.output.scenes[0].text, '识别后的第一段');
+  eq(result.output.scenes[1].text, 'part-b.mp3');
+  expect(bus.splitText).not.toHaveBeenCalled();
+});
+
+it('OPTIMIZE 阶段调用 serviceBus.optimizePrompt', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'opt', type: STAGE_TYPES.OPTIMIZE, inputFrom: 'prompt', options: { quality_baseline: false } },
+    params: {},
+    context: { prompt: '一只猫坐在窗台上' },
+  });
+  eq(result.success, true);
+  eq(result.output.optimized_prompt, '一只猫坐在窗台上 [optimized]');
+  expect(bus.optimizePrompt).toHaveBeenCalledOnce();
+  // 统一契约参数：平台/创意度/长度/候选数/自动风格检测
+  expect(bus.optimizePrompt).toHaveBeenCalledWith(
+    '一只猫坐在窗台上',
+    expect.objectContaining({
+      platform: 'generic',
+      creative_level: 5,
+      // 与 prompt-engine-contract PROMPT_ENGINE_LIMITS.maxLength.default=500 一致（00a581d1 引入时测试期望 300 未同步）
+      max_length: 500,
+      num_candidates: 1,
+      auto_detect_style: true,
+    }),
+  );
+});
+
+it('OPTIMIZE 多候选择优：选择评分最高候选并对胜出候选施加 max_length 截断（评审 W1）', async function () {
+  const bus = makeMockServiceBus({
+    optimizePrompt: vi.fn(async () => ({
+      optimized_prompt: 'a cat sitting, soft light',
+      candidates: [
+        'a warrior riding through a ruined city at golden hour, cinematic composition, dramatic lighting, epic style, low angle, rule of thirds, depth of field, dust and embers, volumetric light rays, detailed armor, ruined temple, banner',
+        'a cat sitting, soft light',
+      ],
+      platform: 'generic', model_used: 'mock',
+    })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r-w1',
+    stage: { name: 'opt', type: STAGE_TYPES.OPTIMIZE, inputFrom: 'prompt', options: { num_candidates: 2, max_length: 120, quality_baseline: false } },
+    params: {},
+    context: { prompt: 'a warrior in ruined city' },
+  });
+  eq(result.success, true);
+  // 择优选中高分候选（而非 candidates[0]）
+  expect(result.output.optimized_prompt).toContain('ruined city at golden hour');
+  // W1：胜出候选超过 max_length=120 → Unicode 安全截断 + truncated 标记
+  expect(Array.from(result.output.optimized_prompt)).toHaveLength(120);
+  expect(result.output.truncated).toBe(true);
+});
+
+it('OPTIMIZE 多候选择优关闭：select_best=false 保持 candidates[0] 现状行为', async function () {
+  const bus = makeMockServiceBus({
+    optimizePrompt: vi.fn(async () => ({
+      optimized_prompt: 'first candidate text',
+      candidates: ['first candidate text', 'second candidate much longer with more detail'],
+      platform: 'generic', model_used: 'mock',
+    })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r-w1b',
+    stage: { name: 'opt', type: STAGE_TYPES.OPTIMIZE, inputFrom: 'prompt', options: { num_candidates: 2, select_best: false, quality_baseline: false } },
+    params: {},
+    context: { prompt: 'a cat' },
+  });
+  eq(result.success, true);
+  expect(result.output.optimized_prompt).toBe('first candidate text');
+});
+
+it('SPLIT/OPTIMIZE 把 runId 作为 traceId 传给 serviceBus（R2）', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+
+  await exec.execute({
+    runId: 'run_42',
+    stage: { name: 'split', type: STAGE_TYPES.SPLIT, inputFrom: 'input' },
+    params: {},
+    context: { input: '第一句。第二句！' },
+  });
+  expect(bus.splitText).toHaveBeenCalledWith('第一句。第二句！', expect.objectContaining({ traceId: 'run_42' }));
+
+  await exec.execute({
+    runId: 'run_43',
+    stage: { name: 'opt', type: STAGE_TYPES.OPTIMIZE, inputFrom: 'prompt', options: { quality_baseline: false } },
+    params: {},
+    context: { prompt: '一只猫' },
+  });
+  expect(bus.optimizePrompt).toHaveBeenCalledWith('一只猫', expect.objectContaining({ traceId: 'run_43' }));
+
+  await exec.execute({
+    runId: 'run_44',
+    stage: { name: 'ob', type: STAGE_TYPES.OPTIMIZE_BATCH, inputFrom: 'prompts' },
+    params: { prompts: ['a', 'b'] },
+    context: {},
+  });
+  expect(bus.optimizePromptsBatch).toHaveBeenCalledWith(['a', 'b'], expect.objectContaining({ traceId: 'run_44' }));
+});
+
+it('OPTIMIZE_BATCH 阶段需要数组输入', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  // 非数组输入应失败
+  const r1 = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'ob', type: STAGE_TYPES.OPTIMIZE_BATCH },
+    params: { prompts: 'not_an_array' },
+    context: {},
+  });
+  eq(r1.success, false);
+  ok(/array/.test(r1.error), '错误信息应提示 array');
+  // 数组输入应成功
+  const r2 = await exec.execute({
+    runId: 'r2',
+    stage: { name: 'ob', type: STAGE_TYPES.OPTIMIZE_BATCH, inputFrom: 'prompts' },
+    params: {},
+    context: { prompts: ['prompt1', 'prompt2'] },
+  });
+  eq(r2.success, true);
+  eq(r2.output.length, 2);
+});
+
+it.each([
+  ['服务错误对象', { code: -1, message: 'prompt-engine quota exceeded' }, /quota exceeded/],
+  ['结果数量错配', { code: 0, data: { results: [{ optimized_prompt: 'only one' }] } }, /count mismatch/i],
+])('OPTIMIZE_BATCH 对%s保持 fail closed', async function (_label, response, expectedError) {
+  const bus = makeMockServiceBus({
+    optimizePromptsBatch: vi.fn(async () => response),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'optimize-batch-failure-' + _label,
+    stage: { name: 'ob', type: STAGE_TYPES.OPTIMIZE_BATCH, inputFrom: 'prompts' },
+    params: {},
+    context: { prompts: ['prompt1', 'prompt2'] },
+  });
+
+  expect(result.success).toBe(false);
+  expect(result.error).toMatch(expectedError);
+  expect(result.output).toBeUndefined();
+});
+
+it('OPTIMIZE_BATCH 接受非空字符串及支持的对象 prompt 字段', async function () {
+  const response = [
+    'direct prompt',
+    { prompt: 'prompt field' },
+    { optimized_prompt: 'optimized_prompt field' },
+    { optimized: 'optimized field' },
+  ];
+  const bus = makeMockServiceBus({
+    optimizePromptsBatch: vi.fn(async () => ({ code: 0, data: { results: response } })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'optimize-batch-valid-shapes',
+    stage: { name: 'ob', type: STAGE_TYPES.OPTIMIZE_BATCH, inputFrom: 'prompts' },
+    params: {},
+    context: { prompts: ['prompt1', 'prompt2', 'prompt3', 'prompt4'] },
+  });
+
+  expect(result).toEqual({ success: true, output: response });
+});
+
+it.each([
+  ['空对象', [{}, {}]],
+  ['null', [null, null]],
+  ['空白 prompt 字段', [{ optimized_prompt: '  ' }, { prompt: '\t', optimized: '' }]],
+  ['前置空白字段遮蔽后续值', [{ prompt: ' ', optimized_prompt: 'valid but shadowed' }, { optimized: 'valid' }]],
+])('OPTIMIZE_BATCH 对真实 PromptBridge 返回的等长%s结果保持 fail closed', async function (_label, response) {
+  let receivedBody = null;
+  const server = http.createServer((request, reply) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => {
+      receivedBody = JSON.parse(body);
+      reply.writeHead(200, { 'Content-Type': 'application/json' });
+      reply.end(JSON.stringify({ code: 0, data: { results: response } }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const promptBridge = new PromptBridge({ log: { info() {}, warn() {}, error() {}, notify() {} } });
+  promptBridge.modelProviderManager = {
+    getDefault: vi.fn(() => ({ id: 'sensenova-llm', name: 'SenseNova', base_url: 'https://token.sensenova.cn/v1', models: ['deepseek-v4-flash'] })),
+    getProviderWithKey: vi.fn(() => ({ id: 'sensenova-llm', name: 'SenseNova', base_url: 'https://token.sensenova.cn/v1', models: ['deepseek-v4-flash'], api_key: 'sk-test' })),
+  };
+  promptBridge.host = '127.0.0.1';
+  promptBridge.port = server.address().port;
+  promptBridge.isRunning = true;
+  const serviceBus = new ServiceBus({
+    pythonBridge: null,
+    splitterBridge: null,
+    promptBridge,
+    story2videoEngine: null,
+    log: { info() {}, warn() {}, error() {}, notify() {} },
+  });
+  const exec = new StageExecutor({ serviceBus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+
+  try {
+    const result = await exec.execute({
+      runId: 'optimize-batch-malformed-' + _label,
+      stage: { name: 'ob', type: STAGE_TYPES.OPTIMIZE_BATCH, inputFrom: 'prompts' },
+      params: {},
+      context: { prompts: ['prompt1', 'prompt2'] },
+    });
+
+    expect(receivedBody).toEqual({
+      requests: [
+        // max_length 与契约默认 500 一致（00a581d1 引入时测试期望 300 未同步）
+        expect.objectContaining({ prompt: 'prompt1', platform: 'generic', creative_level: 5, max_length: 500, num_candidates: 1, auto_detect_style: true }),
+        expect.objectContaining({ prompt: 'prompt2', platform: 'generic', creative_level: 5, max_length: 500, num_candidates: 1, auto_detect_style: true }),
+      ],
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/item 0.*non-empty prompt/i);
+    expect(result.output).toBeUndefined();
+  } finally {
+    promptBridge.isRunning = false;
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+it('COMPOSE 阶段处理 code === 0 成功', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets' },
+    params: {},
+    context: { assets: { images: [], audio: [] } },
+  });
+  eq(result.success, true);
+  eq(result.output.videoPath, '/tmp/out.mp4');
+});
+
+it('COMPOSE 可并行启动注册任务，并按 index 回填结果', async function () {
+  let composeStarted = false;
+  let parallelStarted = false;
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async (_assets) => {
+      composeStarted = true;
+      await Promise.resolve();
+      return {
+        code: 0,
+        data: {
+          videoPath: '/tmp/out.mp4',
+          segments: [{ index: 1, prompt: 'p1' }, { index: 0, prompt: 'p0' }],
+        },
+      };
+    }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('story2video-prompt-translation', async () => {
+    parallelStarted = true;
+    return {
+      results: [{ index: 0, translation: '译文0' }, { index: 1, translation: '译文1' }],
+      degraded: false,
+      apply: ({ composeOutput, result }) => {
+        const translations = new Map(result.results.map((item) => [item.index, item.translation]));
+        composeOutput.segments.forEach((segment) => {
+          segment.promptTranslation = translations.get(segment.index) || null;
+        });
+      },
+    };
+  });
+  const result = await exec.execute({
+    runId: 'compose-parallel',
+    stage: {
+      name: 'compose',
+      type: STAGE_TYPES.COMPOSE,
+      inputFrom: 'assets',
+      options: { composeParallelTask: 'story2video-prompt-translation' },
+    },
+    params: {},
+    context: {
+      assets: { scenes: [] },
+      prompt_translations_pending: { uiLocale: 'zh', items: [] },
+    },
+  });
+  eq(result.success, true);
+  eq(composeStarted, true);
+  eq(parallelStarted, true);
+  expect(result.output.segments).toEqual([
+    { index: 1, prompt: 'p1', promptTranslation: '译文1' },
+    { index: 0, prompt: 'p0', promptTranslation: '译文0' },
+  ]);
+});
+
+it('COMPOSE 在合成未完成时已启动并行任务，并优先使用任务自身超时预算', async function () {
+  let parallelStarted = false;
+  let resolveParallel;
+  const parallelPromise = new Promise((resolve) => { resolveParallel = resolve; });
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => {
+      expect(parallelStarted).toBe(true);
+      resolveParallel({ results: [], degraded: false });
+      return { code: 0, data: { videoPath: '/tmp/out.mp4', segments: [] } };
+    }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('translation-overlap', () => {
+    parallelStarted = true;
+    return { promise: parallelPromise, timeoutMs: 1, apply: vi.fn() };
+  });
+  const result = await exec.execute({
+    runId: 'compose-parallel-overlap',
+    stage: {
+      name: 'compose',
+      type: STAGE_TYPES.COMPOSE,
+      options: { composeParallelTask: 'translation-overlap', composeParallelTimeoutMs: 60000 },
+    },
+    params: {},
+    context: {},
+  });
+  expect(result.success).toBe(true);
+  expect(parallelStarted).toBe(true);
+  expect(bus.composeVideo).toHaveBeenCalledOnce();
+});
+
+it('COMPOSE 并行任务失败时保持合成成功并记录降级', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => ({ code: 0, data: { videoPath: '/tmp/out.mp4', segments: [{ index: 0 }] } })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('translation', async () => ({
+    degraded: true,
+    reason: 'translation timeout',
+    apply: ({ composeOutput }) => composeOutput.segments.forEach((segment) => { segment.promptTranslation = null; }),
+  }));
+  const context = {
+    assets: { scenes: [] },
+    prompt_translations_pending: { uiLocale: 'zh', items: [] },
+  };
+  const result = await exec.execute({
+    runId: 'compose-parallel-fail-open',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets', options: { composeParallelTask: 'translation' } },
+    params: {},
+    context,
+  });
+  eq(result.success, true);
+  eq(result.output.segments[0].promptTranslation, null);
+  eq(context.compose_parallel_diagnostic.degraded, true);
+});
+
+it('COMPOSE 并行任务不掩盖合成失败', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => ({ code: -1, message: 'ffmpeg failed' })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('translation', async () => ({ results: [], degraded: false }));
+  const result = await exec.execute({
+    runId: 'compose-parallel-compose-fail',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, options: { composeParallelTask: 'translation' } },
+    params: {},
+    context: { prompt_translations_pending: { uiLocale: 'zh', items: [] } },
+  });
+  eq(result.success, false);
+  ok(/ffmpeg failed/.test(result.error));
+});
+
+it('COMPOSE 配置了未注册并行任务时记录降级诊断但不阻塞合成', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => ({ code: 0, data: { videoPath: '/tmp/out.mp4' } })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const context = {};
+  const result = await exec.execute({
+    runId: 'compose-parallel-unregistered',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, options: { composeParallelTask: 'missing-task' } },
+    params: {},
+    context,
+  });
+  expect(result.success).toBe(true);
+  expect(context.compose_parallel_diagnostic).toEqual({
+    taskType: 'missing-task',
+    degraded: true,
+    reason: 'parallel task not registered',
+  });
+});
+
+it('COMPOSE 成功重试后清除上一次并行降级诊断', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => ({ code: 0, data: { videoPath: '/tmp/out.mp4' } })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('translation-retry', () => ({
+    promise: Promise.resolve({ results: [], degraded: false }),
+  }));
+  const context = {
+    compose_parallel_diagnostic: { taskType: 'translation-retry', degraded: true, reason: 'previous timeout' },
+  };
+  const result = await exec.execute({
+    runId: 'compose-parallel-retry',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, options: { composeParallelTask: 'translation-retry' } },
+    params: {},
+    context,
+  });
+  expect(result.success).toBe(true);
+  expect(context.compose_parallel_diagnostic).toBeUndefined();
+});
+
+it('COMPOSE 合成失败时取消仍在运行的并行任务', async function () {
+  const cancel = vi.fn(async () => {});
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => ({ code: -1, message: 'ffmpeg failed' })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('translation-cancel', () => ({
+    promise: new Promise(() => {}),
+    cancel,
+  }));
+  const result = await exec.execute({
+    runId: 'compose-parallel-cancel',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, options: { composeParallelTask: 'translation-cancel' } },
+    params: {},
+    context: {},
+  });
+  expect(result.success).toBe(false);
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it('COMPOSE 并行任务超时后仍执行 fail-open 收尾', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async () => ({ code: 0, data: { videoPath: '/tmp/out.mp4', segments: [{ index: 0 }] } })),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  exec.registerComposeParallelTask('translation-timeout', () => ({
+    promise: new Promise(() => {}),
+    timeoutMs: 1,
+    apply: ({ composeOutput }) => composeOutput.segments.forEach((segment) => { segment.promptTranslation = null; }),
+  }));
+  const context = { assets: {} };
+  const result = await exec.execute({
+    runId: 'compose-parallel-timeout',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, options: { composeParallelTask: 'translation-timeout' } },
+    params: {},
+    context,
+  });
+  eq(result.success, true);
+  eq(result.output.segments[0].promptTranslation, null);
+  eq(context.compose_parallel_diagnostic.degraded, true);
+});
+
+it('COMPOSE 成功后采集 TTS 时长样本（Batch 5a，best-effort）', async function () {
+  const saved = new Map();
+  const store = {
+    getSetting: (key) => saved.get(key),
+    setSetting: (key, value) => saved.set(key, value),
+  };
+  const bus = makeMockServiceBus({
+    composeVideo: async () => ({
+      code: 0,
+      data: {
+        videoPath: '/tmp/out.mp4',
+        segments: [
+          { text: '长安城的灯火。', audioDuration: 4.2, duration: 4.2 },
+          { text: '第二段旁白', audioDuration: 3.1, duration: 3.1 },
+          { text: '探测失败段', audioDuration: null, duration: 6 },
+        ],
+      },
+    }),
+  });
+  const exec = new StageExecutor({
+    serviceBus: bus,
+    container: { get: (name) => (name === 'store' ? store : null) },
+    log: { info() {}, warn() {}, error() {}, notify() {} },
+  });
+  const result = await exec.execute({
+    runId: 'compose-collect',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets' },
+    params: {
+      story2videoTextConfig: {
+        split: { language: 'zh' },
+        voice: { provider: 'edge-tts', model: 'm', id: 'v', speed: 1 },
+      },
+    },
+    context: { assets: { scenes: [] } },
+  });
+  eq(result.success, true);
+  const samples = saved.get('story2video.ttsSamples.v1');
+  eq(Array.isArray(samples), true);
+  eq(samples.length, 2); // 探测失败的片段被跳过
+  eq(samples[0].language, 'zh');
+  eq(samples[0].chars, 7);
+  eq(samples[0].durationSeconds, 4.2);
+  eq(samples[1].chars, 5);
+});
+
+it('COMPOSE 采集在 store 缺失/异常时静默（不阻断成功返回）', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: async () => ({
+      code: 0,
+      data: { videoPath: '/tmp/out.mp4', segments: [{ text: 'x', audioDuration: 1 }] },
+    }),
+  });
+  const exec = new StageExecutor({
+    serviceBus: bus,
+    container: { get: () => { throw new Error('no store') } },
+    log: { info() {}, warn() {}, error() {}, notify() {} },
+  });
+  const result = await exec.execute({
+    runId: 'compose-collect-fail',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets' },
+    params: {},
+    context: { assets: {} },
+  });
+  eq(result.success, true);
+});
+
+it('COMPOSE 阶段把用户选择的合成参数按白名单覆盖流水线默认值', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  await exec.execute({
+    runId: 'compose-options',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets', options: { transition: 'fade' } },
+    params: {
+      transition: 'slide-left', imageEffect: 'pan-up', subtitleEnabled: false,
+      defaultSceneDuration: 5, sceneDurationMode: 'min-duration', minSceneDuration: 8,
+      resolution: '1080x1920', fps: 25, voiceVolume: 0.8,
+      untrustedOption: 'must-not-pass',
+    },
+    context: { assets: { scenes: [] } },
+  });
+
+  expect(bus.composeVideo).toHaveBeenCalledWith({ scenes: [] }, expect.objectContaining({
+    transition: 'slide-left', imageEffect: 'pan-up', subtitleEnabled: false,
+    defaultSceneDuration: 5, sceneDurationMode: 'min-duration', minSceneDuration: 8,
+    resolution: '1080x1920', fps: 25, voiceVolume: 0.8,
+  }));
+  expect(bus.composeVideo.mock.calls[0][1]).not.toHaveProperty('untrustedOption');
+});
+
+it('COMPOSE 阶段处理 code === -1 引擎不可用', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: async () => ({ code: -1, message: 'ffmpeg not found' }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE },
+    params: {},
+    context: {},
+  });
+  // 引擎不可用时返回失败
+  eq(result.success, false);
+  ok(/ffmpeg not found/.test(result.error));
+});
+
+it('COMPOSE 阶段把引擎 onProgress 写入 context.compose_progress（字段级校验通过）', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async (_assets, options) => {
+      if (typeof options.onProgress === 'function') {
+        options.onProgress({ phase: 'segments', percent: 39, segmentsDone: 3, segmentsTotal: 5 });
+        options.onProgress({ phase: 'concat', percent: 87, segmentsDone: 5, segmentsTotal: 5 });
+        options.onProgress({ phase: 'done', percent: 100, segmentsDone: 5, segmentsTotal: 5 });
+      }
+      return { code: 0, data: { videoPath: '/tmp/out.mp4' } };
+    }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const context = { assets: { scenes: [] } };
+  const result = await exec.execute({
+    runId: 'compose-progress',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets' },
+    params: {},
+    context,
+  });
+  eq(result.success, true);
+  // onProgress 已挂在 composeOptions 透传给引擎
+  expect(bus.composeVideo.mock.calls[0][1].onProgress).toEqual(expect.any(Function));
+  // context 收到最后合法值
+  eq(context.compose_progress, { phase: 'done', percent: 100, segmentsDone: 5, segmentsTotal: 5 });
+});
+
+it('COMPOSE 丢弃非法 onProgress 值（fail-closed，不下发 renderer）', async function () {
+  const bus = makeMockServiceBus({
+    composeVideo: vi.fn(async (_assets, options) => {
+      if (typeof options.onProgress === 'function') {
+        options.onProgress({ phase: 'segments', percent: NaN });
+        options.onProgress({ phase: 'segments', percent: 120 });
+        options.onProgress({ phase: 'segments', percent: 50, segmentsTotal: 0 });
+        options.onProgress({ phase: 'segments', percent: 50, segmentsTotal: 3, segmentsDone: 4 });
+        options.onProgress({ phase: 'unknown', percent: 50 });
+        options.onProgress({ phase: '', percent: 50 });
+        options.onProgress({ phase: 'segments', percent: 'not-a-number' });
+        // I1：Number() 强转穿透被严格数值校验拒绝
+        options.onProgress({ phase: 'segments', percent: null });
+        options.onProgress({ phase: 'segments', percent: [] });
+        options.onProgress({ phase: 'segments', percent: true });
+        options.onProgress({ phase: 'segments', percent: 50, segmentsTotal: '5' });
+        options.onProgress({ phase: 'segments', percent: 50, segmentsTotal: 5, segmentsDone: '3' });
+        // W1：percent 100 只允许 done 阶段
+        options.onProgress({ phase: 'verify', percent: 100 });
+        options.onProgress({ phase: 'segments', percent: 99.6 });
+        // 合法值仍可写入
+        options.onProgress({ phase: 'validated', percent: 3, segmentsTotal: 2 });
+      }
+      return { code: 0, data: { videoPath: '/tmp/out.mp4' } };
+    }),
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const context = { assets: {} };
+  const result = await exec.execute({
+    runId: 'compose-progress-invalid',
+    stage: { name: 'compose', type: STAGE_TYPES.COMPOSE, inputFrom: 'assets' },
+    params: {},
+    context,
+  });
+  eq(result.success, true);
+  // 非法更新全部被丢弃，context 只有最后合法值
+  eq(context.compose_progress, { phase: 'validated', percent: 3, segmentsTotal: 2 });
+});
+
+it('CALL_SKILL 阶段需要 skillName', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  // 缺 skillName 应失败
+  const r1 = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'cs', type: STAGE_TYPES.CALL_SKILL },
+    params: {},
+    context: {},
+  });
+  eq(r1.success, false);
+  ok(/skillName/.test(r1.error));
+  // 正常调用
+  const r2 = await exec.execute({
+    runId: 'r2',
+    stage: { name: 'cs', type: STAGE_TYPES.CALL_SKILL, skillName: 'generate_script' },
+    params: { topic: 'AI' },
+    context: {},
+  });
+  eq(r2.success, true);
+  eq(r2.output.skill, 'generate_script');
+});
+
+it('MANUAL_CHECKPOINT 阶段返回 checkpoint: true', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'review', type: STAGE_TYPES.MANUAL_CHECKPOINT },
+    params: {},
+    context: {},
+  });
+  eq(result.success, true);
+  eq(result.checkpoint, true);
+  eq(result.output, null);
+});
+
+it('未知 stage.type 回退为 MANUAL_CHECKPOINT', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'unknown_stage', type: 'totally_unknown_type' },
+    params: {},
+    context: {},
+  });
+  eq(result.success, true);
+  eq(result.checkpoint, true);
+});
+
+it('无 stage.type 回退为 MANUAL_CHECKPOINT（向后兼容）', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'research' }, // 旧流水线只有 name
+    params: {},
+    context: {},
+  });
+  eq(result.success, true);
+  eq(result.checkpoint, true);
+});
+
+it('CUSTOM 阶段调用 stage.executor 函数', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: {
+      name: 'custom_step',
+      type: STAGE_TYPES.CUSTOM,
+      executor: async ({ params, context }) => ({ success: true, output: { doubled: params.x * 2, ctx: context.previous } }),
+    },
+    params: { x: 21 },
+    context: { previous: 'hello' },
+  });
+  eq(result.success, true);
+  eq(result.output.doubled, 42);
+  eq(result.output.ctx, 'hello');
+});
+
+it('CUSTOM 阶段缺 executor 函数应失败', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'cs', type: STAGE_TYPES.CUSTOM },
+    params: {},
+    context: {},
+  });
+  eq(result.success, false);
+  ok(/executor/.test(result.error));
+});
+
+it('执行器抛异常被捕获返回 success:false', async function () {
+  const bus = makeMockServiceBus({
+    splitText: async () => { throw new Error('mock split failure'); },
+  });
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'split', type: STAGE_TYPES.SPLIT, inputFrom: 'text' },
+    params: {},
+    context: { text: 'hello' },
+  });
+  eq(result.success, false);
+  ok(/mock split failure/.test(result.error));
+});
+
+// ============================================================
+// 3. 自定义执行器注册
+// ============================================================
+
+it('register 注册自定义执行器优先于内置', async function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const customExecutor = vi.fn(async () => ({ success: true, output: 'custom_split_result' }));
+  exec.register(STAGE_TYPES.SPLIT, customExecutor);
+  const result = await exec.execute({
+    runId: 'r1',
+    stage: { name: 'split', type: STAGE_TYPES.SPLIT },
+    params: {},
+    context: {},
+  });
+  expect(customExecutor).toHaveBeenCalledOnce();
+  eq(result.output, 'custom_split_result');
+  expect(bus.splitText).not.toHaveBeenCalled();
+});
+
+it('register 非函数应抛错', function () {
+  const bus = makeMockServiceBus();
+  const exec = new StageExecutor({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  expect(() => exec.register('bad_type', 'not_a_function')).toThrow(/function/);
+});
+
+// ============================================================
+// 4. PipelineEngine 编排模式
+// ============================================================
+
+it('PipelineEngine 无参构造仍可工作（向后兼容）', function () {
+  const pe = new PipelineEngine();
+  eq(pe.stageExecutor, null);
+  eq(pe.serviceBus, null);
+  // state_machine 模式仍可用
+  const r = pe.start('animated-explainer', {});
+  eq(r.success, true);
+});
+
+it('PipelineEngine 注入 serviceBus 后自动构造 StageExecutor', function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  ok(pe.stageExecutor !== null, 'StageExecutor 应已构造');
+  ok(pe.stageExecutor instanceof StageExecutor);
+});
+
+it('startOrchestrated 在无 stageExecutor 时返回错误', async function () {
+  const pe = new PipelineEngine(); // 无 serviceBus
+  const r = await pe.startOrchestrated('animated-explainer', {});
+  eq(r.success, false);
+  ok(/StageExecutor/.test(r.error));
+});
+
+it('startOrchestrated 在未知流水线时返回错误', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const r = await pe.startOrchestrated('nonexistent', {});
+  eq(r.success, false);
+  ok(/Unknown pipeline/.test(r.error));
+});
+
+it('startOrchestrated 手动模式（autoAdvance=false）只创建 run', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const r = await pe.startOrchestrated('framework-smoke', { autoAdvance: false });
+  eq(r.success, true);
+  ok(r.runId, '应返回 runId');
+  // 第一个阶段未执行（手动模式）
+  const status = pe.getStatus('framework-smoke');
+  eq(status.orchestrationMode, 'orchestrator');
+  eq(status.status, 'running');
+});
+
+it('startOrchestrated + autoAdvance 自动执行全部阶段（旧流水线回退为 checkpoint）', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  // framework-smoke 有 2 个阶段：verify, report（无 stage.type，回退为 MANUAL_CHECKPOINT）
+  const r = await pe.startOrchestrated('framework-smoke', { autoAdvance: true });
+  eq(r.success, true);
+  eq(r.paused, true, '应在第一个 MANUAL_CHECKPOINT 暂停');
+  ok(r.results.length >= 1, '至少执行了 1 个阶段');
+  eq(r.results[0].checkpoint, true);
+});
+
+it('executeStage 在非编排模式 run 上返回错误', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  pe.start('animated-explainer', {}); // state_machine 模式
+  // 获取 runId（通过 status）
+  const status = pe.getStatus('animated-explainer');
+  const r = await pe.executeStage(status.id);
+  eq(r.success, false);
+  ok(/orchestrator mode/.test(r.error));
+});
+
+it('executeStage 执行单个阶段并将输出写入 context', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+
+  // 动态注册带 stageDefs 的测试流水线
+  pe.registerPipeline({
+    name: 'test-call-skill-pipeline',
+    description: '测试 CALL_SKILL 阶段',
+    category: 'custom',
+    stages: ['verify', 'report'],
+    stageDefs: [
+      { name: 'verify', type: STAGE_TYPES.CALL_SKILL, skillName: 'verify_pipeline' },
+      { name: 'report', type: STAGE_TYPES.MANUAL_CHECKPOINT },
+    ],
+  });
+
+  const startR = await pe.startOrchestrated('test-call-skill-pipeline', { autoAdvance: false });
+  const runId = startR.runId;
+  const r = await pe.executeStage(runId);
+  eq(r.success, true);
+  ok(r.output, '应返回 output');
+  eq(r.output.skill, 'verify_pipeline');
+  // context 应包含 verify 阶段的输出
+  const ctx = pe.getRunContext(runId);
+  ok(ctx.verify, 'context 应有 verify 键');
+  eq(ctx.verify.skill, 'verify_pipeline');
+});
+
+it('advanceToNextCheckpoint 推进到检查点', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  pe.registerPipeline({
+    name: 'test-advance-checkpoint-pipeline',
+    description: '测试 advanceToNextCheckpoint',
+    category: 'custom',
+    stages: ['verify', 'report'],
+    stageDefs: [
+      { name: 'verify', type: STAGE_TYPES.CALL_SKILL, skillName: 'verify_pipeline' },
+      { name: 'report', type: STAGE_TYPES.MANUAL_CHECKPOINT },
+    ],
+  });
+  const startR = await pe.startOrchestrated('test-advance-checkpoint-pipeline', { autoAdvance: false });
+  const r = await pe.advanceToNextCheckpoint(startR.runId);
+  eq(r.success, true);
+  ok(r.results.length >= 1, '至少执行了 1 个阶段');
+  eq(r.paused, true, '应在 report 检查点暂停');
+});
+
+it('executeStage 遇到检查点时暂停，不提前推进或重复执行', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  pe.registerPipeline({
+    name: 'test-execute-checkpoint-pipeline',
+    description: '测试 executeStage 检查点',
+    category: 'custom',
+    stages: ['review', 'done'],
+    stageDefs: [
+      { name: 'review', type: STAGE_TYPES.MANUAL_CHECKPOINT, checkpointRequired: true },
+      { name: 'done', type: STAGE_TYPES.CALL_SKILL, skillName: 'verify_pipeline' },
+    ],
+  });
+  const startR = await pe.startOrchestrated('test-execute-checkpoint-pipeline', { autoAdvance: false });
+  const result = await pe.executeStage(startR.runId);
+  eq(result.success, true);
+  ok(result.checkpoint, '应返回 checkpoint');
+  const snapshot = pe.getRunSnapshot(startR.runId);
+  eq(snapshot.status.status, 'paused');
+  eq(snapshot.currentStage, 0);
+  eq(snapshot.stages[0].status, 'paused');
+  eq(bus.callPythonSkill.mock.calls.length, 0, '下一阶段不应被提前执行');
+});
+
+it('pauseWithCheckpoint 保存 context 快照', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  pe.registerPipeline({
+    name: 'test-pause-checkpoint-pipeline',
+    description: '测试 pauseWithCheckpoint',
+    category: 'custom',
+    stages: ['verify', 'report'],
+    stageDefs: [
+      { name: 'verify', type: STAGE_TYPES.CALL_SKILL, skillName: 'verify_pipeline' },
+      { name: 'report', type: STAGE_TYPES.MANUAL_CHECKPOINT },
+    ],
+  });
+  const startR = await pe.startOrchestrated('test-pause-checkpoint-pipeline', { autoAdvance: false });
+  await pe.executeStage(startR.runId); // 执行 verify
+  const pauseR = pe.pauseWithCheckpoint();
+  eq(pauseR.success, true);
+  ok(pauseR.checkpoint, '应有 checkpoint');
+  ok(pauseR.checkpoint.context, 'checkpoint 应含 context');
+  ok(pauseR.checkpoint.context.verify, 'checkpoint context 应含 verify 输出');
+});
+
+it('resumeFromCheckpoint 恢复 context', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  pe.registerPipeline({
+    name: 'test-resume-checkpoint-pipeline',
+    description: '测试 resumeFromCheckpoint',
+    category: 'custom',
+    stages: ['verify', 'report'],
+    stageDefs: [
+      { name: 'verify', type: STAGE_TYPES.CALL_SKILL, skillName: 'verify_pipeline' },
+      { name: 'report', type: STAGE_TYPES.MANUAL_CHECKPOINT },
+    ],
+  });
+  const startR = await pe.startOrchestrated('test-resume-checkpoint-pipeline', { autoAdvance: false });
+  await pe.executeStage(startR.runId);
+  pe.pauseWithCheckpoint();
+  // 清空 context 模拟崩溃后重启
+  const run = pe._runs.get(startR.runId);
+  run.context = {};
+  const r = pe.resumeFromCheckpoint();
+  eq(r.success, true);
+  const ctx = pe.getRunContext(startR.runId);
+  ok(ctx.verify, 'context 应从 checkpoint 恢复 verify 输出');
+});
+
+it('registerStageExecutor 插件扩展点', async function () {
+  const bus = makeMockServiceBus();
+  const pe = new PipelineEngine({ serviceBus: bus, log: { info() {}, warn() {}, error() {}, notify() {} } });
+  const pluginExecutor = vi.fn(async ({ params }) => ({
+    success: true,
+    output: { custom: params.foo },
+  }));
+  pe.registerStageExecutor('my_custom_type', pluginExecutor);
+  // 注册一个使用自定义 stage 类型的流水线
+  pe.registerPipeline({
+    name: 'test-plugin-stage-pipeline',
+    description: '测试插件 stage 扩展',
+    category: 'custom',
+    stages: ['custom_step'],
+    stageDefs: [{ name: 'custom_step', type: 'my_custom_type' }],
+  });
+  const startR = await pe.startOrchestrated('test-plugin-stage-pipeline', { autoAdvance: false, foo: 'bar' });
+  const r = await pe.executeStage(startR.runId);
+  expect(pluginExecutor).toHaveBeenCalledOnce();
+  eq(r.output.custom, 'bar');
+});
+
+it('registerPipeline 动态注册流水线', function () {
+  const pe = new PipelineEngine();
+  // 注册新流水线
+  const r1 = pe.registerPipeline({
+    name: 'test-dynamic-pipeline',
+    description: '动态注册测试',
+    category: 'custom',
+    stages: ['step1', 'step2'],
+  });
+  eq(r1.success, true);
+  // 在 listPipelines 中应可见
+  const list = pe.listPipelines();
+  ok(list.find(p => p.name === 'test-dynamic-pipeline'), '动态注册的流水线应在 list 中');
+  // 重复注册应失败
+  const r2 = pe.registerPipeline({ name: 'test-dynamic-pipeline', stages: ['x'] });
+  eq(r2.success, false);
+  ok(/already exists/.test(r2.error));
+  // 缺 stages 应失败
+  const r3 = pe.registerPipeline({ name: 'bad-pipeline' });
+  eq(r3.success, false);
+  ok(/stages/.test(r3.error));
+});
+
+it('registerPipeline 注册的流水线可启动和推进', function () {
+  const pe = new PipelineEngine();
+  pe.registerPipeline({
+    name: 'test-runnable-dynamic',
+    description: '可运行动态流水线',
+    category: 'custom',
+    stages: ['init', 'process', 'finalize'],
+    estimatedCost: 'low',
+  });
+  const r = pe.start('test-runnable-dynamic', { foo: 1 });
+  eq(r.success, true);
+  for (let i = 0; i < 3; i++) {
+    eq(pe.advance().success, true);
+  }
+  eq(pe.getStatus('test-runnable-dynamic').status, 'idle');
+});
+
+it('registerStageExecutor 在无 stageExecutor 时返回错误', function () {
+  const pe = new PipelineEngine(); // 无 serviceBus
+  const r = pe.registerStageExecutor('x', () => {});
+  eq(r.success, false);
+  ok(/StageExecutor/.test(r.error));
+});
+
+// ============================================================
+// 5. 现有 15 条流水线回归（state_machine 模式）
+// ============================================================
+
+it('现有 15 条流水线在 state_machine 模式下全部可启动', function () {
+  const pe = new PipelineEngine(); // 无 serviceBus，纯状态机
+  const list = pe.listPipelines();
+  eq(list.length, 15, '应有 15 条流水线（含 film-engineering 与 story2video-compose）');
+  for (const pl of list) {
+    const r = pe.start(pl.name, { test: true });
+    eq(r.success, true, pl.name + ' 应可启动');
+    pe.cancel();
+  }
+});
+
+it('story2video-compose 流水线已注册为第 15 条（2026-08-15：新增 film-engineering 后顺延）', function () {
+  const pe = new PipelineEngine();
+  const list = pe.listPipelines();
+  const s2v = list.find(p => p.name === 'story2video-compose');
+  ok(s2v, 'story2video-compose 应存在于流水线列表');
+  eq(s2v.category, 'generated');
+  const detail = pe.getPipeline('story2video-compose');
+  // 2026-08-11：新增 select_video_scenes 阶段（视频+图片轮播混合模式）与 scene_context 阶段（场景上下文增强中间层）
+  // 2026-08-14：domain_enrich 合并入 scene_context（merge-domain-enrich-into-scene-context），运行清单 8→7 阶段
+  eq(detail.stages.length, 7);
+  eq(detail.stageDefs[0].name, 'split');
+  eq(detail.stageDefs[1].name, 'scene_context');
+  eq(detail.stageDefs[2].name, 'optimize');
+  eq(detail.stageDefs[3].name, 'select_video_scenes');
+  eq(detail.stageDefs[4].name, 'generate_assets');
+  // 2026-08-12：分镜素材自选（manual）新增 finalize_assets 阶段定义（auto 模式不进入运行清单）
+  eq(detail.stageDefs[5].name, 'finalize_assets');
+  eq(detail.stageDefs[6].name, 'compose');
+  eq(detail.stageDefs[7].name, 'publish');
+});
+
+it('现有 14 条流水线可完整 advance 到完成', function () {
+  const pe = new PipelineEngine();
+  const list = pe.listPipelines();
+  for (const pl of list) {
+    pe.start(pl.name, {});
+    const detail = pe.getPipeline(pl.name);
+    for (let i = 0; i < detail.stages.length; i++) {
+      const r = pe.advance();
+      eq(r.success, true, pl.name + ' stage ' + i + ' 应可推进');
+    }
+    // 最后一次 advance 应返回 completed
+    const status = pe.getStatus(pl.name);
+    eq(status.status, 'idle', pl.name + ' 完成后应回到 idle');
+  }
+});
+
+// ============================================================
+// normalizeStageProgress 统一校验（阶段级进行中信息契约）
+// ============================================================
+describe('normalizeStageProgress 统一校验', () => {
+  it('合法更新归一化（percent 取整 + detail/summary 透传）', () => {
+    expect(normalizeStageProgress({
+      percent: 39.4,
+      message: '正在生成第 3/10 张图片',
+      detail: { done: 3, total: 10, kind: 'image' },
+      summary: '共 10 张图片',
+    })).toEqual({
+      percent: 39,
+      message: '正在生成第 3/10 张图片',
+      detail: { done: 3, total: 10, kind: 'image' },
+      summary: '共 10 张图片',
+    });
+  });
+
+  it('结构化本地化字段通过校验并保留参数', () => {
+    expect(normalizeStageProgress({
+      percent: 42,
+      message: 'Working…',
+      messageKey: 'stageProgress.assetsImage',
+      messageParams: { images: 2, imagesTotal: 4, nested: { ok: true } },
+      summary: 'Assets ready',
+      summaryKey: 'stageProgress.assetsSummary',
+      summaryParams: { done: 8, total: 8 },
+      detail: { done: 2, total: 4, kind: 'resource' },
+    })).toMatchObject({
+      messageKey: 'stageProgress.assetsImage',
+      messageParams: { images: 2, imagesTotal: 4, nested: { ok: true } },
+      summaryKey: 'stageProgress.assetsSummary',
+      summaryParams: { done: 8, total: 8 },
+    });
+  });
+
+  it('结构化本地化字段与 detail.kind 非法时 fail closed', () => {
+    const invalid = [
+      { messageKey: 'assetsImage' },
+      { messageKey: 'stageProgress.assetsImage', messageParams: { value: [] } },
+      { summaryKey: 'stageProgress.assetsSummary', summaryParams: { value: NaN } },
+      { detail: { done: 1, total: 2, kind: 'unknown' } },
+    ];
+    for (const extra of invalid) {
+      expect(normalizeStageProgress({ percent: 20, message: 'Working…', ...extra })).toBeNull();
+    }
+  });
+
+  it('percent 越界/非有限/强转穿透拒绝', () => {
+    for (const bad of [
+      { percent: -1, message: 'x' },
+      { percent: 101, message: 'x' },
+      { percent: NaN, message: 'x' },
+      { percent: Infinity, message: 'x' },
+      { percent: null, message: 'x' },
+      { percent: '39', message: 'x' },
+      { percent: true, message: 'x' },
+    ]) {
+      expect(normalizeStageProgress(bad), JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it('message 空/非字符串/超长拒绝', () => {
+    expect(normalizeStageProgress({ percent: 50, message: '' })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: '   ' })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 42 })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x'.repeat(81) })).toBeNull();
+  });
+
+  it('detail 越界/结构非法拒绝', () => {
+    expect(normalizeStageProgress({ percent: 50, message: 'x', detail: { done: 5, total: 3 } })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', detail: { done: -1, total: 3 } })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', detail: { done: 0, total: 0 } })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', detail: { done: 0, total: -2 } })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', detail: [1, 2] })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', detail: 'nope' })).toBeNull();
+  });
+
+  it('summary 非法 / 非对象 / 数组拒绝', () => {
+    expect(normalizeStageProgress(null)).toBeNull();
+    expect(normalizeStageProgress(undefined)).toBeNull();
+    expect(normalizeStageProgress([1])).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', summary: '' })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', summary: '  ' })).toBeNull();
+    expect(normalizeStageProgress({ percent: 50, message: 'x', summary: 'y'.repeat(81) })).toBeNull();
+  });
+});
+
+})
+
+

@@ -1,0 +1,47 @@
+// @ts-check
+/**
+ * Offline IPC handlers
+ */
+// eslint-disable-next-line no-unused-vars
+function registerHandlers(ipcMain, deps) {
+  const EC = require('../core/error-codes').ERROR
+  const log = require('../services/logger')
+  const { withSenderCheck } = require('./helpers')
+  const offlineManager = require("../services/offline-manager")
+
+  ipcMain.handle("offline:status", withSenderCheck(async function() {
+    try {
+      return { code: 0, data: offlineManager.getStatus() }
+    } catch (e) { log.warn('[ipc:offline]', ((e && e.message) || String(e))); return { code: EC.REQUEST_ERROR, message: e.message } }
+  }))
+
+  ipcMain.handle("offline:is-offline", withSenderCheck(async function() {
+    try {
+      return { code: 0, data: offlineManager.isOffline() }
+    } catch (e) { log.warn('[ipc:offline]', ((e && e.message) || String(e))); return { code: EC.REQUEST_ERROR, message: e.message, data: false } }
+  }))
+
+  ipcMain.handle("offline:cached-tasks", withSenderCheck(async function() {
+    try {
+      return { code: 0, data: offlineManager.loadCache() }
+    } catch (e) { log.warn('[ipc:offline]', ((e && e.message) || String(e))); return { code: EC.REQUEST_ERROR, message: e.message, data: [] } }
+  }))
+
+  ipcMain.handle("offline:add-to-cache", withSenderCheck(async function(event, task) {
+    try {
+      const ok = offlineManager.addToCache(task)
+      // R52 修复：统一返回格式，补充 data 字段
+      return { code: ok ? 0 : EC.REQUEST_ERROR, data: ok, message: ok ? "已缓存" : "缓存失败" }
+    } catch (e) { log.warn('[ipc:offline]', ((e && e.message) || String(e))); return { code: EC.REQUEST_ERROR, message: e.message } }
+  }))
+
+  ipcMain.handle("offline:clear-cache", withSenderCheck(async function() {
+    try {
+      offlineManager.clearSuccessfulTasks()
+      // R52 修复：统一返回格式，补充 data 字段
+      return { code: 0, data: true, message: "已清理" }
+    } catch (e) { log.warn('[ipc:offline]', ((e && e.message) || String(e))); return { code: EC.REQUEST_ERROR, message: e.message } }
+  }))
+}
+
+module.exports = registerHandlers

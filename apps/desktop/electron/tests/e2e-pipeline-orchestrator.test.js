@@ -1,0 +1,248 @@
+// E2E 集成测试 - 验证 PipelineEngine orchestrator 模式端到端执行 story2video-compose 流水线
+// 前置条件：smart-sentence-splitter 已在 8002 启动。
+// Story2Video 优化阶段统一走 prompt-engine（PromptBridge / 8013），
+// 本测试注入 mock PromptBridge，不依赖真实 prompt-engine 服务与 LLM key。
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const ServiceBus = require('../services/service-bus');
+const SplitterBridge = require('../services/splitter-bridge');
+const { StageExecutor } = require('../services/stage-executor');
+const { PipelineEngine } = require('../services/pipeline-engine');
+const { registerStory2VideoStages } = require('../services/story2video-stages');
+
+function createMockPromptEngine() {
+  const calls = [];
+  const promptBridge = {
+    calls,
+    start: async () => {},
+    stop: async () => {},
+    healthCheck: async () => true,
+    optimize: async (request) => {
+      calls.push(request);
+      return {
+        optimized_prompt: 'E2E visual prompt: ' + request.prompt,
+        platform: request.platform || 'generic',
+        style: request.style || null,
+        model_used: 'e2e-model',
+        key_source: 'config',
+      };
+    },
+    optimizeBatch: async (requests) => requests.map((request) => ({
+      optimized_prompt: 'E2E visual prompt: ' + request.prompt,
+      platform: request.platform || 'generic',
+      style: request.style || null,
+      model_used: 'e2e-model',
+      key_source: 'config',
+    })),
+  };
+  return promptBridge;
+}
+
+// 构造依赖注入的容器（attach 到外部已运行的 Python 服务）
+async function buildContainer({ promptBridge = createMockPromptEngine() } = {}) {
+  const splitterBridge = new SplitterBridge({});
+  await splitterBridge.start();
+  const pythonBridge = {
+    isRunning: () => true,
+    requestBackend: async () => ({ code: 0, data: {} }),
+    startPythonBackend: async () => {},
+    stopPythonBackend: async () => {},
+  };
+
+  const serviceBus = new ServiceBus({
+    pythonBridge,
+    splitterBridge,
+    promptBridge,
+    // E2E 测试用 mock 引擎（真实引擎需要图片/音频文件）
+    story2videoEngine: {
+      compose: async () => ({
+        code: 0,
+        data: { videoPath: '/tmp/e2e_test.mp4', fileSize: 1024, segmentCount: 2, duration: 5.0 },
+      }),
+    },
+    log: { info: () => {}, warn: () => {}, error: () => {}, notify: () => {} },
+  });
+  const stageExecutor = new StageExecutor({
+    serviceBus,
+    container: {},
+    log: { info: () => {}, warn: () => {}, error: () => {}, notify: () => {} },
+  });
+  const pipelineEngine = new PipelineEngine({
+    serviceBus,
+    stageExecutor,
+    container: {},
+    log: { info: () => {}, warn: () => {}, error: () => {}, notify: () => {} },
+  });
+
+  registerStory2VideoStages(pipelineEngine);
+
+  return { pipelineEngine, serviceBus, promptBridge };
+}
+
+test('PipelineEngine orchestrator - story2video-compose 流水线稳定排在首位', { timeout: 10000 }, () => {
+  const pe = new PipelineEngine({ log: { info: () => {}, warn: () => {}, error: () => {}, notify: () => {} } });
+  const list = pe.listPipelines();
+  const s2v = list.find(p => p.name === 'story2video-compose');
+  assert.ok(s2v, 'story2video-compose 应存在于流水线列表');
+  assert.equal(list[0].name, 'story2video-compose', 'Story2Video 应优先显示');
+  assert.equal(s2v.category, 'generated');
+  assert.equal(list.length, 14, '总流水线数应为 14');
+});
+
+test('PipelineEngine orchestrator - startOrchestrated 创建 run 并标记为 orchestrator 模式', { timeout: 60000 }, async () => {
+  const { pipelineEngine } = await buildContainer();
+  const res = await pipelineEngine.startOrchestrated('story2video-compose', {
+    text: '美丽的日落。海边的椰子树。',
+    autoAdvance: false,
+  });
+  assert.ok(res.success, '应成功创建 orchestrator run');
+  assert.ok(res.runId, '应返回 runId');
+  const ctx = pipelineEngine.getRunContext(res.runId);
+  assert.ok(ctx !== null, '应返回 context 对象');
+});
+
+test('PipelineEngine orchestrator - stage 1 (split) 执行成功并写入 context', { timeout: 60000 }, async () => {
+  const { pipelineEngine } = await buildContainer();
+  const res = await pipelineEngine.startOrchestrated('story2video-compose', {
+    text: '美丽的日落。海边的椰子树。远处的帆船。',
+    autoAdvance: false,
+  });
+  const execRes = await pipelineEngine.executeStage(res.runId);
+  if (!execRes.success) console.log('  stage 1 error:', execRes.error);
+  assert.ok(execRes.success, 'stage 1 应执行成功');
+  assert.ok(execRes.output, '应返回 output');
+  const ctx = pipelineEngine.getRunContext(res.runId);
+  assert.ok(ctx.split, 'context 应包含 split 结果');
+  assert.ok(ctx.split.scenes?.length > 0, 'split 应返回 scenes');
+  console.log('  stage 1 (split) 完成，场景数:', ctx.split.scenes?.length);
+});
+
+test('PipelineEngine orchestrator - scene_context 后由 prompt-engine 执行 optimize', { timeout: 60000 }, async () => {
+  const { pipelineEngine, promptBridge } = await buildContainer();
+  const res = await pipelineEngine.startOrchestrated('story2video-compose', {
+    text: '美丽的日落。海边的椰子树。',
+    autoAdvance: false,
+    // domain_enrich 合并入 scene_context 后阶段数 8→7；手动逐步执行跳过 checkpoint 暂停，
+    // 否则 optimize 完成后下一次 executeStage 会重跑 optimize。
+    checkpointPolicy: 'none',
+  });
+  for (const stageName of ['split', 'scene_context', 'optimize']) {
+    const execRes = await pipelineEngine.executeStage(res.runId);
+    if (!execRes.success) console.log('  ' + stageName + ' error:', execRes.error, execRes.details);
+    assert.ok(execRes.success, stageName + ' 应执行成功');
+  }
+  const ctx = pipelineEngine.getRunContext(res.runId);
+  assert.ok(ctx.split, 'context 应包含 split 结果');
+  assert.ok(ctx.scene_context, 'context 应包含 scene_context 结果');
+  assert.ok(ctx.optimize, 'context 应包含 optimize 结果');
+  assert.equal(ctx.optimize[0].providerId, 'prompt-engine');
+  const enrichedScenes = ctx.scene_context.scenes || ctx.scene_context.sentences || ctx.scene_context;
+  assert.ok(Array.isArray(enrichedScenes), 'scene_context 应提供场景数组');
+  assert.equal(promptBridge.calls.length, enrichedScenes.length,
+    'prompt-engine 应逐场景接收 scene_context 输出');
+  assert.ok(promptBridge.calls.every(call => typeof call.prompt === 'string' && call.prompt.length > 0),
+    '优化请求必须携带场景 prompt seed');
+  assert.ok(promptBridge.calls.every(call => call.auto_detect_style === true || call.style),
+    '优化请求必须启用自动风格检测或显式风格');
+  assert.ok(ctx.optimize.every(item => item.optimized_prompt.startsWith('E2E visual prompt:')),
+    '优化输出必须来自 mock prompt-engine');
+  assert.ok(ctx.optimize.every(item => item.providerId === 'prompt-engine' && item.model === 'e2e-model'),
+    '优化输出必须保留 prompt-engine 身份');
+  console.log('  scene_context + optimize 完成');
+});
+
+test('PipelineEngine orchestrator - prompt-engine 不可用时 optimize 明确 fail-closed', { timeout: 60000 }, async () => {
+  const unavailablePromptBridge = {
+    start: async () => {},
+    stop: async () => {},
+    healthCheck: async () => false,
+    optimize: async () => { throw new Error('PromptBridge is not running'); },
+    optimizeBatch: async () => [],
+  };
+  const { pipelineEngine } = await buildContainer({ promptBridge: unavailablePromptBridge });
+  const res = await pipelineEngine.startOrchestrated('story2video-compose', {
+    text: '美丽的日落。海边的椰子树。',
+    autoAdvance: false,
+  });
+  assert.ok(res.success, '应成功创建 orchestrator run');
+  for (const stageName of ['split', 'scene_context']) {
+    const execRes = await pipelineEngine.executeStage(res.runId);
+    assert.ok(execRes.success, stageName + ' 应执行成功');
+  }
+  const optimize = await pipelineEngine.executeStage(res.runId);
+  assert.equal(optimize.success, false, 'prompt-engine 不可用必须阻止 optimize');
+  assert.match(optimize.error, /prompt-engine|PromptBridge|not running/i, '应返回可操作的 prompt-engine 错误');
+});
+
+test('PipelineEngine orchestrator - advanceToNextCheckpoint 推进到完成', { timeout: 120000 }, async () => {
+  const { pipelineEngine } = await buildContainer();
+  const res = await pipelineEngine.startOrchestrated('story2video-compose', {
+    text: '美丽的日落。海边的椰子树。',
+    autoAdvance: true,
+  });
+  if (!res.success) console.log('  autoAdvance error:', res.error, res.results);
+  assert.ok(res.success, 'autoAdvance 应执行成功');
+  // 流水线完成后 run 从 _runs 删除，context 通过返回值传递
+  const ctx = res.context || pipelineEngine.getRunContext(res.runId);
+  assert.ok(ctx, '应返回 context');
+  console.log('  context keys:', Object.keys(ctx).join(', '));
+  console.log('  autoAdvance 完成，paused:', res.paused);
+});
+
+
+// ── 字幕分句 v1.2 真实 8002 链路回归（5 段用户坏例）──────────────────────────
+// 断言 Python sidecar（smart-sentence-splitter /v1/split）实际返回的字幕块序列
+// 不再劈词（扶余国/电视剧/复杂 等），与共享向量 expected_blocks 逐字一致。
+const USER_SUBTITLE_CASES = [
+  {
+    label: '扶余神话（顿号短块+连词）',
+    text: '故事里充满了神话色彩。卵生、日影受孕、鱼鳖搭桥，但剥去这些奇幻的外壳，内核却无比清晰。',
+    expected: ['故事里充满了神话色彩', '卵生、日影受孕、鱼鳖搭桥', '但剥去这些奇幻的外壳', '内核却无比清晰'],
+  },
+  {
+    label: '扶余国 不劈词',
+    text: '因此，在韩国的历史教科书里，能看到大量关于扶余国和扶余人的记载。',
+    expected: ['因此，在韩国的历史教科书里', '能看到大量关于扶余国', '和扶余人的记载'],
+  },
+  {
+    label: '电视剧《朱蒙》不劈词',
+    text: '2005年，韩国收视率最高的电视剧《朱蒙》播出，里面讲述的正是这位扶余王子的故事。',
+    expected: ['2005年，韩国收视率最高的', '电视剧《朱蒙》播出', '里面讲述的正是', '这位扶余王子的故事'],
+  },
+  {
+    label: '燕国/空白一片 不劈词',
+    text: '西周人对东北的了解本就模糊，连分封在河北的燕国早期历史都空白一片，更不要说辽西以东的虚实。',
+    expected: ['西周人对东北的了解本就模糊', '连分封在河北的', '燕国早期历史都空白一片', '更不要说辽西以东的虚实'],
+  },
+  {
+    label: '复杂/顿号枚举整体保留',
+    text: '历史上的族群迁徙与政权更迭本就复杂，而民族叙事则倾向于把一切复杂简单化、直线化。',
+    expected: ['历史上的族群迁徙', '与政权更迭本就复杂', '而民族叙事则倾向于', '把一切复杂简单化、直线化'],
+  },
+  {
+    label: '声音枚举吞谓语/滚烫不劈词',
+    text: '枪声、爆炸声、呐喊声混成一锅滚烫的粥。',
+    expected: ['枪声、爆炸声、呐喊声', '混成一锅滚烫的粥'],
+  },
+]
+
+test('E2E real 8002 - 5 段用户坏例字幕分块符合 v1.2 目标', { timeout: 180000 }, async () => {
+  const { pipelineEngine } = await buildContainer()
+  for (const c of USER_SUBTITLE_CASES) {
+    const res = await pipelineEngine.startOrchestrated('story2video-compose', {
+      text: c.text,
+      autoAdvance: false,
+    })
+    assert.ok(res.success, '应创建 run: ' + res.error)
+    const execRes = await pipelineEngine.executeStage(res.runId)
+    assert.ok(execRes.success, c.label + ' split 应成功: ' + execRes.error)
+    const scenes = execRes.output && execRes.output.scenes
+    assert.ok(Array.isArray(scenes) && scenes.length > 0, c.label + ' 应返回 scenes')
+    const blocks = scenes.flatMap((s) => s.subtitleBlocks || [])
+    assert.deepEqual(blocks, c.expected, c.label + ' 字幕块应命中 v1.2 目标')
+    console.log('  [8002] ' + c.label + ' → ' + blocks.join(' | '))
+    // 释放并发槽：本轮只验证 split 阶段，run 不推进到终态时手动取消
+    pipelineEngine.cancel()
+  }
+})

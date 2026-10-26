@@ -1,0 +1,1177 @@
+# PRD — 「更多」菜单新增「热门选题」功能模块
+
+- 文档编号：PRD-HOT-TOPICS-MODULE-2026-09-11
+- 状态：已合并（PR #1701，squash 提交 76e555bf，2026-09-11）；2026-09-12 追加「一键生成视频」（§3.10/§5.6）；2026-09-13 修正「后台运行后的并发语义」（前端不再自设单任务锁，支持多任务并行，§3.10/§5.6/§6.6/§6.7）；2026-09-19 修正「收藏列表 UI 与行样式作用域缺陷」并补齐创作/生成视频入口（§10.7.6）；2026-10-17 弹窗 footer 统一为 `UiButton` 四按钮并新增完成出口【查看】【去发布】，成功后弹窗保持打开、不再自动跳转结果页（§6.6，详见 `01-docs/PRD-VIDEO-PIPELINE-PROGRESS-MODAL-2026-10-17.md`）
+- 关联分支：`codex/hot-topics-module`
+- 关联模块：`apps/desktop/src/views/HotTopics.vue`、`apps/desktop/electron/services/hot-topics-service.js`
+- 创建日期：2026-09-11
+
+## 1. 背景与目标
+
+自媒体创作者（图文与视频）的核心痛点之一是「选题」：不知道今天写什么、拍什么。各大平台（微博、知乎、百度、B站、抖音、头条等）每天都会产生热搜榜/热榜标题，这些标题天然就是内容选题或标题素材，但分散在十几个网站里，人工逐个查看效率极低。
+
+本需求在应用左侧菜单「更多」分组中新增「热门选题」模块，用于：
+
+1. 从多个公开渠道定期聚合热门选题（热搜榜标题），形成统一列表；
+2. 按常见内容类别（综合/社会/财经/科技/娱乐/体育/情感/教育/健康/国际）分类展示；
+3. 每个选题带勾选框，支持批量操作：【创作文案】（跳转文案改写页，自动进入选题创作模式并自动开始改写）与【一键发布】（先自动改写生成新文案，再走采集页一键发布流程）；
+4. 采集过程复用采集模块的防反爬体系（限流、熔断、冷却、缓存），避免封 IP。
+
+## 2. 术语定义
+
+| 术语 | 含义 |
+|------|------|
+| 热门选题（选题/选题） | 自媒体内容（图文和视频）的文案内容选题或标题；常见形态是一个词汇、一句话或一个短句；来源于各平台热搜榜/热榜的标题条目 |
+| 渠道 | 提供热门选题数据的公开站点/接口，如知乎热榜、今日头条热榜、百度热搜等 |
+| 分类 | 选题所属内容类别，共 10 类：综合、社会、财经、科技、娱乐、体育、情感、教育、健康、国际 |
+| 创作文案 | 把选题文本带入文案改写页输入框、改写模式设为「选题创作」并自动开始改写的动作 |
+| 一键发布 | 对选中选题先批量自动改写、生成新文案存为草稿，再跳转发布页草稿列表的流程 |
+| 选题创作 | 文案改写页已有改写模式（`create`），以给定选题为起点创作全新文案 |
+| 渠道原生分类 | 渠道接口返回数据中自带的选题分类字段（如头条的 Category、腾讯的领域信息） |
+
+## 3. 功能范围
+
+### 3.1 菜单入口（P0）
+
+- 左侧菜单「更多」分组（`MpSidebar.vue` 的 `moreItems`）新增一项：`{ key: 'hot-topics', label: t('hotTopics.menuLabel'), to: '/hot-topics', icon: TrendCharts }`。
+- 路由 `/hot-topics` 懒加载 `HotTopics.vue`，路由名 `HotTopics`。
+- 菜单 label 走 i18n key `hotTopics.menuLabel`（zh/en 成对）。
+
+### 3.2 选题列表页（P0）
+
+- 页面结构：顶部标题区（页面标题 + 描述 + 分类筛选 chips + 渠道筛选下拉 + 【刷新】按钮 + 上次刷新时间）→ 批量操作条（全选/取消全选 + 已选计数 + 【创作文案】+【一键发布】）→ 选题列表。
+- 每个选题条目：勾选框 + 排名徽标（渠道内排名）+ 选题标题 + 分类标签 + 渠道标签 + 热度值（如有）+ 单条【创作文案】快捷按钮。
+- 列表为空时展示空状态：标题「暂无热门选题」+ 描述「点击刷新按钮获取最新选题，或等待自动刷新」+ 【立即刷新】按钮。
+- 加载中展示加载指示器。
+- 单渠道失败不阻塞整体：列表正常渲染其余渠道数据，失败渠道在渠道下拉中标记「不可用」并在页面顶部以警告条提示「部分渠道获取失败：xxx」。
+
+### 3.3 分类体系（P0）
+
+10 个分类，映射规则：
+
+1. **渠道原生分类优先**：头条 `Category`、腾讯领域字段直接映射到 10 类之一（映射表见 5.2）；无法映射的原生分类归入综合。
+2. **关键词规则兜底**：无原生分类的渠道（知乎/B站/抖音/百度/tophub-微博）用类别关键词表匹配（如 财经：股票/基金/A股/楼市/房价/经济；科技：AI/芯片/手机/互联网；情感：恋爱/婚姻/离婚/相亲；体育：足球/篮球/奥运；娱乐：明星/综艺/电影/演唱会；教育：高考/考研/开学；健康：医院/疫苗/养生；国际：美国/日本/韩国/国际）。
+3. **兜底归综合**：规则匹配不中的选题归入「综合」。
+
+### 3.4 创作文案（P0）
+
+- 单条快捷按钮与批量【创作文案】：跳转 `/rewrite?topic=<encodeURIComponent(topic)>`。
+- 改写页 `RewriteView.vue` 读取 `route.query.topic`：非空时填入 `content`，`rewriteMode` 设为 `create`（选题创作），并自动调用 `startRewrite()`。
+- topic 为空/缺失时不做任何填充，保持页面原状（防止误触发）。
+- 自动改写前置校验与手动一致：内容 ≥20 字符才启动；不足 20 字符的选题（如单个词汇）自动补充引导语「请以下面这个选题为主题，创作一篇适合自媒体发布的文案：」以满足长度门槛并给 AI 明确指令。
+
+**topic 长度补足规则**：选题长度不足 20 字符时，前置引导语 + 选题原文拼接作为改写输入：
+
+```
+请以下面这个选题为主题，创作一篇适合自媒体发布的文案：
+${topic}
+```
+
+### 3.5 一键发布（P0）
+
+- 勾选选题 + 点击【一键发布】→ 弹出与采集页相同的 `PublishDestinationModal`，用户选择「图文发布」或「视频发布」。
+- 选择后进入批量自动改写阶段：逐条调用改写 IPC（`aiRewrite`，模式 `create`），页面内显示批量进度（已完成 n/总数、每条成功/失败状态、整体进度条）；失败条目标红，支持单条重试。
+- 全部改写完成后：逐条把改写结果存为草稿（复用采集页 `saveDraftAfterRewrite` 的草稿构造逻辑），然后跳转：
+  - 图文发布 → `/publish`（草稿列表，用户逐条确认发送）；
+  - 视频发布 → `/create?draft=<lastDraftId>`（视频创作页，带入最后一个草稿）。
+- 批量改写中途用户可【取消】：已完成的草稿保留，未完成的条目恢复未改写状态。
+
+### 3.6 定时刷新（P0）
+
+- 应用启动后首次进入页面自动拉取（若缓存超过 10 分钟）。
+- 页面内每 30 分钟自动刷新一次（可配置，设置项 `hotTopics.refreshIntervalMinutes`，默认 30，范围 5-120）。
+- 单渠道最小抓取间隔：知乎/头条/腾讯/B站 5 分钟，抖音 15 分钟，百度 10 分钟，tophub 30 分钟（由渠道策略配置控制，复用 rate-limiter）。
+- 刷新结果缓存落 SQLite（settings 表 key `hot_topics_cache`），结构：`{ topics: [...], fetchedAt, channelStats }`；缓存有效期 10 分钟（`CACHE_TTL_MS = 10 * 60 * 1000`）。
+
+### 3.7 防反爬体系（P0）
+
+复用 `packages/collection-engine` 现有组件：
+
+| 组件 | 用途 |
+|------|------|
+| `rate-limiter.js` | 单渠道最小间隔 + 随机抖动 + 活跃时段 |
+| `circuit-breaker.js` | 连续 3 次失败熔断 30 分钟 |
+| `content-cache.js` | URL+内容哈希去重，避免重复抓取 |
+| `default-strategies.json` | 渠道级参数（riskLevel/dailyBudget/interval） |
+
+请求层约定：
+
+- 统一 `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)`（桌面 Chrome UA）；
+- 抖音渠道必须携带 `Referer: https://www.douyin.com/`（实测缺 Referer 返回空 body）；
+- 超时 10 秒（`AbortController`），失败不自动重试（熔断器计数），下次刷新周期再试；
+- 每渠道每次刷新最多取 top 20 条；
+- SSRF 防护：仅允许 https/http、拒绝内网地址。
+
+### 3.8 渠道清单（P0 接入 7 个）
+
+| # | 渠道 | 端点 | 格式 | 登录 | 建议间隔 |
+|---|------|------|------|------|---------|
+| 1 | 知乎热榜 | `www.zhihu.com/api/v4/creators/rank/hot?domain=0` | JSON | 无 | 5-10 分钟 |
+| 2 | 今日头条 | `www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc` | JSON | 无 | 5-10 分钟 |
+| 3 | 腾讯新闻 | `r.inews.qq.com/gw/event/hot_ranking_list?page_size=20` | JSON | 无 | 10 分钟 |
+| 4 | 哔哩哔哩 | `api.bilibili.com/x/web-interface/popular?ps=20&pn=1` | JSON | 无 | 10 分钟 |
+| 5 | 抖音热点 | `www.douyin.com/aweme/v1/web/hot/search/list/` | JSON | 无（需 Referer） | 15 分钟 |
+| 6 | 百度热搜 | `top.baidu.com/board?tab=realtime` | HTML 内嵌 JSON | 无 | 10 分钟 |
+| 7 | tophub.today（含微博榜） | `tophub.today` 聚合页 | HTML | 无 | 15-30 分钟 |
+
+明确不接入：微博直连（432/passport 反爬）、RSSHub 公共实例（Cloudflare 拦截）、网易新闻（端点失效）。tophub 作为微博数据的间接来源。
+
+### 3.9 非目标（Out of Scope）
+
+- 不做选题搜索/自定义选题订阅；
+- 不做选题热度趋势图/历史对比；
+- 不做 AI 自动分类（本期用原生分类+规则）；
+- 不做发布动作的全自动发送（发布仍需用户在发布页确认）；
+- 不做自建 RSSHub/代理池。
+
+### 3.10 一键生成视频（P0，2026-09-12 新增）
+
+每条选题新增【生成视频】按钮（与【创作文案】并列，data-testid="hot-topic-generate-video-{id}"）。点击后弹出与视频创作页流水线进度弹窗同样 UI 的进度弹窗（UiModal variant=progress + StageProgress），自动执行完整编排：
+
+1. **文案改写阶段**（stage 名 rewrite_copy）：调用 aiRewrite(mode='create', content=buildRewriteInput(topic))，输入构造与一键发布一致（<20 字补引导前缀）。改写产物自动存入草稿箱（draftSave，source='hot-topics'，草稿保存失败不阻断视频生成）。
+2. **自动启动故事讲述流水线**：读取用户已保存的默认选项（settings key story2video.lastOptions.v1，owner-scoped SQLite；缺失/非法回退内置默认值），用共享纯函数 buildStory2VideoTextConfigFromSnapshot 构建 story2videoTextConfig，调用 pipelineStartOrchestrated('story2video-compose', params)。params 与创作页 startOrchestratedPipeline 完全一致（text=改写产物、inputMode='text'、checkpointPolicy='none'、autoAdvance=true、background=true、uiLocale）。
+3. **进度实时跟踪**：启动成功后订阅 onPipelineUpdate 实时推送 + 3s 轮询 pipelineGetRunContext 兜底（双通道，与创作页 startOrchestrationForeground 同口径）。runId 快照守卫防竞态。
+4. **完成跳转**：流水线 completed 且提取到 videoPath（publish/compose 上下文的 videoPath/path）→ 关闭弹窗跳转 /create/result?path=...。
+
+弹窗 stages = [rewrite_copy, split, scene_context, optimize, select_video_scenes, generate_assets, compose, publish]（8 阶段，改写环节在最前）。进度百分比 = 已完成阶段数/总数 + 流水线 run progress 映射到当前阶段区间；耗时从点击开始累计；StageProgress 的合成时间参考说明（showTimeGuidance）开启。
+
+**取消语义**：
+- 改写/启动阶段取消 = 仅中止前端编排（流水线尚未启动，无副作用）；
+- 流水线运行中取消 = 调用 pipelineCancel()（取消当前 run）；
+- 运行中关闭弹窗（右上角 ×）= 后台运行（停止前端跟踪并复位前端态，run 继续在主进程执行，提示可在视频创作页历史记录查看）；
+- 改写/启动阶段关闭弹窗（右上角 ×，此时尚无 run）= 中止前端编排：使在途 aiRewrite / pipelineStartOrchestrated 响应失效（genVideoSeq 递增），弹窗关闭且不产生后台任务（无 run 可脱离，不误报「已转入后台」）。
+
+**后台运行按钮**（2026-09-13 新增，与视频创作页进度弹窗对齐；2026-09-13 修正脱离后的复位语义）：
+
+- 弹窗 footer 在【重试】与【取消】之间新增显式【后台运行】按钮（data-testid="hot-topics-gen-video-background"，文案 hotTopics.genVideoBackgroundRun），仅当 genVideoPhase === 'running' 且持有 runId 时显示；
+- 点击行为与右上角 × 的后台语义完全一致（复用唯一公共脱离路径 handleGenVideoClose）：停止前端跟踪（轮询/订阅/计时器）并调用 resetGenVideoFrontendState() 复位前端态（弹窗关闭、phase='idle'、topic/stages/runId/progress/errorText/startedAt 清空、**genVideoBusy 释放**）、主进程 run 不受影响继续执行、不调用 pipelineCancelRun；
+- 额外触发**全局居中提示**（见 §6.6）：应用界面正中央显示「如果想查看该任务，请进入视频创作的历史记录」，4 秒后自动消失；同时顶部 toast 提示 hotTopics.genVideoBackgroundHint；
+- 改写/启动阶段（无主进程 run）与终态（completed/failed/cancelled）不显示该按钮——脱离无意义或已无任务可脱离。
+
+**失败重试**：改写失败 → 重试从改写开始；流水线启动失败 → 重试跳过改写（产物已缓存）直接重启流水线。失败阶段在弹窗中标红显示错误摘要。
+
+**并发约束（2026-09-13 修正）**：热门选题的一键生成视频**支持多任务并行**，与视频创作页流水线语义完全一致——后台脱离（或终态关闭）后前端立即复位，所有选题的【生成视频】按钮恢复可用，用户可对任意选题再次发起任务；并发的权威闸门是**主进程流水线并发门禁**（maxConcurrentRuns，超限返回 PIPELINE_CONCURRENCY_LIMIT，提示「当前已有 N 条流水线正在运行，最多同时运行 M 条」），前端按「流水线启动失败」处理并展示错误摘要 + 【重试】（重试跳过改写）。前端 busy 守卫只在**同一弹窗编排在途时**生效（rewriting/starting/running 且尚未脱离），用于避免同一弹窗内产生两条不受跟踪的编排，不用于限制并行任务数。详见 §6.7。
+
+### 3.11 抓取失败时的缓存韧性（P0，2026-09-14 新增）
+
+**背景（实测缺陷）**：热门选题列表依赖 8 个外部渠道的并发抓取。当**全部渠道**在同一轮刷新中失败或跳过时（网络抖动、请求被 10 秒 `AbortController` 超时中断、渠道限流/熔断跳过、代理不可用等），聚合结果是「零选题」。修复前该空结果会**直接覆盖**上一次成功抓取的缓存，导致：
+
+- 用户已抓到的选题（实测 138 条）被清空；
+- 列表立即落入「暂无热门选题」空态；
+- 空态**不可自愈**：定时刷新（30 分钟）依赖网络恢复，而缓存的 `fetchedAt` 已被刷新为新时间，10 分钟 TTL 内 `fetchTopics({ force: false })` 会继续命中这份空缓存直接返回，必须用户手动点【刷新】才可能恢复。
+
+**需求**：抓取失败可以降级，但**不得销毁已有数据**；陈旧数据必须继续可读，且必须让用户看见「这批数据是旧的、且本次抓取失败了」。
+
+**规则**：
+
+| # | 规则 | 说明 |
+|---|------|------|
+| R1 | 零结果不覆盖非空缓存 | 本轮解析出的 `topics.length === 0` 且上一份缓存 `topics.length > 0` 时，**保留**上次 `topics` 数组（元素引用不重新构造，保持 `id/topic/channel/category/rank/hotValue/url/fetchedAt` 原值） |
+| R2 | 保留陈旧 `fetchedAt` | 保留上次的 `fetchedAt`（**不**写成当前时间）。这样 10 分钟 TTL 判定为「已过期」，下一次非 force 调用会继续重试网络，而不是命中空缓存直接返回 |
+| R3 | 失败原因如实上报 | 本轮 `channelStats`（各渠道 `ok/skipped/error/count`）**照常落盘并返回**，供 UI 展示「部分渠道获取失败：xxx」告警条，不得因为保留缓存而掩盖失败 |
+| R4 | 显式标记 | 保留态结果带 `preservedStaleCache: true`，供上层（渲染层/诊断）区分「真实抓取结果」与「保留的陈旧缓存」 |
+| R5 | 空→空不变 | 上一份缓存本就为空时，行为与修复前一致：写入本轮空结果（`topics: []` + 当前 `fetchedAt`），且**不**产生 `preservedStaleCache` 标记 |
+| R6 | 部分成功正常覆盖 | 只要本轮有任意一条选题解析成功，就正常覆盖缓存（不加保留标记），不做「新旧合并」——避免同一 `id`（`channel:rank`）在新旧批次中含义漂移 |
+| R7 | 跳过不算成功 | 渠道被限流节流（`skipped: true`）或熔断 OPEN 跳过时，`items` 为 null，不产生选题；全渠道皆为跳过时同样命中 R1 保留规则 |
+| R8 | 内存与持久化一致 | 保留结果经 `_writeCache` 同时写入内存 `memCache` 与 owner-scoped SQLite settings（key `hot_topics_cache`），保证重启后仍可读到保留内容 |
+
+**非目标**：不做新旧批次合并、不做渠道级局部保留（渠道 A 新一轮成功但 B 失败时，仍整体覆盖为新结果）、不引入本地离线素材兜底。
+
+### 3.12 热门选题成片自动发布（P0，2026-09-23 新增）
+
+「一键生成视频」链路生成**实际成片**后，支持自动把成片发布到全部可用自媒体平台账号（「能发的都发」）。该能力首先以 E2E 驱动阶段形式落地（`hot-topics-one-click-video-driver.js` 发布阶段 + 纯函数 helper `tests/e2e/lib/hot-video-publish-plan.js`），与 §3.10 的生成链路拼接成端到端闭环：选题 → 改写 → 故事讲述流水线 → 成片 → 多平台发布。
+
+**发布目标选择规则（buildPublishTargets）**：
+
+| # | 规则 | 说明 |
+|---|------|------|
+| T1 | 仅 active 账号 | `status === 'active'` 或 `is_active === true`；expired/失效一律排除 |
+| T2 | 必须有凭证 | `has_cookies !== false`（无凭证账号发了必失败，前置排除） |
+| T3 | 同平台多账号不去重 | 每个可用账号都是一个独立发布目标 |
+| T4 | 可选平台白名单 | `E2E_PUBLISH_PLATFORMS`（逗号分隔）仅白名单内平台参与；缺省 = 全平台 |
+| T5 | 无可用目标即失败 | 抛 `NO_PUBLISH_TARGETS`，计入 report.errors，不静默跳过 |
+
+**文章载荷校验（buildPublishArticle）**：
+
+| # | 字段 | 规则 |
+|---|------|------|
+| A1 | `title` | 取选题标题；trim 后为空抛错；超 `maxTitleLength`（默认 **60** 字符，按 Unicode 字符计数 slice）截断 |
+| A2 | `content` | 回退链：改写引擎全文（探针捕获的 `pipelineStartOrchestrated` params.text）→ 选题 summary → 选题 title |
+| A3 | `video_path` | **必填**：无实际成片不得发布，缺失直接抛错 |
+| A4 | `cover_path` | 由 `cover:extract`（首帧提取）产出；提取失败置空不阻断发布（平台自处） |
+| A5 | `tags` | 数组，缺省 `[]` |
+
+**发布与终态追踪流程**：每条成片 → `extractVideoCover(sourcePath)` 取封面 → `publishBatch(targets, article)` 入队（立即返回 `taskIds`）→ 轮询 `getQueueHistory()` 至全部任务进入终态（`success`/`failed`/`cancelled`，默认上限 15 分钟/条）。结果写入 `report.publish[]`：`{ topicIndex, runId, title, targets, taskIds, tasks: [{id, platform, accountId, status, error, resultUrl}], status: published|partial|failed|error }`。
+
+**权益门禁说明**：`publish:batch` 在 `CHANNEL_FEATURE_MAP` 映射 `cloud_publish` 权益；但开发/未打包模式（`app.isPackaged === false`）跳过业务权益校验（license-access-control.js L271-288 注释：本地验证发布流程不应被产品权益阻塞），因此本机 E2E 可直接发布。
+
+**环境变量（均向后兼容，缺省保持原生成-only 行为）**：`E2E_PUBLISH=1` 启用发布阶段；`E2E_PUBLISH_PLATFORMS=baijiahao,kuaishou` 平台白名单；`E2E_PUBLISH_TIMEOUT_MS` 单条终态等待上限（默认 900000）。
+
+## 4. 数据校验
+
+### 4.1 选题条目结构
+
+| 字段 | 类型 | 校验规则 |
+|------|------|---------|
+| `id` | string | 必填；`channel + ':' + rank`；列表 key 与操作定位依据 |
+| `topic` | string | 必填非空；trim 后长度 1-100；超长截断到 100 字符加省略号展示（完整文本保留在 title 属性） |
+| `channel` | string | 必填；7 渠道枚举之一（`zhihu/toutiao/tencent/bilibili/douyin/baidu/tophub`） |
+| `category` | string | 必填；10 分类枚举之一；缺省 `general`（综合） |
+| `rank` | number | 0-50；渠道内排名 |
+| `hotValue` | number \| null | 可空；渠道原始热度值（知乎热度分/B站播放等），仅展示用 |
+| `url` | string \| null | 可空；选题详情链接；仅允许 http/https 协议，其他协议丢弃置 null |
+| `fetchedAt` | string | ISO 时间戳；本批数据抓取时间 |
+
+### 4.2 校验与防御规则
+
+- **反序列化 fail-closed**：缓存读取 `JSON.parse` 失败或非对象/非数组 `topics` 时回退 `{ topics: [], fetchedAt: 0, channelStats: {} }`，不抛错。
+- **去重**：同批次跨渠道按 `topic.trim()` 归一化去重（保留先到者，记录 `mergedFrom: [channel]` 数组）；同渠道内按 rank 去重。
+- **HTML 实体解码**：HTML 渠道（百度/tophub）解析出的文本必须解码（`&amp;` 等）。
+- **XSS**：选题文本一律经 Vue 转义渲染（`{{ }}`），禁止 v-html。
+- **批量上限**：单次批量改写最多 20 条（超出提示「一次最多批量处理 20 条选题，请减少选择」）。
+- **空选择守卫**：【创作文案】/【一键发布】未勾选任何选题时提示「请先勾选至少一条选题」。
+- **缓存保留判定（2026-09-14 新增，对应 §3.11）**：写缓存前必须做一次「零结果 + 旧缓存非空」判定，命中时保留旧 `topics`/`fetchedAt` 并打 `preservedStaleCache` 标记；判定失败（如旧缓存字段缺失/非数组）时按空数组处理，**不得**因为保留逻辑抛错而中断刷新流程。
+- **保留态字段完整性**：保留的 `topics` 元素必须仍满足 §4.1 的字段校验（原样透传自上一次通过校验的批次，不在保留路径上二次加工）；`channelStats` 必须逐渠道给出 `{ ok: boolean, skipped: boolean, error: string|null, count: number }` 四字段，缺一不可。
+- **保留态不得伪造成「新鲜」**：`preservedStaleCache === true` 时 `fetchedAt` 必须早于当前时间（等于上一次的真实抓取时间），禁止写成 `Date.now()`。
+
+### 4.3 成片发布的平台侧载荷校验（P0，2026-09-23 新增，对应 §3.12 / §5.8）
+
+载荷离开应用前按 §3.12 表 A1-A5 校验；进入平台编辑器后按本表按平台差异二次校验（任一不满足即按「跳过该字段 + warn 日志」处理，不整单失败）：
+
+| # | 项 | 规则 | 取证来源 |
+|---|-----|------|----------|
+| P1 | 视频必填 | `article.video_path` 非空是「视频任务」的唯一判据：路由层据此把 RPA 超时抬到 **30 分钟**、队列任务超时抬到 **30 分钟**（见 §5.8 表 T-TO） | 300s/900s 预算下 bilibili 96MB 上传必被杀 |
+| P2 | 标题字段存在性 | 平台若无独立标题框（`sel.title_input` 全部候选超时），标题必须**回退写入正文编辑器**并与正文合并，此时正文步骤**跳过独立填充**（否则标题被纯正文覆写丢失） | `d4-1-kuaishou.json`：编辑页只有 `div#work-description-edit[contenteditable]` |
+| P3 | 合并文案长度 | 回退写入的「标题+正文」合并文本按平台 `max_content`（`platforms.yaml`，缺省 **2000**）截断；标题与正文之间以 `\n\n` 分隔 | 快手作品描述上限 |
+| P4 | 上传完成判定 | 必须同时满足「无负向信号」+「存在完成信号」（https 预览源 / 编辑器字段出现 / URL 落到 `post/video`），且最低稳定期 **25s**；仅凭 class 含 progress/success 不得判定完成 | smoke5/smoke6 误判实锤（blob 预览秒判） |
+| P5 | 必填声明 | 平台存在必填下拉（B 站「创作声明」）时必须先选中；选中后未确认不得上报成功（状态 `option-selected-no-confirm`） | `d5-bilibili.json`：`input.bcc-select-input-inner[placeholder="请选择符合您视频内容的创作声明"]` |
+| P6 | 遮罩清理 | 导航到发布页后、填写字段前必须清理草稿恢复/引导遮罩（如抖音「我知道了」），否则字段与发布按钮不可点 | `d5-douyin.json` |
+| P7 | 平台作品 ID | `baijiahao`/`kuaishou` 为严格平台：结果必须携带从**网络响应**提取的 `postId`（作品 ID），否则判 `failed: 发布结果缺少平台作品 ID`，禁止用 URL/localStorage 里的数字冒充 | 防「静默失败被记成成功」 |
+| P8 | 选择器候选 | 任何字段选择器都是**候选数组**，必须逐个尝试（首个候选命中即用，不得硬取 `[0]`） | 页面改版即全链失败 |
+
+### 4.4 发布文案恢复的数据校验（P0，2026-09-23 新增，对应 §5.10）
+
+| 字段 | 类型 | 必填 | 校验规则 | 不满足时 |
+|------|------|------|----------|----------|
+| `project.json.title` | string | 否 | 视为「正文片段候选」：若 `sourceText`（或拼接后的 segments 文本）以该值开头，则**不得**作为发布标题 | 丢弃该值，改从正文首句派生 |
+| `project.json.topicTitle` / `topic_title` / `topic.title` | string | 否 | 通过 `isHumanTitle` 且不是正文前缀 → 采纳为标题 | 继续尝试下一个候选 |
+| `project.json.sourceText` | string | 否 | 去首尾空白后长度 > 0 即作为正文首选 | 回退拼接 `segments[i].text`（按数组顺序，不排序） |
+| `project.json.segments[].text` | string[] | 否 | 仅取 string 且 trim 非空的项，按序 join（无分隔符） | 正文为空 → 返回三空，调用方必须跳过发布 |
+| 派生标题 | string | — | 取正文首个非空句（断句符为句号、叹号、问号、分号、换行），按 `maxTitleLength`（默认 60）截断，再剥离结尾句读 | 空串 |
+| slug 判定 `isHumanTitle` | boolean | — | 长度 2–120；含 CJK 直接通过；纯 ASCII 必须含空格且含 3 个以上连续字母 | 判为非法标题（例：`smart-sentence-splitter`、`story2video-compose`、`v2`） |
+
+不变式：
+
+- I-1：`readProjectCaption(null | 空对象 | 数组)` 必须返回 `{ title: '', text: '', titleSource: '' }`，不得抛错。
+- I-2：`readProjectCaption` 返回的 `{ title, text }` 直接喂给 `buildPublishArticle` 时，不得再触发「缺少标题」异常（除非正文与所有标题候选同时为空）。
+- I-3：任何情况下，纯 ASCII 标识符（引擎名 / slug / 流水线名）不得成为发布标题。
+- I-4：正文恢复优先级固定为 `sourceText` > `segments[].text` 顺序拼接 > `title`（仅当其形似正文：长度 ≥ 20 或含句读）。
+
+---
+
+## 5. 流程与功能逻辑
+
+### 5.1 刷新流程
+
+```
+进入页面（onMounted，SWR 缓存优先）
+  → hotTopicsGetCache() 读缓存（IPC，内存+SQLite，立即返回）
+    ├─ 缓存有数据（topics.length > 0）→ 立即渲染缓存内容（0 网络等待）
+    │   → 后台静默 refresh(force=false)：不显示中央提示、不打断已渲染内容
+    │   → 主进程缓存新鲜（<10min）直接返回缓存；过期则并发抓取后替换列表
+    └─ 缓存为空（首次使用）→ refresh(force=false) 网络抓取 + 中央加载提示
+
+点击【刷新】（手动，force=true）
+  → 显示中央加载提示（用户明确等待场景）→ 并发调用 7 渠道 fetch
+
+定时器触发（每 30 分钟，页面可见时）
+  → 后台静默 refresh(force=false)：无中央提示，不打断用户
+
+并发抓取（7 渠道，各自过 rate-limiter + circuit-breaker 门禁）
+  → 每渠道成功：解析 → 提取 top20 → 分类 → 入列表；失败：记入 channelStats.failed，不阻塞其他渠道
+  → 全部返回后：跨渠道去重 → 按 fetchedAt 写缓存 → 更新页面状态
+
+中央加载提示显隐规则
+  → 显示：首次进入无缓存抓取中 / 用户点击【刷新】手动抓取中
+  → 隐藏：抓取完成（成功/失败/异常）后淡出；后台静默刷新一律不显示
+  → 已有内容时后台刷新：列表原地更新，内容不消失、无遮挡
+```
+
+### 5.2 分类映射流程
+
+```
+选题条目
+  → 渠道有原生分类字段？
+    ├─ 是 → 查原生分类映射表（头条 Category → 10 类）→ 命中 → 用之
+    │        └─ 未命中 → 落入规则匹配
+    └─ 否 → 关键词规则匹配（10 类词表，优先级：国际 > 社会 > 财经 > 科技 > 娱乐 > 体育 > 情感 > 教育 > 健康）
+  → 规则不中 → 综合（general）
+```
+
+### 5.3 创作文案流程（单条与批量同构）
+
+```
+用户点击【创作文案】（单条或勾选后批量）
+  → 勾选校验（批量时 ≥1 条，上限 20）
+  → 单条：直接跳转 /rewrite?topic=xxx
+  → 批量：把勾选选题存入 sessionStorage（key hot_topics_selected，上限 20 条）
+        → 跳转 /rewrite?topic=<第一条>
+        → 改写页读完 query 后保留 session 队列供后续手动消费（本期简化：批量创作=存队列 + 首条自动开始，改写页不新增队列 UI）
+```
+
+### 5.4 一键发布流程
+
+```
+勾选选题 + 点击【一键发布】
+  → 弹 PublishDestinationModal
+  → 用户选「图文发布」或「视频发布」
+  → 批量自动改写（逐条 aiRewrite，模式 create，输入=引导语+topic）
+  → 进度展示：n/total、单条状态（pending/rewriting/success/failed）、进度条
+  → 单条失败：标红 + 【重试】按钮；整体不中断
+  → 全部完成（或用户点【取消】）
+  → 成功条目逐条存草稿（title=改写结果标题或选题、content=改写正文、source='hot-topics'）
+  → 图文：跳 /publish（草稿列表）
+  → 视频：跳 /create?draft=<lastDraftId>
+```
+
+### 5.5 定时刷新逻辑
+
+```
+onMounted
+  → hotTopicsGetCache() 读缓存（SWR）
+    ├─ 有数据 → 立即渲染 + 后台静默 refresh(force=false, background=true)
+    └─ 无数据 → refresh(force=false)（中央加载提示）
+  → 启动 setInterval(30min, refresh(force=false, background=true))
+onUnmounted → clearInterval
+```
+
+`document.hidden` 时跳过自动刷新 tick，恢复可见时检查缓存过期则刷新。
+
+### 5.6 一键生成视频流程
+
+```
+用户点击某选题的【生成视频】
+  → busy 守卫（进行中则忽略）→ 初始化 8 阶段弹窗（全部 pending）
+  → 阶段 rewrite_copy: running
+  → aiRewrite(mode=create, content=引导语+topic)
+    ├─ 成功 → 产物存草稿（失败不阻断）→ rewrite_copy: completed
+    │   → 读取 story2video.lastOptions.v1（缺失回退默认）
+    │   → buildStory2VideoTextConfigFromSnapshot(text, snapshot)
+    │   → pipelineStartOrchestrated('story2video-compose', params)
+    │     ├─ 成功 → runId 记录 → split: running → 开启双通道跟踪
+    │     │   → onPipelineUpdate 推送 / 3s 轮询 getRunContext
+    │     │     ├─ 阶段推进 → mergeGenStages 更新弹窗各阶段状态/子进度
+    │     │     ├─ completed + videoPath → 弹窗关闭 → 跳 /create/result?path=...
+    │     │     ├─ failed/cancelled → 终态处理，弹窗提供重试/关闭
+    │     │     ├─ 用户点【后台运行】按钮 / 关闭弹窗 → 后台脱离 + 全局居中提示，run 继续执行
+    │     │     │   → 前端态复位（busy 释放、runId/stages 清空）→ 可立即对其它选题发起并行任务
+    │     │     │   → 并行上限由主进程并发门禁判定（超限 → 启动失败 + 【重试】）
+    │     │     └─ 改写/启动阶段点关闭（×）→ 中止前端编排，不启动流水线、无后台任务
+    │     └─ 失败 → split: failed → 弹窗错误提示 + 重试（跳过改写）
+    └─ 失败 → rewrite_copy: failed → 弹窗错误提示 + 重试（从改写开始）
+```
+
+### 5.6a 成片发布流程（E2E 驱动，2026-09-23 新增）
+
+```text
+驱动轮询全部 run 终态 → 成片 copyFileSync 落盘 + ffprobe 校验
+  → E2E_PUBLISH ≠ 1 → 跳过发布（保持生成-only 原行为）
+  → E2E_PUBLISH = 1：
+    → listAccounts() 取全量账号对象
+    → 逐条成片：
+      → extractVideoCover(sourcePath) → cover_path（失败置空不阻断）
+      → buildPublishPlan(accounts, topic, rewriteFull, videoPath, coverPath)
+        ├─ 无可用目标 → 抛 NO_PUBLISH_TARGETS → item.status='error' 计入 report.errors，继续下一条
+        └─ 成功 → { targets, article }
+      → publishBatch(targets, article) → { code:0, data:{ taskIds } }（异步入队，主进程 taskQueue maxConcurrent=3）
+      → 每 5s 轮询 getQueueHistory()，过滤本批 taskIds 对应任务
+        ├─ 全部终态（success/failed/cancelled）→ item.status = published(全成) / partial(部分) / failed(零成)
+        └─ 超 E2E_PUBLISH_TIMEOUT_MS（默认 15min）→ 按当前快照定格（未终态任务计入 tasks 供事后排查）
+    → 全部结果写 report.publish[]
+```
+
+注意：发布内容与生成时的改写产物同源——驱动探针在 `pipelineStartOrchestrated` 包装点捕获完整 `params.text`（`textFull`），发布 article.content 直接复用，保证「视频音频 = 发布文案」一致性。
+
+### 5.7 抓取失败与缓存保留流程（2026-09-14 新增）
+
+```text
+fetchTopics({ force })
+  │
+  ├─ 读缓存 getCache()（内存 → SQLite settings['hot_topics_cache']；解析失败 fail-closed 空结构）
+  │
+  ├─ 非 force 且 (fetchedAt > 0) 且 (0 <= now-fetchedAt < 10min) → 直接返回缓存（fromCache=true，不发网络请求）
+  │
+  └─ 发起本轮抓取（inFlight 去重：同一时刻只允许一个 fetch 在飞）
+       │
+       ├─ 8 渠道并发 _collectChannel（各自的 限流 → 熔断 → fetch → 解析 → 分类）
+       │     ├─ 限流未到间隔 / 熔断 OPEN → skipped=true, items=null（不算失败）
+       │     └─ 异常 → error=<message>, items=null（计入熔断失败计数）
+       │
+       ├─ 汇总：channelStats（逐渠道 ok/skipped/error/count）+ 跨渠道按 topic.trim() 去重 → topics（≤160）
+       │
+       └─ 写缓存判定（§3.11）
+            ├─ topics.length > 0
+            │     → 覆盖写 { topics, fetchedAt: now, channelStats }
+            │     → info 日志：fetched N topics from K/8 channels
+            │
+            ├─ topics.length === 0 且 cache.topics.length > 0        ← 本次新增的韧性命中分支
+            │     → 保留写 { topics: cache.topics, fetchedAt: cache.fetchedAt,
+            │                channelStats, preservedStaleCache: true }
+            │     → warn 日志：all channels failed; preserved N cached topics (stale)
+            │     → 前端：列表内容不变（仍是旧选题），告警条展示本轮失败渠道
+            │     → 下一次非 force 调用因 fetchedAt 过期会继续重试网络
+            │
+            └─ topics.length === 0 且 cache.topics.length === 0
+                  → 覆盖写 { topics: [], fetchedAt: now, channelStats }（与修复前一致）
+                  → 前端：空态「暂无热门选题」+【立即刷新】
+```
+
+**关键时序不变式**：
+
+1. **失败不清空**：任何一轮抓取失败都不得使已展示的选题数量下降（仅在上一批为空时允许保持为空）。
+2. **保留即过期**：保留态下 `fetchedAt` 保持旧值 ⇒ 下一次非 force 调用必然重新尝试网络（不会因为命中"新鲜"缓存而永久停留在陈旧数据）。
+3. **失败可见**：保留态下 `channelStats` 必须是本轮真实结果，前端告警条（§6.2 部分渠道失败警告）照常展示。
+4. **并发安全**：`inFlight` 去重保证同一时刻只有一次写缓存；保留判定读取的 `cache` 是进入本轮前的快照，不会被本轮部分写入污染。
+
+### 5.8 视频成片的 RPA 平台发布流程（P0，2026-09-23 新增，对应 §3.12）
+
+发布任务由 `publish:batch` 入队（`taskQueue` maxConcurrent=3）→ `publisher-router` 按平台路由 → `rpaViewManager.publish(platform, article, authData, timeout)` → `_publish_generic`（douyin 走 `_publish_douyin` 专用链路）。时序不变式如下：
+
+```text
+导航到 publish_url（3s 稳定）
+  → URL 登录检测（login/passport/signin）+ SPA 登录态 DOM 探测（有登录文案且无表单 → fail fast）
+  → preFill hook（若有）
+  → ① 遮罩清理 _dismissPostNavDialogs      ← 必须在任何字段操作之前
+  → ② 视频上传 _resolveSelector(sel.file_input) → _setFileInput → 上传完成判定（P4）
+       └ 之后 ③ 表单就绪等待（标题/正文/编辑器出现，最长 120s）
+  → ④ 标题：_resolveSelector(sel.title_input) → 命中则填标题框
+       └ 未命中 → _resolveSelector(editor|content_textarea|textarea|desc_textarea)
+                   → 命中则「标题+正文」合并写编辑器（P2/P3），并跳过 ⑤
+  → ⑤ 正文：_resolveSelector(cs) → 填充（④已合并时跳过）
+  → ⑥ 标签/封面/声明（平台 hook：bilibili 创作声明 + 短信风控弹窗清理；kuaishou AI 声明勾选）
+  → ⑦ 点击发布按钮（候选数组逐个尝试，文本匹配分级见下）
+  → ⑧ 成功判定：api 响应 / URL 变化 / DOM 成功文案（三种 mode + 回退）
+  → ⑨ 严格平台（baijiahao/kuaishou）：作品 ID 必须来自响应体或作品列表回查（P7）
+```
+
+**顺序硬约束（实测定死，不得回退）**：② 上传必须在 ④⑤ 字段填充**之前**。原因：kuaishou/bilibili 的 `publish_url` 是**上传落地页**，标题/简介字段要等上传完成进入编辑器后才渲染；旧顺序（先填字段）必然 3×10s timeout。
+
+**表 T-TO：超时预算分层（一次配置、全链一致）**
+
+| 层 | 位置 | 图文 | 视频（`video_path` 非空） |
+|----|------|------|--------------------------|
+| 队列任务 | `ipc-handlers/publish.js` `publish:batch` | 180s（task-queue 默认） | **1800000ms = 30min** |
+| 路由→RPA | `publisher-router.js` `resolveRpaTimeout(route, article)` | `ROUTE_TABLE[platform].timeout`（300s） | `max(route.timeout, VIDEO_RPA_TIMEOUT=1800000)` |
+| 上传等待 | `_waitForVideoUploadComplete(win, platform, timeoutMs)` | — | 默认 **900000ms = 15min**，轮询 3s，最低稳定期 25s |
+| 单条终态 | 驱动 `E2E_PUBLISH_TIMEOUT_MS` | 900000 | 建议 ≥1800000 |
+
+**选择器文本匹配分级（`rpa-selector-utils.buildResolveElementCode`）**：
+
+1. 原生 `document.querySelector(selector)` 命中即返回（快路径）；
+2. `:has-text("x")` / `text=x` 走文本匹配，且**必须先按选择器自带的 tag/class 收窄候选池**（`button:has-text("发布")` 永远不得命中 `div` 文案），再按优先级取元素：
+   **精确文本 + 可交互标签（button/a/li/label/[role=button]）> 精确文本叶子 > 包含文本 + 可交互 > 包含文本任意**，同级内优先可见元素（`offsetParent`/`getClientRects`）；
+3. 全部候选都不命中 → 返回 `null`，调用方（`_resolveSelector`）继续下一个候选。
+
+> 为什么第 2 步的两条都是硬性的：快手发布页存在「在粉丝浏览高峰期发布」「发布成功次数」等含“发布”字样的文案。旧实现「包含文本」优先且忽略 tag 约束，会点中统计文案 → 页面无任何请求（诊断日志 `responses=0`），任务假死到超时。
+
+**B 站创作声明状态机（`_selectContentDeclaration`）**：返回 `{ state, option }`，`state ∈ no-input | already | done | option-selected-no-confirm | option-missing | error`；只有 `done`/`already` 视为处理成功，其余仅记 warn 日志、不抛异常（保持发布链路继续尽力提交，便于日志取证）。
+
+### 5.9 提示词优化阶段的限流韧性与降级（P0，2026-09-23 新增）
+
+> 触发背景（CDP E2E 取证，5 条 run 全部失败）：热门选题一键生成视频在 `optimize`（提示词优化）阶段整条失败，run 上下文里的原始 `error` 为
+> `Story2Video optimize failed: Story2Video 场景 12 prompt-engine 优化失败: Error code: 429 - {'error': {'code': '', 'message': '您已达到免费用户的 API 速率限制。升级 Token Plan 即可解锁更高限额，继续不间断使用 API。'}}`
+> 同时 `split` 阶段的 `text` 字段均有正常改写文案（说明【生成视频】→ 改写引擎链路本身是通的），失败点在 LLM 额度。
+
+**结构性缺陷（已修）**：`optimize` 阶段旧实现用 `withTransientRetry`，它**只捕获抛错**；而 prompt-engine 会把上游 LLM 的 429 兜底成 `HTTP 200 + { optimized_prompt: <原文>, error: '…Error code: 429…' }` 正常返回。结果：一次限流既不重试也不降级，直接 `throw` → 整条流水线 `failed`，已消耗的额度与时间全部作废。`withAssetTransientRetry`（资源生成阶段）早就做了结果体分类，优化阶段是漏网之鱼。
+
+**新契约 R-CL：失败分类矩阵（按 prompt-engine 响应体 `error`/`detail` 文本判定）**
+
+| 类别 | 识别信号（节选） | 是否重试 | 是否降级 template | 最终行为 |
+|------|------------------|----------|-------------------|----------|
+| rate（限流） | `Error code: 429` / `rate limit` / `too many requests` / `限流` / `速率限制` / `请求频率` / `队列` | 是（按分钟重置，线性退避） | 是（重试预算耗尽后） | 成功出片并打降级标记 |
+| transient（拖动） | `timed out` / `ETIMEDOUT` / `ECONNREFUSED` / `fetch failed` / `超时` / `网络` / 5xx | 是（短退避） | 否（保持旧语义） | 耗尽后阶段 fail closed |
+| quota（额度/余额） | `insufficient balance` / `quota exceeded` / `额度…上限` / `Token Plan … limit` | **否** | **否** | 立即 fail closed（需用户处理） |
+| other | 其余（如 422 参数非法、内容政策） | 否 | 否 | 立即 fail closed |
+
+> 中文「速率限制」不含在通用 `RATE_LIMIT_MESSAGE_PATTERN`（其只认 `频率.*限制`）内，因此本阶段自带 `OPTIMIZE_RATE_TEXT_PATTERN` 补充信号；两处判定不得合并回单一正则（否则 provider-error 的统一分类会被中文字面量拖慢）。
+
+**表 R-RE：重试预算（全部可在 `stage.options` 覆盖，不新增用户可见配置）**
+
+| 参数 | 默认 | 来源 / 说明 |
+|------|------|-------------|
+| `maxAttempts` | `min(3, (stage.options.maxRetries ?? 2) + 1)` | 瞬时错误总次数上限 |
+| `rateLimitMaxAttempts` | `max(maxAttempts + 1, 4)` | 限流专用（多给 1 次跨退避窗口） |
+| 限流退避 | `retryBackoffMs \|\| 2500`，第 n 次等 `base × n`（2.5s/5s/7.5s…） | 免费额度按分钟重置，线性放大比指数更可控 |
+| 瞬时退避 | `800 × n` | 与旧行为一致 |
+| 场景内并发 | `stage.options.concurrency ?? 3` | 与 `api-usage-governor` 的 llm rpm 无交集（LLM 在引擎子进程内调用，**已知限制**） |
+
+**降级路径（`optimization_strategy: 'template'`）**
+
+1. 触发条件：当前场景的 LLM 策略重试耗尽且最后一次仍为 **rate** 类；
+2. 动作：对**同一场景、同一归一化请求**只改 `optimization_strategy=template` 再走一次完整重试预算（模板路径不调 LLM、不计费）；
+3. 引擎事实（2026-09-23 直连 8013 实测）：`POST /v1/optimize {optimization_strategy:'template'}` → `HTTP 200`、`model_used="template"`、`key_source="none"`、`tokens_used=0`、`duration≈22ms`；
+4. 失败回退：降级调用也带 `error` → **丢弃降级结果，保留原始 429 错误**交给输出校验，阶段 `success:false` 且**不产生 output**（绝不静默出片）。
+
+**数据校验（输出结构不变式）**
+
+| 字段 | 类型/取值 | 规则 |
+|------|-----------|------|
+| `optimize[i].optimized_prompt` | string，非空且经 `sanitizeOptimizedPrompt` 剔思考块 | 降级时仍必非空（空→抛错 fail closed） |
+| `optimize[i].optimize_note` | `'rate_limited_template_fallback'` \| 缺省 | 仅降级场景写入；与已有 `prompt_engine_too_short_use_original` / `llm_rejected_use_original` / `prompt_engine_empty_reasoning_use_original` 互斥 |
+| `optimize[i].degraded` | boolean | 仅降级场景为 `true`；上层（历史/排查）据此区分提示词来源 |
+| `optimize[i].model_used` / `strategy_used` | string | 降级时为 `template`（由引擎 meta 透传，不手写） |
+| `context.optimize_degraded` | `{ scenes: number[], total: number }` \| 不存在 | 有降级才存在；`scenes` 为场景下标升序（`concurrency=1` 时严格递增）；本次无降级时**必须 delete** 该键（不留旧值） |
+| `context.optimize_resume` | 数组 | 逐场景部分结果；降级结果同样入 resume，断点续跑不重复消耗 LLM 额度 |
+| `context.optimize_progress` | `{ done, total }` | 降级不改变进度语义 |
+
+**显示项与提示文字**
+
+- **不新增 i18n key**（避免 locale 同步门禁）：用户可见途径为①阶段进度条文案沿用 `story2video.optimizeProgress`（共 N 个场景，已完成 M 个）；②失败时沿用既有 `story2video.optimize_failed` / `story2video.optimize_service_unavailable` 映射；③成功但降级时，历史详情「画面提示词」旁 `model_used` 显示 `template`（显示项已存在，无需新控件）。
+- **固定日志文案**（主进程 `Story2VideoStages`，与 §7.5 同族）：`optimize degraded to prompt-engine template strategy for {n}/{m} scene(s): LLM rate limited; scenes={idx,idx}` —— `warn` 级，阶段结束一次性输出（不逐场景刷屏）。
+- **默认选项不受影响**：`story2video.lastOptions.v1` 无新增键；降级是运行时自适应行为，不需用户预先选择。
+
+**与模型设置的关系（运维口径）**
+
+- 优化用的 LLM 由「模型设置 → 文字推理（llm）默认服务商」决定，`PromptBridge.resolveLlmBind()` 无默认/无 Key/无可用模型时 **fail-closed 抛错**（引擎不再用服务端 key 兜底）。
+- 若持续限流，用户可改默认 LLM（本机已配置 Key 的候选：`agnes-multimodal`(默认) / `sensenova-llm` / `openrouter` / `opencode-go` / `minimax-multimodal`）；`modelProviderTest` 只验“可列模型”，**不等于有额度**，不得用其结果向用户保证可用。
+
+### 5.10 应用重启后的发布文案恢复（P0，2026-09-23 新增）
+
+#### 5.10.1 问题背景（真实故障）
+
+热门选题一键生成视频的完整链路是「生成 → 校验成片 → 发布」。流水线 `run context`
+（`pipelineGetRunContext()`）**只存在于主进程内存**，不落盘。E2E 期间只要发生
+应用重启（例：热应用代码、窗口异常恢复），`pipelineHistory()` 与 run context 全部清零，
+此时若仍要发布此前已产出的成片：
+
+- 改写正文取不到 → `storyChars = 0`，发布载荷 content 退化为空；
+- 标题取不到 → 早期实现用「遍历上下文里所有 key 含 title 的字符串」兜底，
+  结果命中 `segments[].subtitleSource = "smart-sentence-splitter"`（字幕分段引擎名），
+  把这个 slug 当成了发布标题发到 7 个平台。
+
+结论：**发布文案必须有落盘恢复路径，且标题必须有合法性判定。**
+
+#### 5.10.2 数据来源与流程
+
+```
+成片目录（userData/story2video-projects/<sha256(projectRoot)>/<runId>/）
+  └── project.json（manifestVersion=2）
+        ├── sourceText       改写引擎产出的完整文案（发布正文首选）
+        ├── segments[].text  分镜文案（按序拼接 = 正文兜底）
+        ├── title            警示：实为「文案前 200 字」，不是标题
+        └── status/duration/videoPath/format 等（成片校验用）
+              │
+              ▼
+   readProjectCaption(manifest) → { title, text, titleSource }
+              │
+              ├── 有真实选题标题（热门选题列表可按内容匹配回填）→ 用选题标题
+              └── 否则 → 正文首句派生
+              ▼
+   buildPublishArticle({ topic:{title}, rewrittenText:text, videoPath, coverPath })
+```
+
+标题来源优先级（`publish-only` 驱动器实现）：
+
+1. `hot-topic-row#N(overlap=x.xx)`：把当前「热门选题」列表每行标题与恢复出的正文做
+   二元字组重合度打分，贪心做「一条 run 只占一行选题」的唯一匹配，阈值 0.35；
+   热门选题列表是轮换的，因此**禁止**用「行号 = 生成序号」的位置映射（实测同一分钟内
+   首行就从「苹果不建议给iPhone贴膜」变成「油价或将大幅调整」）。
+2. `manifest`：project.json 的显式 `topicTitle` / `topic_title` / `topic.title`。
+3. `derived`：正文首句截断（60 字内，去结尾标点）。
+
+#### 5.10.3 交互与显示项
+
+| 位置 | 显示项 | 文案 |
+|------|--------|------|
+| E2E 驱动日志 | 每条发布 | `#N 标题=<标题前30字> 来源=<titleSource> 正文字数=<len>` |
+| E2E 驱动日志 | 匹配汇总 | `选题唯一匹配成功=<k>/<总条数>` |
+| E2E 驱动日志 | 启动 | `ACCOUNTS=<platform>:<status>,…`（active 才算可用） | |
+| `publish-report-v2.json` | `items[].titleSource` | `hot-topic-row#5(overlap=0.63)` / `manifest` / `derived` |
+| `publish-report-v2.json` | `items[].article` | `{ title, contentChars, video_path, cover_path }`（发布载荷留痕） |
+| `publish-report-v2.json` | `topics[]` | 发布时刻的热门选题列表快照（可复盘匹配依据） |
+
+#### 5.10.4 失败与拒绝路径
+
+- 正文与所有标题候选都为空 → 不进入发布（`buildPublishArticle` 抛
+  「缺少标题（topic.title 为空）」），驱动器标记 `enqueue_failed` 并继续下一条；
+- 成片文件不存在 → 标记 `missing-video` 跳过；
+- 队列非空闲（running + pending > 0）→ 20s 轮询等待，避免多平台 RPA 争抢同一浏览器；
+- 「能发的都发」= 凡 `status === 'active'`（或 `is_active === true`）且
+  `has_cookies !== false` 的账号全部入队，同平台多账号不去重。
+
+## 6. 交互逻辑
+
+### 6.1 勾选与批量操作
+
+- 勾选状态：`selectedIds: Set<string>`；全选=当前过滤视图全部条目 id；取消全选清空。
+- 已选计数实时显示「已选 n 条」；n=0 时【创作文案】【一键发布】disabled。
+- 勾选变化时按钮态即时更新。
+- 单条快捷【创作文案】按钮不依赖勾选状态。
+
+### 6.2 筛选与列表
+
+- 分类 chips：全部 + 10 分类，单选；切换立即过滤列表。
+- 渠道下拉（el-select）：全部渠道 + 7 渠道（含不可用标记）；切换立即过滤。
+- 刷新按钮：loading 态（转圈 + 禁用），完成后显示「上次刷新 HH:mm」。
+
+### 6.2a 中央加载提示（SWR 优化新增，2026-09-12）
+
+**触发条件**（满足其一显示，非弹窗）：
+
+- 首次进入页面且无可用缓存（topics 为空），网络抓取进行中；
+- 用户点击【刷新】按钮手动触发抓取（即使列表已有内容）。
+
+**不触发**：
+
+- 缓存命中后的后台静默刷新（不打断已渲染内容）；
+- 定时器自动刷新。
+
+**视觉与动效规格**：
+
+- 定位：全屏半透明遮罩（rgba(255,255,255,0.72) + backdrop-blur 2px），z-index 1001（高于应用内模态 UpgradeModal/ViralFormDialog 的 1000），内容区居中；
+- 卡片：白底圆角卡片（border-radius 16px，紫色系阴影），最大宽 460px，内边距 36px 48px；
+- 主文案：**「刷新中」** + 三个跳动圆点（依次延迟 0.15s 弹跳动画）；
+- 副文案：**「正在从网上实时获取热门信息，一般需要5-10秒，请耐心等候」**（13px，#777）；
+- 旋转 spinner：42px 紫色圆环（0.9s 线性无限旋转）；
+- 流光进度条：240px 宽轨道，40% 宽渐变光带（紫→浅紫）1.4s 循环扫过；
+- 进出场：0.25s 淡入淡出（Transition）；
+- 无障碍：容器 role="status" aria-live="polite"，动画元素 aria-hidden。
+
+**状态联动**：
+
+- 中央提示显示期间刷新按钮同步显示「刷新中…」并禁用；
+- 抓取失败：中央提示消失 + 错误 toast「选题获取失败，请稍后重试」；
+- 抓取成功：中央提示淡出，列表渲染新数据，头部显示「上次刷新 HH:mm」。
+- 失败渠道警告条：`el-alert` warning，文案「部分渠道获取失败：渠道A、渠道B」，可关闭。
+
+### 6.3 一键发布进度交互
+
+- 批量改写期间：批量操作条替换为进度区（进度条 + n/total + 取消按钮）。
+- 取消：已完成草稿保留并提示「已取消，已保留 n 条草稿」；剩余条目恢复可勾选状态。
+- 失败条目在进度列表中标红，提供【重试】；重试成功则转绿并计入草稿。
+
+### 6.4 状态保持与竞态守卫
+
+- 遵循 spec「目标快照守卫」：刷新请求发起时记录请求序号（requestSeq），响应返回时若序号不匹配则丢弃，防止旧响应覆盖新数据。
+- 批量改写期间禁用【刷新】与筛选操作（防止列表变动导致改写目标错位）。
+
+### 6.5 路由与菜单
+
+- 菜单高亮：`isActive` 沿用现有前缀匹配（`/hot-topics` 精确匹配）。
+- 页面离开时清理定时器（interval）与 in-flight 请求（AbortController.abort）。
+
+### 6.6 一键生成视频弹窗操作与全局居中提示（2026-09-13 新增；2026-10-17 四按钮与完成出口修订）
+
+**弹窗 footer 按钮矩阵**（按 phase 状态机渲染；2026-10-17 起 footer 全部由 `UiButton` 渲染，与视频创作页进度浮层同源，不再使用 `cohere-btn-*`）：
+
+| phase | 查看 | 去发布 | 重试 | 后台运行 | 取消 | 关闭 | 错误文本 |
+|-------|------|--------|------|---------|------|------|---------|
+| rewriting（改写中） | 灰显 | 灰显 | ✗ | ✗（无 run，脱离无意义） | ✓ | ✗ | ✗ |
+| starting（流水线启动中） | 灰显 | 灰显 | ✗ | ✗（run 未确认） | ✓ | ✗ | ✗ |
+| running（流水线运行中） | 灰显 | 灰显 | ✗ | ✓ | ✓ | ✗（右上角 × 等价后台运行） | ✗ |
+| failed（失败终态） | 灰显 | 灰显 | ✓ | ✗ | ✗ | ✓ | ✓ |
+| cancelled（取消终态） | 灰显 | 灰显 | ✗ | ✗ | ✗ | ✓ | ✓ |
+| completed（完成） | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ |
+
+**完成出口（2026-10-17 修订，取代「完成即关闭弹窗并跳转结果页」）**：
+
+- 成功后**弹窗保持打开**，不自动跳转 `/create/result`；阶段全绿、进度 100%。
+- 【查看】（`data-testid="hot-topics-gen-video-view"`，文案 `hotTopics.genVideoView`）→ 复位前端跟踪态后跳 `/create?view=history&filter=completed`（视频创作-历史记录「已完成」标签），不调用 `pipelineCancelRun`。
+- 【去发布】（`data-testid="hot-topics-gen-video-publish"`，文案 `hotTopics.genVideoPublish`）→ 跳 `/publish`，用 `buildPublishFromProject` + `publishDataToQuery` 构造视频模式预填充；终态 context 无 `story2videoProject` 时退化为只带 `type=video` 与 `video_path`，不注入空标题/正文。
+- 解锁判据：`genVideoResultReady = genVideoPhase === 'completed' && genVideoCompletedVideoPath.trim() 非空`；成片缺失时置 failed 并保持灰显。
+- 新编排（`startGenerateVideo`）与重试（`retryGenVideo`）必须清零 `genVideoCompletedVideoPath/ProjectId/Project`，避免新 run 未完成时误解锁。
+
+**【后台运行】按钮交互逻辑**：
+
+1. 显示条件：genVideoCanBackground = genVideoPhase === 'running' 且持有 runId——只有主进程 run 确实存在且正在执行时才提供脱离入口（spec 前端规则 2：可逆操作方法内重校验状态，不依赖模板条件）；
+2. 点击 → detachGenVideoToBackground()：入口重校验 genVideoCanBackground（防终态竞态）→ 复用 handleGenVideoClose()（唯一公共脱离路径：判断是否可脱离 → resetGenVideoFrontendState() 停轮询/订阅/tick、弹窗关闭、phase='idle'、runId/stages/progress 清空、**busy 释放** → 可脱离时 notifyInfo 顶部 toast）→ showPipelineBackgroundToast() 触发全局居中提示；
+3. 脱离后：**所有选题行的【生成视频】按钮立即恢复可用**（busy 已释放），可对任意选题发起并行任务；run 在主进程继续执行，完成后可在视频创作页「历史记录」查看产物；
+4. 右上角 × 在运行中同样走后台脱离（与按钮同一 handleGenVideoClose），但不触发全局居中提示（避免与按钮路径重复提示）；在改写/启动阶段（无 run）则走「中止前端编排」语义（不提示已转入后台）。
+
+**全局居中提示规格**（组件 PipelineBackgroundToast.vue，App.vue 全局挂载）：
+
+- 触发方：热门选题一键生成视频【后台运行】按钮 + 视频创作页进度弹窗【后台运行】按钮（detachPipelineToBackground 成功后触发）——所有视频生成流水线进度弹窗统一；
+- 文案：common.pipelineBackgroundToast = 「如果想查看该任务，请进入视频创作的历史记录」 / "To check this task, open History in Video Creation"（zh/en 成对）；
+- 位置：应用界面正中央（position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%)）；
+- 层级：z-index 2100（高于 UiModal overlay 的 2000，弹窗刚关闭瞬间提示仍居中可见）；
+- 时长：4 秒后自动消失（重复触发时重置计时器，不叠加多个提示）；
+- 视觉：深色半透明底（rgba(30,30,34,0.92)）白字圆角卡片，最大宽 480px，内边距 14px 24px，字号 14px，居中对齐，box-shadow 0 8px 24px rgba(0,0,0,0.28)；
+- 动效：0.25s 淡入淡出 + 轻微缩放（enter-from/leave-to: opacity 0 + scale 0.96）；
+- 交互：pointer-events: none（不阻挡任何点击，纯提示）；
+- 无障碍：role="status" aria-live="polite"；
+- 状态承载：模块级单例（stores/pipeline-background-toast.js，与 settings-dialog.js 同模式），脱离触发视图存活——用户点击后台运行后立即切换页面，提示仍正常显示与消失；
+- 防泄漏：文案经 vue-i18n 解析；key 未命中时回退空串（不显示），绝不把 i18n key 原文或硬编码中文泄漏到界面。
+
+### 6.7 一键生成视频：并发任务与前端态复位规格（2026-09-13 修正）
+
+**背景**：2026-09-13 用户报障——点击某选题【生成视频】→ 弹窗内点【后台运行】→ 弹窗消失；再点另一选题的【生成视频】，**无任何反应**。根因是后台脱离路径只置 `genVideoPhase='background'` 而未释放 `genVideoBusy`，而按钮 `:disabled="genVideoBusy"` 且 `startGenerateVideo` 首行 `if (genVideoBusy.value) return`，于是所有选题的入口被永久锁死；同时该行为此前被 PRD 写成「并发约束」需求、并被单测断言固化。修正后语义与视频创作页（CreateView.detachPipelineToBackground → resetPipelineToNewTaskState → resetPipelineUiState）完全一致。
+
+**前端状态机（genVideoPhase）**：
+
+| 值 | 含义 | 进入条件 | 可离开到 |
+|----|------|---------|---------|
+| `idle` | 无在跟踪任务（初始/复位后） | 初始化；后台脱离；终态关闭 | rewriting（点击生成视频） |
+| `rewriting` | aiRewrite 在途 | 点击【生成视频】后立即 | starting / failed / cancelled（取消）/ idle（关闭=中止） |
+| `starting` | pipelineStartOrchestrated 在途 | 改写成功 | running / failed / cancelled / idle（关闭=中止） |
+| `running` | 主进程 run 运行中且持有 runId | 启动成功返回 runId | completed / failed / cancelled / idle（后台脱离） |
+| `completed` | 流水线完成（提取到 videoPath） | 轮询/推送判定 | 跳转结果页并关闭弹窗 |
+| `failed` | 改写/启动/运行失败 | 任一环节失败 | 重试（failed → 重试）/ 关闭 |
+| `cancelled` | 用户取消 | 取消按钮 / 关闭（改写/启动阶段） | 关闭 |
+
+> 不再存在 `background` 滞留态：后台脱离后统一复位为 `idle`，避免「弹窗已关闭但内部仍自认有一个任务在前台」的中间态。
+
+**复位清单（resetGenVideoFrontendState，唯一公共路径）**：
+
+| 字段 | 复位值 | 说明 |
+|------|--------|------|
+| `genVideoSeq` | `+1` | 代际守卫：使在途 aiRewrite / pipelineStartOrchestrated 响应失效，防止脱离后旧响应重新挂回弹窗、或改写成功后静默启动流水线 |
+| 轮询/订阅/tick | 全部清理 | `stopGenVideoTracking()`：clearInterval(3s 轮询) + 退订 onPipelineUpdate + clearInterval(1s 耗时 tick) |
+| `genVideoModalOpen` | `false` | 弹窗关闭 |
+| `genVideoPhase` | `idle` | 见上表 |
+| `genVideoTopic` / `genVideoStages` / `genVideoRunId` | `null` / `[]` / `null` | 下次任务重新初始化，不复用旧选题与阶段 |
+| `genVideoRunProgress` / `genVideoStartedAt` | `null` / `0` | 防止新任务进度/耗时继承旧 run |
+| `genVideoErrorText` / `genVideoRewrittenContent` / `genVideoDraftId` | `''` / `''` / `null` | 错误与改写产物不外溢到新任务 |
+| `genVideoBusy` | `false` | **关键**：释放【生成视频】按钮（修复本次报障） |
+
+**busy 守卫的作用域（保留部分）**：
+
+| 场景 | 守卫是否生效 | 理由 |
+|------|-------------|------|
+| rewriting / starting / running（弹窗在跟踪同一任务） | ✅ 生效（按钮 disabled + 方法内 return） | 避免同一弹窗内产生两条不受跟踪的编排（旧任务会静默失去 UI） |
+| 后台脱离后（idle） | ❌ 不生效 | 与视频创作页一致，允许并行发起新任务 |
+| 运行中取消 / 失败 / 完成 | ❌ 不生效 | 终态已复位 |
+
+**数据校验与竞态守卫**：
+
+1. **入参校验**：`startGenerateVideo(topic)` 校验 `topic?.topic` 非空字符串才继续，否则直接 return（不打开弹窗、不调用 IPC）；`retryGenVideo()` 仅在 `phase==='failed'` 时可用。
+2. **runId 校验**：启动成功判定要求 `code===0` 且 `typeof runId==='string'` 且 `runId.trim()` 非空且 `success!==false`；`genVideoRunId` 存 trim 后的值。
+3. **轮询/推送 runId 守卫**：`pollGenVideoRun(runId)` 与 `handleGenVideoPush(snapshot)` 均先比对当前 `genVideoRunId`，不匹配一律丢弃（脱离后旧 run 的推送不会污染新任务）；`pipelineGetRunContext` 返回的 `runId/id` 与请求不一致时同样丢弃。
+4. **代际守卫**：`genVideoSeq` 在「开新任务 / 重试 / 取消 / 关闭 / 后台脱离 / 组件卸载」时递增，所有 await 之后都要 `seq !== genVideoSeq` 提前返回。
+5. **终态单调性**：`mergeGenStages` 对已处于 completed/skipped/failed/cancelled 的阶段拒绝降级回 running（乱序推送防护）。
+6. **并发上限**：前端不再自设单任务锁；由主进程 `PipelineEngine` 的 `maxConcurrentRuns` 判定，超限返回 `PIPELINE_CONCURRENCY_LIMIT`，前端落到「流水线启动失败」分支（弹窗错误摘要 + 【重试】，重试跳过改写）。
+
+**提示文字（本次未新增 i18n key，沿用既有文案）**：
+
+| 触发点 | key | zh 文案 |
+|--------|-----|---------|
+| 后台脱离（按钮或 ×） | `hotTopics.genVideoBackgroundHint`（顶部 toast） | 任务已转入后台，可在视频创作页「历史记录」中查看进度 |
+| 后台脱离（按钮） | `common.pipelineBackgroundToast`（全局居中，4s） | 如果想查看该任务，请进入视频创作的历史记录 |
+| 流水线启动失败（含并发超限） | `hotTopics.genVideoPipelineFailed`（弹窗错误摘要） | 视频流水线启动失败，请点击重试 |
+| 改写失败 | `hotTopics.genVideoRewriteFailed` | 文案改写失败，请点击重试 |
+| 取消 | `hotTopics.genVideoCancelled` | 已取消生成视频 |
+
+**边界情况**：
+
+1. `pipelineStartOrchestrated` 成功但返回空/非法 runId → 按启动失败处理（不进入 running、不启动跟踪）。
+2. 改写返回成功但内容为空 → 抛错走「改写失败」分支（不启动流水线）。
+3. 草稿保存失败 → 静默忽略，不阻断视频生成（草稿仅为回溯入口）。
+4. 后台脱离瞬间旧 run 恰好完成 → 前端已退订与清空，无事后写回；产物仍可在历史记录/结果页找到。
+5. 组件卸载（切页）→ `onUnmounted` 递增 seq、清理定时器与订阅；主进程 run 不受影响。
+6. 连续快速点击【生成视频】（同一弹窗在途）→ 第二次点击被 busy 守卫拦截，不产生重复编排。
+
+### 6.8 缓存保留态下的交互与显示项（2026-09-14 新增）
+
+保留态（§3.11 R4）对用户是**透明降级**：列表内容、筛选、勾选、创作、生成视频等一切能力保持可用（用的是上一批选题），只有告警条与「上次刷新」时间体现「本轮抓取失败」。
+
+| 位置 | 保留态表现 | 依据 |
+|------|-----------|------|
+| 选题列表 | 内容 = 上一次成功抓取的选题（数量不减少、顺序不变、`id` 不变） | R1 |
+| 「上次刷新 HH:mm」 | 显示**上一次成功抓取**的时间（保留的 `fetchedAt`），不是本轮失败时间 | R2 |
+| 部分渠道失败告警条 | 照常按本轮 `channelStats` 展示：`部分渠道获取失败：微信(tophub)`（`hotTopics.partialFail`，`el-alert type=warning`，可关闭） | R3 |
+| 渠道下拉不可用标记 | 照常按本轮 `channelStats[ch].ok === false` 追加 `（不可用）` | R3 |
+| 空态「暂无热门选题」 | **不出现**（列表非空）；仅在「上一批也为空 + 本轮失败」时出现 | R5 |
+| 中央加载提示 | 与修复前一致：首次无缓存 / 手动刷新时展示，后台静默刷新不展示 | 不变 |
+| 定时刷新（30 分钟） | 照常触发；因保留态 `fetchedAt` 已过期，会真实重试网络；成功后自动覆盖为最新选题 | R2 + §5.5 |
+| 平台账号/发布/生成视频入口 | 全部照常可用（不因抓取失败降级） | — |
+
+**边界情况**：
+
+1. **首次进入即全渠道失败且无缓存** → 空态 + 告警条「部分渠道获取失败：…」（沿用 `hotTopics.loadFailed` toast 与空态文案）。
+2. **保留态下用户手动点【刷新】** → 触发 `force=true`，若本轮成功则覆盖为新选题（可能数量变化、顺序变化）；若仍失败则继续保留（用户看到"刷了但没变 + 告警条"）。
+3. **保留态跨应用重启** → 保留内容已持久化到 SQLite settings，重启后仍可读到（R8）。
+4. **保留态下进入某渠道筛选** → 旧数据中该渠道条目照常展示；若该渠道本轮失败，下拉项带「（不可用）」标记但不影响已有条目展示。
+5. **上一批恰为空且本轮部分渠道成功** → 正常覆盖（可能只有少数条目），不命中保留分支。
+6. **`preservedStaleCache` 标记对 UI 不可见** → 该字段仅用于诊断/测试断言，不在界面上呈现任何"陈旧"字样（避免制造焦虑）；用户通过告警条与刷新时间自行判断。
+
+## 7. 显示项与提示文字（i18n）
+
+### 7.1 新增 i18n key（zh/en 成对，命名空间 hotTopics.*）
+
+| key | zh | en |
+|-----|----|----|
+| hotTopics.menuLabel | 热门选题 | Hot Topics |
+| hotTopics.pageTitle | 热门选题 | Hot Topics |
+| hotTopics.pageDesc | 多渠道热门选题聚合，一键创作文案或批量发布 | Aggregate trending topics, create copy or publish in batch |
+| hotTopics.refresh | 刷新 | Refresh |
+| hotTopics.lastRefresh | 上次刷新 {time} | Last refresh {time} |
+| hotTopics.categoryAll | 全部 | All |
+| hotTopics.categories.general | 综合 | General |
+| hotTopics.categories.society | 社会 | Society |
+| hotTopics.categories.finance | 财经 | Finance |
+| hotTopics.categories.tech | 科技 | Tech |
+| hotTopics.categories.entertainment | 娱乐 | Entertainment |
+| hotTopics.categories.sports | 体育 | Sports |
+| hotTopics.categories.emotion | 情感 | Emotion |
+| hotTopics.categories.education | 教育 | Education |
+| hotTopics.categories.health | 健康 | Health |
+| hotTopics.categories.international | 国际 | International |
+| hotTopics.channelAll | 全部渠道 | All channels |
+| hotTopics.channels.zhihu | 知乎 | Zhihu |
+| hotTopics.channels.toutiao | 头条 | Toutiao |
+| hotTopics.channels.tencent | 腾讯新闻 | Tencent News |
+| hotTopics.channels.bilibili | B站 | Bilibili |
+| hotTopics.channels.douyin | 抖音 | Douyin |
+| hotTopics.channels.baidu | 百度 | Baidu |
+| hotTopics.channels.tophub | 微博(tophub) | Weibo (tophub) |
+| hotTopics.selectAll | 全选 | Select all |
+| hotTopics.selectedCount | 已选 {count} 条 | {count} selected |
+| hotTopics.createCopy | 创作文案 | Create copy |
+| hotTopics.publish | 一键发布 | Publish |
+| hotTopics.emptyTitle | 暂无热门选题 | No topics yet |
+| hotTopics.emptyDesc | 点击刷新按钮获取最新选题，或等待自动刷新 | Click refresh to fetch latest topics, or wait for auto refresh |
+| hotTopics.emptyAction | 立即刷新 | Refresh now |
+| hotTopics.partialFail | 部分渠道获取失败：{channels} | Some channels failed: {channels} |
+| hotTopics.noSelection | 请先勾选至少一条选题 | Please select at least one topic first |
+| hotTopics.batchLimit | 一次最多批量处理 20 条选题，请减少选择 | Batch limit is 20 topics, please reduce selection |
+| hotTopics.topicPrefix | 请以下面这个选题为主题，创作一篇适合自媒体发布的文案： | Please create self-media copy based on the following topic: |
+| hotTopics.publishProgress | 改写中 {done}/{total} | Rewriting {done}/{total} |
+| hotTopics.publishCancelled | 已取消，已保留 {count} 条草稿 | Cancelled, {count} drafts kept |
+| hotTopics.publishDone | 改写完成，已生成 {count} 条草稿 | Done, {count} drafts created |
+| hotTopics.publishRetry | 重试 | Retry |
+| hotTopics.publishCancel | 取消 | Cancel |
+| hotTopics.channelUnavailable | 不可用 | Unavailable |
+| hotTopics.loadFailed | 选题获取失败，请稍后重试 | Failed to fetch topics, please retry later |
+| hotTopics.rank | 排名 | Rank |
+| hotTopics.hotValue | 热度 | Heat |
+| hotTopics.generateVideo | 生成视频 | Generate video |
+| hotTopics.genVideoTitle | 一键生成视频 · {topic} | One-click video · {topic} |
+| hotTopics.genVideoStartToast | 已开始生成视频，改写文案后将自动启动故事讲述流水线 | Video generation started. The storytelling pipeline will start after copy rewriting |
+| hotTopics.genVideoRewriteFailed | 文案改写失败，请点击重试 | Copy rewrite failed, please retry |
+| hotTopics.genVideoPipelineFailed | 视频流水线启动失败，请点击重试 | Failed to start the video pipeline, please retry |
+| hotTopics.genVideoCancelled | 已取消生成视频 | Video generation cancelled |
+| hotTopics.genVideoBackgroundHint | 任务已转入后台，可在视频创作页「历史记录」中查看进度 | Task moved to background. Track progress in Video Creation → History |
+| hotTopics.genVideoBackgroundRun | 后台运行 | Run in background |
+| hotTopics.genVideoView | 查看（2026-10-17 新增，完成出口） | View |
+| hotTopics.genVideoPublish | 去发布（2026-10-17 新增，完成出口） | Publish |
+| hotTopics.genVideoRetry | 重试 | Retry |
+| hotTopics.genVideoCancel | 取消 | Cancel |
+| hotTopics.genVideoClose | 关闭 | Close |
+| hotTopics.genVideoDone | 视频已生成，正在打开结果… | Video generated, opening result… |
+| pipelines.stages.rewrite_copy | 文案改写 | Rewrite Copy |
+| common.pipelineBackgroundToast | 如果想查看该任务，请进入视频创作的历史记录 | To check this task, open History in Video Creation |
+
+### 7.2 显示规则
+
+- 分类标签颜色：综合=灰、社会=蓝、财经=橙、科技=紫、娱乐=粉、体育=绿、情感=红、教育=青、健康=teal、国际=深蓝。
+- 渠道标签：固定色带 + 渠道名。
+- 热度值：≥10000 显示为 x.x万，否则千分位。
+
+### 7.3 带参文案 Message Function 约定
+
+所有含 `{param}` 的文案必须写成 `(ctx) => 'xxx' + ctx.named('param')` 形式（zh/en 两侧一致），禁止静态字符串带占位符。
+
+### 7.4 缓存保留态的提示文字（2026-09-14 新增）
+
+**本次变更不新增任何 i18n key**，保留态复用既有文案，zh/en 成对性不变（CI Gate 7 无需变更）：
+
+| 场景 | 文案 key | 文案（zh） | 呈现方式 |
+|------|---------|-----------|---------|
+| 本轮有渠道失败（保留态或部分成功） | `hotTopics.partialFail` | `部分渠道获取失败：{channels}` | 列表顶部 `el-alert type=warning`，可关闭 |
+| 渠道本轮失败（下拉标记） | `hotTopics.channelUnavailable` | `不可用` | 渠道下拉项后缀 `（不可用）` |
+| 上一批为空 + 本轮全失败 | `hotTopics.loadFailed` | `加载失败，请稍后重试` | 顶部 toast（既有行为） |
+| 上一批为空 + 本轮全失败 | `hotTopics.emptyTitle` / `emptyDesc` / `emptyAction` | `暂无热门选题` / `点击刷新按钮获取最新选题，或等待自动刷新` / `立即刷新` | 列表区空态 |
+| 「上次刷新」时间 | `hotTopics.lastRefresh` | `上次刷新 {time}` | 页头右侧（保留态为旧时间） |
+
+**判定依据**：如果未来需要在界面上显式区分「陈旧数据」（例如加一条 `数据为上次抓取结果，本次刷新失败` 的常驻提示），必须先在本表补齐 zh/en 双语文案与 Message Function 约定，再改 UI；本期不做。
+
+### 7.5 RPA 发布过程日志与失败提示文字（P0，2026-09-23 新增）
+
+视频发布失败与降级全部以 `RpaView` 日志形式可取证（不新增 UI 控件、不新增 i18n key，列表/进度 UI 继续用 §7.1 已有文案）。日志前缀统一为 `[<platform>] `，文本为固定字符串（可用作断言/ grep）：
+
+| 场景 | 级别 | 日志/错误文字 | 含义与后续动作 |
+|------|------|----------------|----------------|
+| 候选回退生效 | info | `no dedicated title field, title falls back to editor sel=<sel\|none>` | 平台无独立标题框，标题已合并写进编辑器（§4.3 P2） |
+| 正文跳过 | info | `content already composed into editor caption, skip separate fill` | 防正文覆写丢标题（P2） |
+| 标题彻底失败 | warn | `title field not found (no title_input nor editor candidate), title skipped` | 两个池都空，只发正文 |
+| 正文候选不命中 | warn | `content editor not found among <N> candidates` | 已逐个尝试，非只试首项 |
+| 上传无完成信号 | warn | `video upload-complete signal not detected (preview/url), continuing best-effort` | 15min 预算内未判成，继续尽力填字段/提交 |
+| 表单未就绪 | warn | `editor form not ready after upload (still trying fields)` | 上传后 120s 内没出现标题/正文控件 |
+| 遮罩清理 | info | `post-nav dialogs dismissed: <JSON>` | 记录实际点掉的遮罩（P6） |
+| B 站风控弹窗 | info | `[bilibili] sms dialog: NO_SMS_DIALOG\|CANCELLED\|DIALOG_NO_CANCEL` | 短信验证只能用户完成；`DIALOG_NO_CANCEL` 代风控不可自动绕过 |
+| 创作声明 | info | `declaration prep state=<state> aiGenerated=<bool> option=<值>` | state 枚举见 §5.8 |
+| 严格平台无 ID | warn | `publish signal lacked platform ID; endpoint=<脱链URL> responses=<N>` | 任务以 `发布结果缺少平台作品 ID` 失败（P7）；`responses=0` 意味发布按钮没真正生效 |
+| 发布验证超时 | warn | `publish verification timeout endpoint=... responses=N` + `publish verify snapshot: {text,modals,buttons}` + 截图 `mp-rpa-diag/<platform>-verify-<ts>.png` | 提交后无法确认成功；快照+截图区分“弹窗拦截/校验失败/静默成功” |
+
+**失败时写入队列历史 `error` 字段的固定文案**（UI 发布进度列表直接展示，不截断）：`kuaishou no publish_url`、`kuaishou not logged in`、`发布结果缺少平台作品 ID`、`publish verification timeout`、`timeout (1800s)`（括号内为任务实际预算，视频为 1800s）。
+
+## 8. 验收标准
+
+1. 「更多」菜单出现「热门选题」入口，点击进入 `/hot-topics` 页面。
+2. 首次进入自动拉取（缓存过期时），7 渠道并发抓取，单渠道失败不阻塞整体。
+3. 列表按渠道内排名展示：勾选框、分类标签、渠道标签、热度值齐全。
+4. 10 类分类筛选与渠道筛选正常工作，分类不中归综合。
+5. 【创作文案】单条/批量跳转改写页：topic 填入、模式=create、自动开始（含 <20 字补引导语）。
+6. 【一键发布】弹窗选图文/视频 → 批量改写带进度、失败重试、存草稿、跳转。
+7. 缓存与定时刷新：10 分钟缓存、30 分钟自动刷新、document.hidden 暂停。
+8. 防反爬组件接入（rate-limiter/circuit-breaker/cache 有测试断言）。
+9. i18n zh/en 成对 + Message Function + 无硬编码中文泄漏到模板。
+10. 【生成视频】按钮渲染于每条选题行；点击后弹窗打开、改写执行、流水线按用户默认选项自动启动；进度实时更新；成功后弹窗保持打开、【查看】【去发布】解锁（2026-10-17 修订，原为「完成跳转结果页」）；失败可重试（流水线失败重试不重复改写）；取消/后台运行语义正确（2026-09-12）。
+11. 流水线运行中弹窗 footer 显示【后台运行】按钮；点击后弹窗关闭、run 继续后台执行、前端态复位（phase='idle'、runId/stages 清空、**busy 释放**），不调用 pipelineCancelRun；应用正中央显示「如果想查看该任务，请进入视频创作的历史记录」4 秒后消失；改写/启动/终态不显示该按钮；视频创作页进度弹窗【后台运行】同样触发全局居中提示（2026-09-13）。
+12. **多任务并行**（2026-09-13 修正）：【后台运行】脱离（或终态关闭）后，所有选题的【生成视频】按钮立即可用，对另一条选题点击后能正常打开弹窗、改写并启动**第二条**并行流水线（两条 runId 互不干扰、互不覆盖进度）；并发上限由主进程门禁判定，超限时提示「视频流水线启动失败，请点击重试」并保留【重试】。
+13. **改写/启动阶段关闭弹窗**（2026-09-13 修正）：点击右上角 × 应中止前端编排——弹窗关闭、前端态复位、不调用 pipelineStartOrchestrated、不调用 pipelineCancelRun、不出现「任务已转入后台」提示。
+14. **抓取失败不清空选题**（2026-09-14 新增）：8 渠道本轮全部失败（超时/异常/限流跳过）且上一批缓存非空时，列表仍展示上一批选题（数量、顺序、`id` 均不变），不出现「暂无热门选题」空态；「上次刷新」时间保持为上一次成功抓取时间；顶部告警条如实展示本轮失败渠道并标注「（不可用）」。
+15. **保留态可自愈**（2026-09-14 新增）：保留态下缓存 `fetchedAt` 未被刷新，因此下一次非 force 刷新（含 30 分钟定时刷新）必定重新发起网络请求；网络恢复后自动覆盖为最新选题，无需用户手动干预。
+16. **保留态字段契约**（2026-09-14 新增）：`hot-topics:fetch` 返回的 `data.preservedStaleCache === true`、`data.topics` 非空、`data.fetchedAt` 等于保留的旧时间（早于当前时间）、`data.channelStats` 逐渠道四字段齐全；上一批为空时上述标记**不得**出现。
+17. **缓存内容不因失败被改写**（2026-09-14 新增）：全渠道失败后读取 `hot_topics_cache`（SQLite settings）应仍为保留内容（`topics` 非空 + `preservedStaleCache: true`），重启应用后依然可读。
+
+## 9. 测试覆盖
+
+### 9.1 单元测试
+
+| 测试文件 | 覆盖 |
+|---------|------|
+| `hot-topics-service.test.js` | 渠道解析（7 渠道各一 fixture）、分类映射（原生+规则+综合兜底）、去重、缓存读写 fail-closed、限流/熔断调用断言、SSRF 拒绝。**缓存保留回归 4 例（2026-09-14 新增）**：①全渠道失败 → 保留旧 `topics` 与旧 `fetchedAt`、落盘为保留值、`preservedStaleCache: true`、失败原因仍如实上报（`channelStats.zhihu.ok === false`）；②缓存本就为空 → 仍写空结果且无 `preservedStaleCache` 标记；③部分渠道成功 → 正常覆盖且无保留标记；④全渠道被限流/熔断跳过（`skipped: true`）→ 同样保留旧缓存 |
+| `HotTopics.test.js` | 渲染（菜单/标题/空态）、勾选与批量按钮态、筛选过滤、刷新交互（mock IPC）、一键发布进度流（mock aiRewrite）、一键生成视频全流程（改写/启动/进度/完成/取消/后台运行按钮与脱离语义，2026-09-13 补充）。**并发回归 4 例**（2026-09-13 修正）：①运行中关闭 → 后台脱离并复位前端态（busy 释放、runId 清空、不取消 run）；②改写阶段关闭 → 中止前端编排（不启动流水线）；③弹窗在途 busy 守卫仍拦截第二次编排；④【后台运行】脱离后另一选题可立即启动并行流水线（按钮可用 + 第二次 pipelineStartOrchestrated 使用第二条选题的改写产物 + runId 切换） |
+| `pipeline-background-toast.test.js` | 全局居中提示状态机：show 立即可见、4s 自动消失、重复触发重置计时、hide 立即清除定时器 |
+| `PipelineBackgroundToast.test.js` | 全局居中提示组件渲染：zh/en 文案、隐藏后 DOM 移除、key 未命中回退空串不泄漏 |
+| `RewriteView.test.js`（补充） | query.topic 填充、模式切换 create、自动 startRewrite、<20 字补引导语 |
+
+### 9.2 视觉回归
+
+- `all-views.visual.test.js` 注册 `hot-topics` 视图（需 dev server + mock 数据，随实现落地）。
+
+### 9.3 契约测试
+
+- preload 暴露的 API（`hotTopicsFetch/hotTopicsGetCache`）与主进程 handler 参数/返回结构一致。
+- 缓存 settings key `hot_topics_cache` 的结构契约（topics 数组 + fetchedAt + channelStats）。
+
+### 9.4 手动验证清单
+
+- 打包启动 → 更多菜单 → 热门选题 → 刷新 → 勾选 → 创作文案（跳转自动改写）→ 一键发布（图文/视频各一次全流程）。
+- **抓取失败韧性（2026-09-14 新增）**：先正常抓到选题 → 断开外网或让渠道不可达 → 点【刷新】→ 期望：列表条数与内容不变、「上次刷新」时间不变、顶部出现「部分渠道获取失败：…」告警条、控制台可见 `[hot-topics] all channels failed; preserved N cached topics (stale)` 警告日志；恢复网络后再次【刷新】→ 列表更新为新选题。
+
+### 9.5 端到端（CDP 真实实例）覆盖（2026-09-14 新增）
+
+| 资产 | 路径 | 说明 |
+|------|------|------|
+| CDP 客户端 | `apps/desktop/tests/e2e/lib/cdp-client.js` | 极简 CDP-over-WebSocket 传输层（`Runtime.evaluate` + `waitFor` 轮询）。**不使用** Playwright `connectOverCDP`：本机（Electron 43 / Chrome 150）实测其侧握手会稳定超时（15s × 6 次全 timeout），而直连 `webSocketDebuggerUrl` 完全正常 |
+| 一键生成视频驱动 | `apps/desktop/tests/e2e/hot-topics-one-click-video-driver.js` | 连接**已运行**的 Electron 实例（CDP），走真实 UI：进入 `/hot-topics` → 读取前 N 条选题 → 逐条 DOM 点击【生成视频】→ 等 `hot-topics-gen-video-background` 出现（= phase running 且持有 runId）→ 点【后台运行】脱离以发起下一条（受 `E2E_MAX_ACTIVE` 约束）→ 轮询 `pipelineGetRunContext` 至终态 → 深度搜索 `videoPath/outputPath` → 拷贝成片 + `ffprobe` 校验；`E2E_PUBLISH=1` 时追加发布阶段（见 §3.12），产出 `*-generate-report.json` |
+| 发布计划纯函数 | `apps/desktop/tests/e2e/lib/hot-video-publish-plan.js` | `buildPublishTargets` / `buildPublishArticle` / `buildPublishPlan`（规则见 §3.12 表 T1-T5 / A1-A5） |
+| 发布计划单测 | `apps/desktop/tests/hot-video-publish-plan.test.js` | vitest（13 用例）：账号过滤/白名单/多账号不去重、标题截断、内容回退链、无视频拒绝发布、NO_PUBLISH_TARGETS |
+
+**运行方式**：`E2E_CDP_URL` / `E2E_VITE_ORIGIN` / `E2E_TOPIC_COUNT` / `E2E_MAX_ACTIVE` / `E2E_LABEL` / `E2E_OUT_DIR` / `E2E_RUN_TIMEOUT_MS` 见文件头注释；驱动退出码 0 表示至少产出一条真实成片。
+
+**驱动必须遵守的两条硬约束（实测得出）**：
+
+1. **`window.electronAPI` 是 contextBridge 冻结对象**（`Object.isFrozen(api) === true`、`Object.isExtensible(api) === false`）→ **不能**通过在页面侧包一层 `pipelineStartOrchestrated` 来截获 `runId`；必须改用「点击前记录 `pipelineHistory()` → 点击后取新增的 `story2video-compose` run」的方式获取 runId。
+2. **路由用客户端 hash 切换**（`location.hash = '#/hot-topics'`）并**以 DOM 出现为准**判断到达（`[data-testid="hot-topic-item"]` 数量 > 0），不要依赖 hash 值本身——主进程触发 renderer 重载时 hash 会被重置为 `#/`。
+3. **并发门必须排除存量活跃 run**（2026-09-23 回归）：驱动启动前先快照一份当前 `running/paused` 的 runId 集合作为 baseline，并发计数只统计「本驱动新发起」的 run。否则历史陈旧 paused 僵尸（实测：两个月前中断在 generate_assets 的两条 run，重启后仍保持 paused）会永久挡死门控，冒烟测试一条选题都发不出去。
+4. **服务商额度熔断是生成链路外部阻断的典型形态**（2026-09-23 实测）：快照固化 `imageProvider/voiceProvider=minimax-multimodal`，Token Plan 用尽后 generate_assets 阶段秒败（0/17 场景）。处置：备份 `story2video.lastOptions.v1` 后将 imageProvider 切 `agnes-image`、voiceProvider 切 `mimo-tts`（清空 minimax 专属克隆 voiceId）再重跑。
+
+### 9.6 RPA 发布韧性与选择器契约回归（2026-09-23 新增）
+
+| 测试文件 | 类型 | 关键守卫（缺一不可） |
+|----------|------|--------------------|
+| `apps/desktop/electron/services/rpa-selector-utils.test.js` | jsdom 行为 | ① 精确文本+可交互优先于包含文本；② tag/class 约束生效（`div:has-text("发布")` 只能命中 div）；③ 原生 CSS 快路径；④ `text=` 回退全池；⑤ 无命中返回 `null` |
+| `apps/desktop/electron/services/rpa-view-platforms.test.js` | 行为 + 源码契约 | ① 上传先于字段填充；② 导航后调遮罩清理；③ 上传后有表单就绪等待；④ 标题/文件/简介不得硬取 `[0]`；⑤ 无标题框时标题写编辑器且不被正文覆写；⑥ 上传完成判定含负向信号且预算 ≥900000；⑦ `douyin` 专用链路也先清遮罩；⑧ `_prepBilibili` 先选声明再清短信弹窗；⑨ `_selectContentDeclaration` 6 态状态机逐个断言（含“选项缺失/未确认不得误报 done”）；⑩ kuaishou/bilibili/douyin 选择器候选顺序数据契约 |
+| `apps/desktop/electron/services/publisher-router.test.js` | 单元 | 视频任务 `rpaViewManager.publish` 收到 timeout **1800000**；图文任务仍为路由表 300s |
+| `apps/desktop/electron/ipc-handlers/publish.test.js` | 单元 | 带 `video_path` 的批量任务入队 `timeout: 1800000`；无视频保持默认 |
+| `packages/rpa-engine/tests/platform-selectors-cross-platform.test.js` | 数据契约 | 全平台 `publish_btn`/`file_input` 非空；bilibili RPA 兜底需 `file_input` 且按钮文案含「立即投稿」；无意外空数组 |
+
+### 9.7 live DOM 取证资产（修复依据，可回放）
+
+修复不得“猜页面”。本轮全部平台差异结论均可以下列取证文件逐条比对（取证资产已随本 PRD 入库：`01-docs/evidence/rpa-dom-2026-09-23/`，内含可回放取证脚本 `dump3-live.js` / `dump4-ks.js` / `d5-target.js`，跑前只需改顶部输出目录与 CDP 端口）：
+
+| 文件 | 平台/页面 | 锁定的事实 |
+|------|-----------|------------|
+| `d4-1-kuaishou.json` | `article/publish/video?tabType=1` | 无 `input[placeholder*="标题"]`；标题/描述共用 `div#work-description-edit[contenteditable][placeholder="作品描述不会写？试试智能文案"]` |
+| `d5-bilibili.json` | `upload/video/frame` | `input.input-val[placeholder="请输入稿件标题"]`；`.ql-editor` 简介；`创作声明` 必填下拉；风控短信弹窗（`sms-cell` + `btn-pink sms-confirm disabled`）；上传进度文案「已上传：0.0MB/0.0MB 剩余时间：>1天 0%」 |
+| `d5-douyin.json` | `content/post/video` | `input.semi-input[placeholder="填写作品标题，为作品获得更多流量"]`；`button … 发布 (disabled:false)`；`div.zone-container…[contenteditable]`；页面叠加「我知道了」 |
+
+### 9.8 提示词优化限流韧性回归（2026-09-23 新增，对应 §5.9）
+
+`apps/desktop/electron/services/story2video-stages.test.js` › `OPTIMIZE 限流韧性（429 裹在响应体 + template 降级）`，5 例：
+
+| 用例 | 钉住的不变式 |
+|------|--------------|
+| 429 包在响应体里时按结果体重试，恢复后不降级不留降级标记 | 结果体限流可重试；3 次内恢复则 **不得** 出现 `optimize_note` / `context.optimize_degraded`，且全程 `optimization_strategy≠template` |
+| 持续限流后降级 prompt-engine template 策略并标注降级来源 | 降级只发生 1 次 template 调用；entry 带 `optimize_note='rate_limited_template_fallback'` + `degraded=true`；`context.optimize_degraded={scenes:[0],total:1}` |
+| 降级也失败时保留原始限流错误，整阶段 fail closed | 不静默出片：`success:false` + `error` 含 `429`，且 **无** `output` 字段 |
+| 额度类（insufficient balance）错误不按限流处理 | 不重试（恰好 1 次调用）且不降级 —— quota 与 rate 必须分流 |
+| 多场景时降级标记按场景累积，成功恢复的场景不受牵连 | 混合场景下 `output[1].optimize_note` 为空，`optimize_degraded={scenes:[0,2],total:3}` |
+
+变异测试证据：将 `isTransientOptimizeOutcome` 短路为 `false`（即回到“只看抛错”的旧行为）后，上述第 1/2/5 例必红 → 用例非空断言，能真实拦截回归。
+
+### 9.9 发布文案恢复回归（2026-09-23 新增，对应 §4.4 / §5.10）
+
+测试文件：`apps/desktop/tests/hot-video-publish-plan.test.js`
+（`isHumanTitle` 3 例 + `readProjectCaption` 8 例，共 11 例新增）
+
+| 用例 | 断言要点 |
+|------|----------|
+| 含中文/含空格英文短语判为合法标题 | 「多家银行存款利息涨了」、「DeepSeek releases new model」→ true |
+| 纯 slug / 引擎标识符判为非法 | `smart-sentence-splitter`、`story2video-compose`、`v2`、空串、null → false |
+| 超长（>120）判为非法标题 | 121 个「深」→ false |
+| 正文优先取 sourceText | 与 `manifest.sourceText` 严格相等 |
+| sourceText 缺失按序拼接 segments | 顺序不得被打乱、空段被跳过 |
+| 显式选题标题优先于派生标题 | `topicTitle` 命中即返回 |
+| title 是正文前缀时不采用 | 派生为「深夜两点，监控画面定格在走廊尽头」且 `titleSource='derived'` |
+| 派生标题按上限截断 | `maxTitleLength: 20` → 恰好 20 字 |
+| slug 型 title 不得成为发布标题 | 结果不等于 `smart-sentence-splitter` |
+| 空清单返回三空 | `{ title: '', text: '', titleSource: '' }` |
+| 恢复文案可直接喂 buildPublishArticle | title / content 双字段端到端一致 |
+
+RED→GREEN 证据（本机 worktree `mp-hot-topics-video-publish-e2e`）：
+
+```
+# 仅回退 helper 实现、保留新用例 → 11 failed
+npx vitest run tests/hot-video-publish-plan.test.js
+  Test Files  1 failed (1)      Tests  11 failed | 17 passed (28)
+  TypeError: isHumanTitle is not a function
+  TypeError: readProjectCaption is not a function
+# 恢复实现 → 28 passed
+  Test Files  1 passed (1)      Tests  28 passed (28)
+```
+
+逃逸分析（为什么原来没测出来）：发布阶段的单测只覆盖「run context 在场」的正路径，
+没有覆盖「应用重启后只剩落盘工程」这一真实运维态；且标题兜底采用「key 含 title 即取值」
+的宽松启发式，缺少「标题必须像人类语言」的负例断言。
+
+预防措施：§4.4 不变式 I-1~I-4 已固化为测试契约；后续任何标题/正文来源改动必须先补负例
+再改实现。回归入口同 §9.6（RPA 发布韧性）。
+
+## 10. 技术实现说明（附录）
+
+### 10.1 主进程 service
+
+- `apps/desktop/electron/services/hot-topics-service.js`：`HotTopicsService` 类，方法 `fetchTopics(force)` / `getCache()`。
+- DI 链路：`container.setup.js` 注册 `hotTopicsService` → `phase1-context.js` 提取 → `phase5-ipc.js` 传递 deps → `ipc-handlers/hot-topics.js` 注册 IPC（channel：`hot-topics:fetch` / `hot-topics:get-cache`）。
+- preload：`preload/hot-topics.js` 暴露 `hotTopicsFetch/hotTopicsGetCache`。
+- 持久化：settings 表 `hot_topics_cache` key（复用 settings-store）。
+
+### 10.2 渠道适配器
+
+`apps/desktop/electron/services/hot-topics/channels/*.js`：每渠道一个解析器（fetch + parse），统一输出 `{ channel, rank, topic, hotValue, url, rawCategory }`。
+
+### 10.3 分类器
+
+`apps/desktop/electron/services/hot-topics/classifier.js`：`classifyTopic(rawCategory, channel, topicText) → category`，含原生分类映射表 + 关键词词表。
+
+### 10.4 渲染层
+
+- `HotTopics.vue`：列表 + 筛选 + 批量操作 + 进度 UI；IPC 调用经 `api/hot-topics.js`（invokeWithFallback）。
+- `RewriteView.vue`：新增 query.topic 消费逻辑（约 15 行）。
+
+### 10.5 渠道清单与间隔配置
+
+渠道策略内嵌于 service（`CHANNEL_CONFIGS`），每渠道：`{ id, name, url, headers, parser, intervalMinutes, riskLevel }`；不新增外部配置文件（避免打包 files 清单变更）。
+
+### 10.6 全局居中提示实现（2026-09-13 新增）
+
+- `stores/pipeline-background-toast.js`：模块级单例状态（pipelineBackgroundToastVisible ref + showPipelineBackgroundToast/hidePipelineBackgroundToast），与 settings-dialog.js 同模式（非 Pinia store，消费方直接 import）；4s 定时器在重复 show 时重置，hide 时清除；
+- `components/PipelineBackgroundToast.vue`：全局唯一渲染组件，Teleport to body，Transition 淡入淡出；App.vue 挂载（所有路由可见）；文案走 common.pipelineBackgroundToast，未命中回退空串；
+- 接入点 1：HotTopics.vue 的 detachGenVideoToBackground()（热门选题一键生成视频【后台运行】按钮）；
+- 接入点 2：CreateView.vue 的 detachPipelineToBackground() 成功分支（视频创作页进度弹窗【后台运行】按钮，含右上角 × 关闭=后台脱离路径）；
+- 全仓库审计结论：视频生成流水线进度弹窗仅此两处（VideoCloneView/FilmEngineeringView/RewriteView/ViralAnalysis/Intelligence/Collection 的进度均为页面内嵌或本地假进度，非弹窗，不适用本需求）。
+
+### 10.7 收藏与标签页增强（2026-09-13 新增）
+
+#### 10.7.1 标签页切换
+
+- 热门选题页顶部新增双标签页（tab-bar）："热门选题"（hot）与"收藏选题"（favorites），`activeTab` 切换视图。
+- 收藏标签右侧角标显示收藏数量。
+
+#### 10.7.2 收藏功能
+
+- 每条热门选题行新增 ♡ 收藏按钮，点击收藏/取消收藏。
+- 持久化方案：本地 SQLite settings 表，key `hot_topics_favorites`，owner-scoped（复用 `getUserSetting/setUserSetting`，与草稿箱同模式）。
+- IPC 新增 3 通道：
+  - `hot-topics:favorite-add` — 收藏选题（保存完整 topic 快照 + 收藏时间戳）
+  - `hot-topics:favorite-remove` — 取消收藏（按 topicId）
+  - `hot-topics:favorite-list` — 读取收藏列表
+
+#### 10.7.3 收藏列表
+
+- "收藏选题"tab 展示已收藏选题：分类标签、渠道标签、收藏时间（M/D HH:mm）、取消收藏按钮。
+- 空态展示引导文案"在热门选题中点击 ♡ 即可收藏感兴趣的选题"。
+- 收藏逻辑抽到独立 composable `useHotTopicsFavorites.js`，模板抽到 `HotTopicsFavorites.vue`。
+
+#### 10.7.4 信息增强
+
+- **更新时间**：每条热门选题行新增更新时间（`fetchedAt` 字段，格式 HH:mm），紧跟热度值之后。
+- **摘要悬浮**：`title` 属性由纯选题文本替换为结构化摘要（渠道名称 + 排名 + 分类 + 热度值），如"【知乎第3名】分类：科技，热度：952万"，由 `getTopicSummary()` 动态生成。
+
+#### 10.7.5 i18n
+
+- 新增 10 个 i18n key（zh/en 成对）：`tabHot`、`tabFavorites`、`favorite`、`unfavorite`、`favoritesEmptyTitle`、`favoritesEmptyDesc`、`updateTime`、`favoritedAt`、`topicSummary`。
+- 涉及文件：`apps/desktop/src/locales/zh.js`、`en.js`。
+
+#### 10.7.6 收藏列表 UI 对齐与操作入口补齐（2026-09-19 新增）
+
+**问题（用户报障）**：收藏选题列表中，正文、分类/渠道标签、收藏时间、取消收藏按钮挤在一起，无间距、无标签底色，与热门选题行视觉割裂。
+
+**根因**：列表行样式（`.topic-item` / `.topic-text` / `.tag` / `.rank-badge` 等）原先只写在 `apps/desktop/src/views/HotTopics.css`，而该文件以 `<style scoped>` 编译到 `HotTopics.vue`。Vue scoped 样式不穿透子组件，收藏列表却由子组件 `components/HotTopicsFavorites.vue` 渲染 → 该组件内部元素匹配不到任何行样式，flex/gap/padding 全部丢失，退化为无间距的行内流。
+
+**修复方案**：
+
+- 新增共用样式表 `apps/desktop/src/styles/hot-topics-list.css`，把列表行、标签、分类配色（`cat-*`）、热度、更新时间、行内按钮等共用规则从 `views/HotTopics.css` 迁出；
+- `views/HotTopics.vue` 与 `components/HotTopicsFavorites.vue` 各自以 `<style scoped src>` 引入该文件 —— 单一来源、零全局泄漏（避免把 61 条页面级规则变成全局样式）；
+- 删除因改用 `EmptyState` 而失效的 `.empty-box` / `.empty-title` / `.empty-desc` 死样式。
+
+**收藏行结构（与热门行同构）**：
+`♥ 星标徽章` → `正文（单行省略）` → `分类标签（cat-* 配色）` → `渠道标签` → `热度` → `收藏时间（右对齐）` → `取消收藏` → `创作文案` → `生成视频`（主按钮，与热门行同级）。
+
+**新增操作入口**：
+
+- 【创作文案】跳转 `/rewrite?topic=<encodeURIComponent(topic)>`，与热门行同一路由契约（复用 `createCopySingle`）；
+- 【生成视频】复用热门行同一 story2video 一键编排（复用 `startGenerateVideo`）；`genVideoBusy` 由父级透传，编排进行中所有收藏行的该按钮统一禁用（避免并发编排互踩）；
+- 【取消收藏】保留原语义与调用链（`removeFavorite`）。
+
+**空态与边界**：
+
+- 收藏为空时改用公共 `EmptyState` 组件（与热门选题空态同一视觉），文案沿用 `favoritesEmptyTitle` / `favoritesEmptyDesc`；
+- 损坏收藏数据（`topic` 为 null）：行仍渲染（正文显示 `—`），【取消收藏】可用（以 `favoritedAt` 作备用 ID），【创作文案】/【生成视频】置灰不可点。
+
+**i18n**：不新增 key —— 复用既有 `hotTopics.createCopy` / `generateVideo` / `unfavorite` / `favoritedAt`。
+
+**测试**：`apps/desktop/src/views/HotTopics.test.js` 新增 9 例，其中「子组件必须自带 scoped 引入共用样式表」为源码级契约断言，作为本根因的回归保护。
+
+**顺带抽出编排 composable（同日补做）**：本改动使 `views/HotTopics.vue` 由 997 行涨到 1002 行，越过本仓 `filesOver1000` 债务阈值。**未抬高债务基线**，改为把「一键生成视频」前端编排（状态 + 计算 + 方法，326 行）整体迁到 `apps/desktop/src/composables/useHotTopicsGenVideo.js`；依赖注入 `buildRewriteInput`（与批量发布共用同一改写输入契约）、`hotUseViral`（爆款库开关，与批量发布共用）、`isDisposed`（视图卸载标记）。编排行为逐行照搬、无语义改动，`HotTopics.vue` 降至 608 行。仅测试需要断言的内部态（`genVideoPhase` / `genVideoRunId` / `genVideoTopic` / `mergeGenStages`）以 `defineExpose` 显式声明为组件契约。
+
+**验证**：`views/HotTopics.test.js` 35/35 通过（全程无 Vue warn）；`eslint` 无告警；`node scripts/check-debt-budget.js` 全指标在基线内（`filesOver1000: 32 = 基线 32`，抽取前为 33 触发红灯）；`check-color-literals.js` 145/145（迁移未新增历史品牌色字面量）；`check-locale-sync.js --keys` PASS（未新增 i18n key）。另补一条断言锚定「生成视频弹窗的错误文案必须真的落到 DOM」——抽取过程中曾漏把 `genVideoErrorText` 暴露给模板，该文案静默不渲染且单测不报错（仅 Vue warn 可见），该断言即此盲点的回归保护。
+
+**注**：本次未改动根级 `CHANGELOG.md`（该文件与主分支前进易在顶部产生合并冲突，且近期主分支的 PR 已由 `01-docs/` 承载文档同步门禁），变更与验证记录以本节为准。
+
+### 10.8 缓存保留实现要点（2026-09-14 新增）
+
+**改动位置**：`apps/desktop/electron/services/hot-topics-service.js` 的 `fetchTopics()` 汇总段（`const topics = allTopics.slice(0, MAX_TOPICS)` 之后）。
+
+**实现骨架**：
+
+```js
+const topics = allTopics.slice(0, MAX_TOPICS)
+const previous = Array.isArray(cache.topics) ? cache.topics : []
+if (topics.length === 0 && previous.length > 0) {
+  const preserved = {
+    topics: previous,
+    fetchedAt: cache.fetchedAt,      // 保留旧时间 → 下次非 force 调用仍会重试网络
+    channelStats,                    // 本轮真实结果，供 UI 展示失败渠道
+    preservedStaleCache: true,
+  }
+  this._writeCache(preserved)
+  this.log.warn && this.log.warn('[hot-topics] all channels failed; preserved ' +
+    previous.length + ' cached topics (stale) instead of overwriting with an empty list')
+  return preserved
+}
+const newCache = { topics, fetchedAt, channelStats }
+this._writeCache(newCache)
+```
+
+**为什么用「进入本轮前的 `cache` 快照」而不是重新 `getCache()`**：`cache` 是 `fetchTopics()` 开头读取的权威快照（与 `inFlight` 去重配合），重新读取会把本轮可能的其它写入引入判定，破坏确定性。
+
+**为什么不写 `fetchedAt: Date.now()`**：那会让 10 分钟 TTL 认为缓存「新鲜」，`fetchTopics({ force: false })` 会在 TTL 窗口内直接命中这份陈旧缓存返回（`fromCache: true`），既不重试网络也不暴露失败——「保留」会退化成「永久陈旧」。保留旧 `fetchedAt` 让 TTL 自然过期，实现「保留内容 + 持续重试」。
+
+**为什么不合并新旧批次**：`id = channel + ':' + rank` 在新旧批次之间含义会漂移（同一 `zhihu:1` 在不同时间指向不同话题），合并会产出语义混乱的列表；同时 UI 的 `:key="topic.id"` 复用与勾选 `Set<id>` 也会错乱。因此只在「本轮零结果」时整体保留，不做逐条 merge。
+
+**改动边界**：**零渲染层改动、零新增 i18n key、零 IPC 契约变更**（`hot-topics:fetch` 返回结构只在零结果且保留时多一个可选字段 `preservedStaleCache`）。`HotTopics.vue` 的 `refresh()` 已按 `res.data.topics` 渲染，保留态返回的即上一次的选题数组，可直接渲染；顶部告警条依据 `channelStats` 计算，无需改动。
+

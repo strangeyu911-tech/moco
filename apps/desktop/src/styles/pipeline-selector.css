@@ -1,0 +1,227 @@
+/* ============================================
+   PipelineSelector — 流水线选择器样式
+   多列响应式布局 + MiniMax 生成背景 + 交互动效
+   ============================================ */
+
+.pipeline-selector { width: 100%; }
+
+/* ── 多列动态布局 ──────────────────────────────
+   基础：auto-fill 按可用宽度自动排布；
+   显式断点按设备分辨率/宽度给出列数上限，
+   配合 .create-page--pipeline-list 放宽容器充分利用宽屏。 */
+.pipeline-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 768px) {
+  .pipeline-grid { grid-template-columns: 1fr; gap: 12px; }
+}
+
+@media (min-width: 769px) and (max-width: 1199px) {
+  .pipeline-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+}
+
+@media (min-width: 1200px) and (max-width: 1439px) {
+  .pipeline-grid { grid-template-columns: repeat(3, 1fr); }
+}
+
+@media (min-width: 1440px) and (max-width: 1919px) {
+  .pipeline-grid { grid-template-columns: repeat(4, 1fr); }
+}
+
+@media (min-width: 1920px) {
+  .pipeline-grid { grid-template-columns: repeat(5, 1fr); }
+}
+
+/* ── 卡片基础 ─────────────────────────────── */
+.pipeline-card {
+  position: relative;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+  animation: pipeline-card-enter 0.4s ease both;
+  animation-delay: calc(var(--i, 0) * 30ms);
+  isolation: isolate;
+}
+
+@keyframes pipeline-card-enter {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.pipeline-card:hover {
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+  transform: translateY(-4px);
+  border-color: var(--primary);
+}
+
+.pipeline-card:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* 无背景时按分类色系的低饱和渐变兜底（保持文字主题色） */
+.pipeline-card.generated { background: linear-gradient(135deg, rgba(80, 72, 229, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-generated); }
+.pipeline-card.talking_head { background: linear-gradient(135deg, rgba(0, 168, 150, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-talking-head); }
+.pipeline-card.cinematic { background: linear-gradient(135deg, rgba(120, 40, 200, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-cinematic); }
+.pipeline-card.animation { background: linear-gradient(135deg, rgba(255, 150, 40, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-animation); }
+.pipeline-card.screen_recording { background: linear-gradient(135deg, rgba(20, 120, 220, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-screen-recording); }
+.pipeline-card.hybrid { background: linear-gradient(135deg, rgba(100, 80, 220, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-hybrid); }
+.pipeline-card.custom { background: linear-gradient(135deg, rgba(120, 120, 140, 0.10), transparent 55%), var(--surface); border-left: 3px solid var(--pipe-custom); }
+
+.pipeline-card.is-unavailable { opacity: 0.72; }
+.pipeline-card.is-unavailable:hover { transform: none; box-shadow: none; border-color: var(--border); }
+
+/* 带文案进入（改写页等）时不适配的流水线：灰显不可点击，悬浮提示原因 */
+.pipeline-card.is-text-ineligible {
+  opacity: 0.45;
+  filter: grayscale(0.6);
+  cursor: not-allowed;
+  pointer-events: auto; /* 保留 hover 以显示 title 提示 */
+}
+.pipeline-card.is-text-ineligible:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: var(--border);
+}
+/* 灰显时隐藏可用性徽章：悬浮提示已说明原因，避免「开发中」与「不适用」双原因并存混淆 */
+.pipeline-card.is-text-ineligible .availability-badge { display: none; }
+
+/* ── 生成背景层 ───────────────────────────── */
+.card-bg {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--surface);
+}
+
+.card-bg img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.45s ease;
+}
+
+/* 双层暗色遮罩：顶部渐变 + 底部承载 meta 文字，保证文字对比度 */
+.card-bg-scrim {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(10, 12, 24, 0.42) 0%, rgba(10, 12, 24, 0.12) 38%, rgba(10, 12, 24, 0.62) 78%, rgba(10, 12, 24, 0.85) 100%);
+}
+
+.pipeline-card:hover .card-bg img { transform: scale(1.06); }
+
+/* 有背景时前景统一浅色文字，保证可读性 */
+.pipeline-card.has-bg { border-color: rgba(255, 255, 255, 0.16); }
+.pipeline-card.has-bg .card-title,
+.pipeline-card.has-bg .stage-count { color: #f5f6fa; }
+.pipeline-card.has-bg .card-desc { color: rgba(235, 237, 245, 0.82); }
+.pipeline-card.has-bg .card-meta { color: rgba(235, 237, 245, 0.9); }
+.pipeline-card.has-bg .badge { background: rgba(255, 255, 255, 0.14); color: #fff; }
+.pipeline-card.has-bg .availability-badge.ready { background: rgba(47, 194, 122, 0.22); color: #d9fbe9; }
+.pipeline-card.has-bg .availability-badge.dev { background: rgba(255, 200, 60, 0.20); color: #ffe9b3; }
+.pipeline-card.has-bg .cost-label.low { background: rgba(47, 194, 122, 0.22); color: #d9fbe9; }
+.pipeline-card.has-bg .cost-label.medium { background: rgba(255, 200, 60, 0.20); color: #ffe9b3; }
+.pipeline-card.has-bg .cost-label.high { background: rgba(245, 108, 108, 0.22); color: #ffd9d9; }
+
+.card-content {
+  position: relative;
+  z-index: 0;
+  padding: 16px 20px;
+  min-height: 132px;
+  display: flex;
+  flex-direction: column;
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.badge {
+  font-size: var(--font-size-xs);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  background: rgba(80, 72, 229, 0.10);
+  color: var(--primary);
+}
+
+.stability-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.stability-dot.production { background: var(--stability-production); }
+.stability-dot.beta { background: var(--stability-beta); }
+.stability-dot.experimental { background: var(--stability-experimental); }
+
+.card-title {
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  margin: 0 0 4px;
+  color: var(--text);
+}
+
+.card-desc {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  margin: 0 0 12px;
+  line-height: 1.4;
+  flex: 1 1 auto;
+}
+
+.card-meta {
+  display: flex;
+  gap: 12px;
+  font-size: var(--font-size-xs);
+  color: var(--text-light);
+  flex-wrap: wrap;
+}
+
+.stage-count { font-weight: 500; }
+
+.cost-label { padding: 1px 6px; border-radius: 3px; }
+.cost-label.low { background: var(--status-completed-bg); color: var(--status-completed-text); }
+.cost-label.medium { background: var(--status-waiting-bg); color: var(--status-waiting-text); }
+.cost-label.high { background: var(--status-failed-bg); color: var(--status-failed-text); }
+
+.availability-badge { padding: 1px 6px; border-radius: 3px; }
+.availability-badge.ready { background: var(--status-completed-bg); color: var(--status-completed-text); }
+.availability-badge.dev { background: var(--status-waiting-bg); color: var(--status-waiting-text); }
+
+/* 加载骨架屏：栅格与卡片外壳统一走 styles/skeleton.css 的 .mp-skeleton-grid / .mp-skeleton-card */
+.loading-state { padding: 20px 0; }
+
+/* 错误状态 */
+.error-state { text-align: center; padding: 40px 20px; color: var(--text-muted); }
+.error-icon { font-size: var(--font-size-xxl); margin-bottom: 12px; }
+.retry-btn {
+  margin-top: 12px;
+  padding: 8px 16px;
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+}
+.retry-btn:hover { background: var(--primary); color: #fff; }
+
+/* 减少动态偏好：关闭入场/悬停动效与 shimmer 循环 */
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-card { animation: none; transition: none; }
+  .pipeline-card:hover { transform: none; }
+  .pipeline-card:hover .card-bg img { transform: none; }
+}

@@ -1,0 +1,211 @@
+name: autonomous-loop
+
+# AI 全自动多轮视觉测试循环。
+# PR 仅运行只读检查；基线和补丁作为 artifacts 输出，必须人工审核后提交。
+#
+# LLM 供应商配置：
+#   - 默认 OpenAI（gpt-4o-mini）。使用第三方/中转站时：secrets.OPENAI_API_KEY 填供应商 key，
+#     secrets.LLM_BASE_URL 填 OpenAI 兼容端点（如 https://api.deepseek.com/v1）、secrets.LLM_MODEL 填其在售模型名；
+#     workflow_dispatch 也可用 llm_base_url / llm_model 输入临时覆盖，无需预建 secret。
+#   - Anthropic：secrets.ANTHROPIC_API_KEY + inputs.llm_provider=anthropic。
+#   - PR 事件不注入任何 secrets（GitHub 安全限制），打 label 触发的 run 一律只读检查。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/desktop/src/**"
+      - "apps/desktop/tests/visual-testing/**"
+      - "packages/ai-autonomous-tester/**"
+      - "01-docs/PRD.md"
+      - ".github/workflows/autonomous-loop.yml"
+      - ".github/scripts/autonomous-loop-workflow.test.js"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "最大循环轮数"
+        required: false
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "5"
+      threshold:
+        description: "像素对比阈值"
+        required: false
+        default: "0.1"
+        type: choice
+        options:
+          - "0.02"
+          - "0.05"
+          - "0.1"
+      functional:
+        description: "启用功能测试"
+        required: false
+        default: true
+        type: boolean
+      llm_provider:
+        description: "LLM 协议：openai（官方或 OpenAI 兼容端点/中转站）或 anthropic"
+        required: false
+        default: "openai"
+        type: choice
+        options:
+          - "openai"
+          - "anthropic"
+      llm_base_url:
+        description: "OpenAI 兼容 Base URL（中转站填供应商地址，如 https://api.deepseek.com/v1）；留空 = 官方端点，已配 LLM_BASE_URL secret 时回落 secret"
+        required: false
+        default: ""
+        type: string
+      llm_model:
+        description: "模型名（中转站填其在售模型，如 deepseek-chat）；留空 = 各协议默认（gpt-4o-mini / claude-3-5-sonnet-latest）"
+        required: false
+        default: ""
+        type: string
+  pull_request:
+    branches: [main]
+    types: [labeled]
+    paths:
+      - "apps/desktop/src/**"
+      - "apps/desktop/tests/visual-testing/**"
+      - "packages/ai-autonomous-tester/**"
+      - "01-docs/PRD.md"
+      - ".github/workflows/autonomous-loop.yml"
+      - ".github/scripts/autonomous-loop-workflow.test.js"
+
+permissions:
+  contents: read
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  loop:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'autonomous-loop'
+    name: "Autonomous Loop (迭代 ${{ inputs.iterations || 3 }} 轮)"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      MAX_ITER: ${{ inputs.iterations || 3 }}
+      FUNCTIONAL_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.functional }}
+      LLM_PROVIDER: ${{ github.event_name != 'pull_request' && (inputs.llm_provider || secrets.LLM_PROVIDER) || 'openai' }}
+      LLM_BASE_URL: ${{ github.event_name != 'pull_request' && (inputs.llm_base_url || secrets.LLM_BASE_URL) || '' }}
+      LLM_MODEL: ${{ github.event_name != 'pull_request' && (inputs.llm_model || secrets.LLM_MODEL) || '' }}
+      OPENAI_API_KEY: ${{ github.event_name != 'pull_request' && secrets.OPENAI_API_KEY || '' }}
+      ANTHROPIC_API_KEY: ${{ github.event_name != 'pull_request' && secrets.ANTHROPIC_API_KEY || '' }}
+      COVERAGE_THRESHOLD: 0.5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright
+        run: cd apps/desktop && pnpm exec playwright install chromium
+
+      - name: Build Vue frontend
+        run: cd apps/desktop && pnpm run build:vue 2>&1 | Out-Null
+
+      - name: Run autonomous loop
+        id: loop
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Host "=== Autonomous Visual Test Loop ==="
+          Write-Host "Max iterations: $env:MAX_ITER"
+          Write-Host "Functional: $env:FUNCTIONAL_ENABLED"
+          Write-Host ""
+
+          $funcFlag = ""
+          if ($env:FUNCTIONAL_ENABLED -eq "true") { $funcFlag = "--functional" }
+
+          Push-Location apps/desktop
+          try {
+            node ../../packages/ai-autonomous-tester/scripts/run-autonomous-e2e.js `
+              --iterations=$env:MAX_ITER `
+              $funcFlag `
+              --docs="01-docs/PRD.md,README.md" `
+              --threshold="${{ inputs.threshold || '0.1' }}" 2>&1
+            $exitCode = $LASTEXITCODE
+          } finally {
+            Pop-Location
+          }
+
+          if ($null -eq $exitCode) { $exitCode = 1 }
+          Write-Host "Exit code: $exitCode"
+          "LOOP_EXIT=$exitCode" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload reports and review candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autonomous-loop-reports
+          path: |
+            apps/desktop/tests/visual-testing/reports/
+            apps/desktop/tests/visual-testing/screenshots/
+            apps/desktop/tests/visual-testing/base-screenshots/
+            apps/desktop/patches/
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report final status
+        if: always()
+        shell: pwsh
+        env:
+          LOOP_REPORT_DIR: ${{ github.workspace }}/apps/desktop/tests/visual-testing/reports
+        run: |
+          $exitCode = 1
+          $parsed = [int]::TryParse($env:LOOP_EXIT, [ref]$exitCode)
+          if (-not $parsed) {
+            $exitCode = 1
+          }
+
+          if ($exitCode -eq 0) {
+            Write-Host "::notice::Autonomous loop PASSED after all iterations"
+            exit 0
+          }
+
+          # NEED_HUMAN / MAX_ITERATIONS 均属于"尽力而为"结果，非基础设施故障
+          # - NEED_HUMAN：无 LLM API Key 时的降级只读检查
+          # - MAX_ITERATIONS：LLM 已尝试修复但未完全通过（已达最大迭代次数）
+          # （语义对齐 .github/scripts/agent-review-gate.js 的 PROMPT_REVIEW_REQUIRED）
+          if ($parsed -and $exitCode -eq 1) {
+            $reportDir = $env:LOOP_REPORT_DIR
+            if (-not [string]::IsNullOrEmpty($reportDir)) {
+              $reportFile = Get-ChildItem -Path $reportDir -Filter "autonomous-loop-report-*.json" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if ($reportFile) {
+                try {
+                  $report = Get-Content -LiteralPath $reportFile.FullName -Raw | ConvertFrom-Json
+                  if ($report -is [pscustomobject] -and ($report.finalStatus -ceq "NEED_HUMAN" -or $report.finalStatus -ceq "MAX_ITERATIONS")) {
+                    $degradeReason = if ($report.finalStatus -ceq "NEED_HUMAN") { "no LLM API key configured" } else { "max iterations reached" }
+                    Write-Host "::warning::Autonomous loop degraded to read-only check ($degradeReason); report uploaded for manual review. finalStatus=$($report.finalStatus), iterations=$($report.iterations)"
+                    exit 0
+                  }
+                } catch {
+                  # 报告损坏时回落失败，不静默放行
+                }
+              }
+            }
+          }
+          Write-Host "::error::Autonomous loop FAILED - see artifacts for details"
+          exit 1

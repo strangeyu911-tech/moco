@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "mutate": [
+    "apps/desktop/electron/services/**/*.js",
+    "apps/desktop/electron/ipc-handlers/**/*.js",
+    "apps/desktop/electron/core/**/*.js",
+    "apps/desktop/electron/bootstrap/**/*.js",
+    "apps/desktop/electron/bootstrap.js",
+    "apps/desktop/electron/main.js",
+    "apps/desktop/electron/window.js",
+    "apps/desktop/electron/shutdown.js",
+    "apps/desktop/src/stores/**/*.js",
+    "apps/desktop/src/composables/**/*.js",
+    "packages/shared-utils/src/scheduler.js",
+    "!**/*.test.js",
+    "!**/*.spec.js"
+  ],
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "ignorePatterns": [
+    "apps/desktop/dist-electron",
+    "apps/desktop/stryker-tmp",
+    "apps/desktop/.stryker-tmp",
+    "stryker-tmp",
+    ".stryker-tmp",
+    "01-docs",
+    "apps/desktop/dist",
+    "apps/desktop/dist-electron",
+    "apps/desktop/tests/e2e",
+    "apps/desktop/tests/visual-testing"
+  ],
+  "inPlace": true,
+  "cleanTempDir": "always",
+  "disableTypeChecks": false,
+  "incremental": true,
+  "vitest": {
+    "configFile": "apps/desktop/vitest.stryker.config.js",
+    "related": false
+  },
+  "disableBail": true,
+  "dryRunTimeoutMinutes": 30,
+  "concurrency": 2,
+  "reporters": ["html", "progress", "clear-text"],
+  "htmlReporter": {
+    "fileName": "apps/desktop/reports/mutation/index.html"
+  },
+  "thresholds": {
+    "high": 55,
+    "low": 40,
+    "break": 30
+  },
+  "tempDirName": "stryker-tmp"
+}

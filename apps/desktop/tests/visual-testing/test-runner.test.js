@@ -1,0 +1,689 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { PNG } from 'pngjs'
+
+const { VisualTestRunner } = require('./test-runner')
+
+// 含内容区的合法 1920x1080 截图：updateBaseline 现在有基线内容下限守卫
+// （拦截「明显未渲染」的空白截图入库，事故原型 PR #2075→#2114），
+// 假 PNG 签名会被拒解码，mock 必须产出真实可渲染内容。
+// 夹具必须与真实宿主同形：evaluate 的返回值由**被求值的页内函数**决定。
+// 对所有输入回同一个值，会让「按输入区分」这一整类缺陷对该测试结构性免疫
+// —— 跨视图浮层清除（clearInheritedOverlays）就是靠这条被真实宿主支持的语义工作的。
+function pageEvaluate(otherwise) {
+  return vi.fn(async (fn) => (fn && fn.name === 'clearInheritedOverlays' ? { removed: 0, left: 0 } : otherwise))
+}
+
+function makeContentPng() {
+  const png = new PNG({ width: 1920, height: 1080 })
+  for (let y = 0; y < png.height; y++) {
+    for (let x = 0; x < png.width; x++) {
+      const i = (y * png.width + x) * 4
+      const ink = y > 300 && y < 900 && x > 100 && x < 1800
+      png.data[i] = ink ? 30 : 255
+      png.data[i + 1] = ink ? 27 : 255
+      png.data[i + 2] = ink ? 75 : 255
+      png.data[i + 3] = 255
+    }
+  }
+  return PNG.sync.write(png)
+}
+
+function createRunner(tempDir) {
+  const runner = new VisualTestRunner({
+    screenshotDir: path.join(tempDir, 'screenshots'),
+    reportDir: path.join(tempDir, 'reports'),
+    metaDir: path.join(tempDir, 'meta'),
+    baselineDir: path.join(tempDir, 'baselines'),
+  })
+  for (const directory of [
+    runner.screenshotDir,
+    runner.reportDir,
+    runner.metaDir,
+    runner.baselineDir,
+  ]) {
+    fs.mkdirSync(directory, { recursive: true })
+  }
+    runner.page = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      url: vi.fn().mockReturnValue('http://127.0.0.1:5174/#/accounts'),
+      waitForSelector: vi.fn().mockResolvedValue(undefined),
+    waitForTimeout: vi.fn().mockResolvedValue(undefined),
+    // 夹具必须与真实宿主同形：evaluate 的返回值由**被求值的页内函数**决定。
+    // 对所有输入回同一个数，会让「按输入区分」这一整类缺陷对该测试结构性免疫。
+    evaluate: pageEvaluate(500),
+    screenshot: vi.fn().mockImplementation(async ({ path: outputPath }) => {
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+      fs.writeFileSync(outputPath, makeContentPng())
+    }),
+  }
+  return runner
+}
+
+function makeCheckLocator(visible) {
+  return {
+    first() { return this },
+    isVisible: vi.fn().mockResolvedValue(visible),
+  }
+}
+
+describe('视觉基线门禁', () => {
+  afterEach(() => {
+    delete process.env.UPDATE_BASELINE
+  })
+
+  it('默认模式缺少人工审核基线时失败且不写基线', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-baseline-missing-'))
+    const runner = createRunner(tempDir)
+    const updateBaseline = vi.spyOn(runner.pixelDiff, 'updateBaseline')
+
+    try {
+      await expect(runner.pixelRegressionTest('missing', '/accounts'))
+        .rejects.toMatchObject({ code: 'ERR_VISUAL_BASELINE_MISSING' })
+      expect(updateBaseline).not.toHaveBeenCalled()
+      expect(runner.results.at(-1)).toMatchObject({
+        test: 'missing',
+        status: 'FAILED',
+      })
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('显式更新模式才允许创建基线', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-baseline-update-'))
+    const runner = createRunner(tempDir)
+    process.env.UPDATE_BASELINE = '1'
+
+    try {
+      await expect(runner.pixelRegressionTest('approved', '/accounts')).resolves.toMatchObject({
+        status: 'BASELINE_CREATED',
+      })
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'approved.png'))).toBe(true)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---- 批次 1：暗色基线通道（ui-apple-token-retirement Task 1）----
+describe('暗色基线通道', () => {
+  afterEach(() => {
+    delete process.env.UPDATE_BASELINE
+  })
+
+  it('主题后缀映射：浅色沿用历史命名，暗色独立后缀', () => {
+    expect(VisualTestRunner.themeSuffix('light')).toBe('')
+    expect(VisualTestRunner.themeSuffix(undefined)).toBe('')
+    expect(VisualTestRunner.themeSuffix('dark')).toBe('-dark')
+  })
+
+  it('浅色（默认）保持历史基线与截图命名 —— 既有基线拍摄条件不得被改写', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-theme-light-naming-'))
+    const runner = createRunner(tempDir)
+    process.env.UPDATE_BASELINE = '1'
+
+    try {
+      await runner.pixelRegressionTest('accounts-list', '/accounts')
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'accounts-list.png'))).toBe(true)
+      expect(fs.existsSync(path.join(tempDir, 'screenshots', 'accounts-list-current.png'))).toBe(true)
+      // 不得产出带后缀的同名文件（否则暗色基线会与浅色互相覆盖）
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'accounts-list-dark.png'))).toBe(false)
+      expect(fs.existsSync(path.join(tempDir, 'screenshots', 'accounts-list-dark-current.png'))).toBe(false)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('暗色基线与截图使用 -dark 命名，与浅色互不覆盖', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-theme-dark-naming-'))
+    const runner = createRunner(tempDir)
+    process.env.UPDATE_BASELINE = '1'
+
+    try {
+      await runner.pixelRegressionTest('accounts-list', '/accounts', { theme: 'dark' })
+      await runner.pixelRegressionTest('accounts-list', '/accounts', { theme: 'light' })
+
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'accounts-list-dark.png'))).toBe(true)
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'accounts-list.png'))).toBe(true)
+      expect(fs.existsSync(path.join(tempDir, 'screenshots', 'accounts-list-dark-current.png'))).toBe(true)
+      expect(fs.existsSync(path.join(tempDir, 'screenshots', 'accounts-list-current.png'))).toBe(true)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('主题逐用例显式设置：暗色用例之后的浅色用例必须被重置（不依赖导航重置）', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-theme-reset-'))
+    const runner = createRunner(tempDir)
+    process.env.UPDATE_BASELINE = '1'
+
+    try {
+      await runner.pixelRegressionTest('a-view', '/accounts', { theme: 'dark' })
+      await runner.pixelRegressionTest('b-view', '/accounts')
+
+      // _applyTheme 第二次仍须显式写 light（hash 导航不重载文档，属性会残留）
+      const appliedThemes = runner.page.evaluate.mock.calls
+        .map((call) => call[1])
+        .filter((value) => value === 'dark' || value === 'light')
+      expect(appliedThemes).toEqual(['dark', 'light'])
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('非法主题值一律归一为 light（fail-safe，不产出第二套命名）', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-theme-invalid-'))
+    const runner = createRunner(tempDir)
+    process.env.UPDATE_BASELINE = '1'
+
+    try {
+      await runner.pixelRegressionTest('weird-view', '/accounts', { theme: 'DARK' })
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'weird-view.png'))).toBe(true)
+      expect(fs.existsSync(path.join(tempDir, 'baselines', 'weird-view-dark.png'))).toBe(false)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('视觉视图门禁', () => {
+  afterEach(() => {
+    delete process.env.UPDATE_BASELINE
+  })
+
+  it('ready 选择器不存在时必须失败', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-ready-selector-'))
+    const runner = createRunner(tempDir)
+    runner.page.waitForSelector = vi.fn().mockRejectedValue(new Error('selector missing'))
+
+    try {
+      await expect(runner.aiVisionTest('bad-ready', '/accounts', [
+        { name: '标题', text: '账号管理' },
+      ], { waitFor: '.missing' })).rejects.toThrow(/selector missing|选择器/)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('每个视觉检查必须声明可执行的选择器或文字断言', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-machine-check-'))
+    const runner = createRunner(tempDir)
+    runner.page.waitForSelector = vi.fn().mockResolvedValue(undefined)
+
+    try {
+      await expect(runner.aiVisionTest('prompt-only', '/accounts', [
+        { name: '仅提示词', prompt: '页面是否正常？' },
+      ], { waitFor: '.page-title' })).rejects.toMatchObject({
+        code: 'ERR_VISUAL_CHECK_INVALID',
+      })
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('机器断言失败时记录 FAILED 并拒绝通过', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-check-failed-'))
+    const runner = createRunner(tempDir)
+    runner.page.waitForSelector = vi.fn().mockResolvedValue(undefined)
+    runner.page.locator = vi.fn(() => makeCheckLocator(false))
+
+    try {
+      await expect(runner.aiVisionTest('missing-control', '/accounts', [
+        { name: '添加按钮', selector: '.add-account-button' },
+      ], { waitFor: '.page-title' })).rejects.toMatchObject({
+        code: 'ERR_VISUAL_CHECK_FAILED',
+      })
+      expect(runner.results).toContainEqual(expect.objectContaining({
+        test: 'missing-control',
+        check: '添加按钮',
+        status: 'FAILED',
+      }))
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('重定向入口按声明的目标路由等待应用就绪', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-redirect-route-'))
+    const runner = createRunner(tempDir)
+    runner.page.waitForFunction = vi.fn().mockResolvedValue(undefined)
+    runner.page.locator = vi.fn(() => makeCheckLocator(true))
+
+    try {
+      await expect(runner.aiVisionTest('providers-redirect', '/providers', [
+        { name: '标题', selector: '.page-title' },
+      ], {
+        expectedRoute: '/model-providers',
+        waitFor: '.page-title',
+      })).resolves.toMatchObject({ status: 'PASSED' })
+      expect(runner.page.goto).toHaveBeenCalledWith(
+        expect.stringContaining('/#/providers'),
+        expect.any(Object),
+      )
+      expect(runner.page.waitForFunction.mock.calls[0][1]).toBe('#/model-providers')
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('每次导航前清空 cookie、localStorage 和 sessionStorage', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-state-reset-'))
+    const runner = createRunner(tempDir)
+    const clearCookies = vi.fn().mockResolvedValue(undefined)
+    runner.context = { clearCookies }
+    const evaluate = pageEvaluate(undefined)
+    runner.page.evaluate = evaluate
+
+    try {
+      await runner._navigateToRoute('/accounts', '.page-title')
+      expect(clearCookies).toHaveBeenCalledOnce()
+      expect(evaluate).toHaveBeenCalled()
+      const resetScript = evaluate.mock.calls[0][0].toString()
+      expect(resetScript).toContain('localStorage.clear')
+      expect(resetScript).toContain('sessionStorage.clear')
+      expect(runner.page.goto.mock.invocationCallOrder[0])
+        .toBeGreaterThan(clearCookies.mock.invocationCallOrder[0])
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('同一路由只改 query 时必须强制重载（组件实例复用会让 onMounted 不再跑）', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-reuse-'))
+    const runner = createRunner(tempDir)
+    runner.page.url = vi.fn().mockReturnValue('http://127.0.0.1:5174/#/accounts')
+    runner.page.reload = vi.fn().mockResolvedValue(undefined)
+    try {
+      await runner._navigateToRoute('/accounts?mpFlag=account_cloud_sync=1', '.accounts-page')
+      expect(runner.page.reload).toHaveBeenCalledTimes(1)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('换路由（path 变了）不得触发多余重载 —— 那会改写既有 18 条基线的拍摄条件', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-noreuse-'))
+    const runner = createRunner(tempDir)
+    runner.page.url = vi.fn().mockReturnValue('http://127.0.0.1:5174/#/accounts')
+    runner.page.reload = vi.fn().mockResolvedValue(undefined)
+    try {
+      await runner._navigateToRoute('/publish', '.publish-page')
+      expect(runner.page.reload).toHaveBeenCalledTimes(0)
+      // 同一路由且 query 也没变 ⇒ 同样不该重载
+      runner.page.url = vi.fn().mockReturnValue('http://127.0.0.1:5174/#/accounts')
+      await runner._navigateToRoute('/accounts', '.accounts-page')
+      expect(runner.page.reload).toHaveBeenCalledTimes(0)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('首次导航停留在 about:blank 时不访问受限存储', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-blank-state-reset-'))
+    const runner = createRunner(tempDir)
+    runner.page.url.mockReturnValue('about:blank')
+    const clearCookies = vi.fn().mockResolvedValue(undefined)
+    runner.context = { clearCookies }
+
+    try {
+      await runner._navigateToRoute('/accounts', '.page-title')
+      expect(clearCookies).toHaveBeenCalledOnce()
+      expect(runner.page.goto).toHaveBeenCalled()
+      expect(runner.page.evaluate.mock.invocationCallOrder[0])
+        .toBeGreaterThan(runner.page.goto.mock.invocationCallOrder[0])
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('视觉应用就绪预算', () => {
+  afterEach(() => {
+    delete process.env.VISUAL_READY_TIMEOUT
+  })
+
+  it('读取有效的 CI 就绪预算，且显式配置优先', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-ready-timeout-'))
+    process.env.VISUAL_READY_TIMEOUT = '15000'
+
+    try {
+      expect(createRunner(tempDir).readyTimeout).toBe(15000)
+      expect(new VisualTestRunner({ readyTimeout: 9000 }).readyTimeout).toBe(9000)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('非法的 CI 就绪预算使用有限默认值', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-ready-timeout-invalid-'))
+    process.env.VISUAL_READY_TIMEOUT = 'not-a-number'
+
+    try {
+      expect(createRunner(tempDir).readyTimeout).toBe(15000)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['500', '30001', '1000.5', '-1', 'Infinity'])('越界的 CI 就绪预算 %s 使用有限默认值', (value) => {
+    process.env.VISUAL_READY_TIMEOUT = value
+    expect(new VisualTestRunner().readyTimeout).toBe(15000)
+  })
+
+  it('业务选择器只使用 Vue 挂载后的剩余总预算', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-ready-budget-'))
+    const runner = createRunner(tempDir)
+    let now = 0
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    runner.page.waitForFunction = vi.fn().mockImplementation(async () => {
+      now = 14999
+    })
+
+    try {
+      await runner._navigateToRoute('/accounts', '.page-title')
+      expect(runner.page.waitForSelector).toHaveBeenCalledWith('.page-title', { timeout: 1 })
+    } finally {
+      nowSpy.mockRestore()
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('应用挂载超时附带路由与挂载状态诊断，且不继续截图', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-ready-diagnostics-'))
+    const runner = createRunner(tempDir)
+    const timeout = new Error('Timeout 5000ms exceeded')
+    timeout.name = 'TimeoutError'
+    runner.page.waitForFunction = vi.fn().mockRejectedValue(timeout)
+    runner.page.url = vi.fn().mockReturnValue('http://127.0.0.1:5174/#/accounts')
+    runner.page.evaluate = pageEvaluate({
+      hash: '#/accounts',
+      appPresent: true,
+      appMounted: false,
+      appTextLength: 0,
+    })
+
+    try {
+      let failure
+      try {
+        await runner._navigateToRoute('/accounts', '.page-title')
+      } catch (error) {
+        failure = error
+      }
+
+      expect(failure).toMatchObject({ code: 'ERR_VISUAL_APP_READY_TIMEOUT' })
+      expect(failure.message).toContain('url=http://127.0.0.1:5174/#/accounts')
+      expect(failure.message).toContain('hash=#/accounts')
+      expect(failure.message).toContain('appMounted=false')
+      expect(runner.page.waitForSelector).not.toHaveBeenCalled()
+      expect(runner.page.screenshot).not.toHaveBeenCalled()
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('业务选择器超时保留独立错误码和阶段信息', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-selector-diagnostics-'))
+    const runner = createRunner(tempDir)
+    const timeout = new Error('Timeout 15000ms exceeded')
+    timeout.name = 'TimeoutError'
+    runner.page.waitForFunction = vi.fn().mockResolvedValue(undefined)
+    runner.page.waitForSelector = vi.fn().mockRejectedValue(timeout)
+    runner.page.url = vi.fn().mockReturnValue('http://127.0.0.1:5174/#/accounts')
+    runner.page.evaluate = pageEvaluate({
+      hash: '#/accounts',
+      appPresent: true,
+      appMounted: true,
+      appTextLength: 32,
+    })
+
+    try {
+      let failure
+      try {
+        await runner._navigateToRoute('/accounts', '.page-title')
+      } catch (error) {
+        failure = error
+      }
+
+      expect(failure).toMatchObject({ code: 'ERR_VISUAL_READY_SELECTOR_TIMEOUT' })
+      expect(failure.message).toContain('stage=业务选择器(.page-title)')
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('截图前的确定性渲染收口（settleForCapture）', () => {
+  it('按字体稳定帧 → 动画归零 → 回顶部 → settle → networkidle 的序列执行', async () => {
+    const calls = []
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settle-'))
+    try {
+      const runner = createRunner(tempDir)
+      runner.page = {
+        evaluate: vi.fn(async (fn) => { calls.push('evaluate:' + (fn.name || 'anon')) }),
+        addStyleTag: vi.fn(async ({ content }) => { calls.push('style:' + (/animation:0s/.test(content) ? 'anim-off' : 'other')) }),
+        waitForTimeout: vi.fn(async (ms) => { calls.push('sleep:' + ms) }),
+        waitForLoadState: vi.fn(async (s) => { calls.push('load:' + s) }),
+      }
+      await runner.settleForCapture()
+      expect(calls).toEqual([
+        'evaluate:anon',
+        'style:anim-off',
+        'evaluate:anon',
+        'sleep:300',
+        'load:networkidle',
+      ])
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('视图路径 _navigateToRoute 仍然 await settleForCapture', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settle-nav-'))
+    try {
+      const runner = createRunner(tempDir)
+      runner._resetBrowserState = vi.fn(async () => {})
+      runner._waitForApplicationReady = vi.fn(async () => {})
+      const settle = vi.fn(async () => {})
+      runner.settleForCapture = settle
+      runner.url = 'http://127.0.0.1:5174'
+      runner.page = {
+        goto: vi.fn(async () => {}),
+        reload: vi.fn(async () => {}),
+      }
+      await runner._navigateToRoute('/dashboard', '.dash')
+      expect(settle).toHaveBeenCalledTimes(1)
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('采集时钟合同（含实时值的视图必须可复现）', () => {
+  const FIXED_ISO = '2026-01-01T00:00:00.000Z'
+
+  afterEach(() => {
+    delete process.env.VISUAL_CAPTURE_FIXED_TIME_ISO
+    vi.restoreAllMocks()
+  })
+
+  function clockRunner (page) {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-clock-'))
+    const runner = new VisualTestRunner({
+      screenshotDir: path.join(tempDir, 'screenshots'),
+      reportDir: path.join(tempDir, 'reports'),
+      metaDir: path.join(tempDir, 'meta'),
+      baselineDir: path.join(tempDir, 'baselines'),
+    })
+    runner.page = page
+    return runner
+  }
+
+  it('默认钉住：以固定时刻调用 setFixedTime，并把钉住值如实暴露出来', async () => {
+    const setFixedTime = vi.fn().mockResolvedValue(undefined)
+    const runner = clockRunner({ clock: { setFixedTime } })
+    const got = await runner._installCaptureClock()
+    expect(setFixedTime).toHaveBeenCalledTimes(1)
+    const arg = setFixedTime.mock.calls[0][0]
+    expect(arg instanceof Date).toBe(true)
+    expect(arg.toISOString()).toBe(FIXED_ISO)
+    expect(got).toBe(arg.getTime())
+    expect(runner.captureFixedTime).toBe(arg.getTime())
+  })
+
+  it('VISUAL_CAPTURE_FIXED_TIME_ISO=off 显式关闭：不调用宿主 API，且回显 null', async () => {
+    process.env.VISUAL_CAPTURE_FIXED_TIME_ISO = 'off'
+    const setFixedTime = vi.fn()
+    const runner = clockRunner({ clock: { setFixedTime } })
+    expect(await runner._installCaptureClock()).toBe(null)
+    expect(setFixedTime).not.toHaveBeenCalled()
+    expect(runner.captureFixedTime).toBe(null)
+  })
+
+  it('非法时间值一律抛错：静默退回未固定会把基线变回跨日必漂', async () => {
+    process.env.VISUAL_CAPTURE_FIXED_TIME_ISO = '昨天下午三点'
+    const setFixedTime = vi.fn()
+    const runner = clockRunner({ clock: { setFixedTime } })
+    await expect(runner._installCaptureClock()).rejects.toThrow(/VISUAL_CAPTURE_FIXED_TIME_ISO/)
+    expect(setFixedTime).not.toHaveBeenCalled()
+  })
+
+  it('宿主不提供 clock API 时必须出声（观察者要报告自己的失明）', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const runner = clockRunner({})
+    expect(await runner._installCaptureClock()).toBe(null)
+    expect(runner.captureFixedTime).toBe(null)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('setFixedTime'))
+  })
+
+  it('接线锁：launch() 必须在建页之后、任何导航之前装时钟', () => {
+    const source = fs.readFileSync(path.join(__dirname, 'test-runner.js'), 'utf8')
+    const iNew = source.indexOf('await this.context.newPage()')
+    const iClock = source.indexOf('await this._installCaptureClock()')
+    const iConsole = source.indexOf("this.page.on('console'")
+    const iGoto = source.indexOf('this.page.goto(')
+    // 先证坐标存在，否则 -1 会让下面的顺序断言退化成永真
+    expect(iNew).toBeGreaterThan(-1)
+    expect(iClock).toBeGreaterThan(-1)
+    expect(iConsole).toBeGreaterThan(-1)
+    expect(iGoto).toBeGreaterThan(-1)
+    // 建页 -> 装时钟 -> 挂监听 -> 才可能导航
+    expect(iNew).toBeLessThan(iClock)
+    expect(iClock).toBeLessThan(iConsole)
+    expect(iConsole).toBeLessThan(iGoto)
+  })
+})
+
+describe('跨视图瞬时浮层清除（错误态不得被烤进下一个视图的基线）', () => {
+  const R = require('./test-runner')
+
+  function overlayRunner(page) {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visual-overlay-'))
+    const runner = new VisualTestRunner({
+      screenshotDir: path.join(tempDir, 'screenshots'),
+      reportDir: path.join(tempDir, 'reports'),
+      metaDir: path.join(tempDir, 'meta'),
+      baselineDir: path.join(tempDir, 'baselines'),
+    })
+    runner.page = page
+    return runner
+  }
+
+  // 夹具必须按选择器区分：对所有输入返回同一份数据，「按输入区分」这一整类缺陷对该测试结构性免疫
+  function makeFakeDoc(bySel) {
+    // 三类选择器一律预置（被清除函数无条件逐个查询），只有登记过的才有节点 ——
+    // 未登记的选择器返回空数组，而**不认识**的选择器抛错，两者不能混为一谈
+    const nodes = {}
+    for (const sel of R.INHERITED_OVERLAY_SELECTORS) nodes[sel] = []
+    for (const sel of Object.keys(bySel)) {
+      if (!(sel in nodes)) throw new Error('夹具收到了不在登记表里的选择器: ' + sel)
+      nodes[sel] = Array.from({ length: bySel[sel] }, () => ({
+        dead: false,
+        remove() { this.dead = true },
+      }))
+    }
+    return {
+      querySelectorAll(sel) {
+        if (!(sel in nodes)) throw new Error('夹具不认识的选择器: ' + sel)
+        return nodes[sel].filter((n) => !n.dead)
+      },
+      _nodes: nodes,
+    }
+  }
+
+  function runClear(bySel) {
+    const doc = makeFakeDoc(bySel)
+    const prev = globalThis.document
+    globalThis.document = doc
+    try {
+      return { verdict: R.clearInheritedOverlays(R.INHERITED_OVERLAY_SELECTORS), doc }
+    } finally {
+      if (prev === undefined) delete globalThis.document; else globalThis.document = prev
+    }
+  }
+
+  it('页内执行体真跑假 DOM：逐类计数、确实摘除、清后归零', () => {
+    const { verdict, doc } = runClear({ '.el-message': 2, '.el-notification': 1, '.el-message-box__wrapper': 0 })
+    expect(verdict).toEqual({ removed: 3, left: 0 })
+    expect(doc._nodes['.el-message'].every((n) => n.dead)).toBe(true)
+    expect(doc._nodes['.el-notification'].every((n) => n.dead)).toBe(true)
+  })
+
+  it('不同选择器不得共享计数：只有某一类有节点时 removed 只能是那一类的数', () => {
+    const a = runClear({ '.el-message': 1, '.el-notification': 0, '.el-message-box__wrapper': 0 }).verdict
+    const b = runClear({ '.el-message': 0, '.el-notification': 0, '.el-message-box__wrapper': 2 }).verdict
+    expect(a).toEqual({ removed: 1, left: 0 })
+    expect(b).toEqual({ removed: 2, left: 0 })
+  })
+
+  it('无浮层时 removed=0 且不算失败（否则每条干净用例都会被判红）', () => {
+    expect(runClear({}).verdict).toEqual({ removed: 0, left: 0 })
+  })
+
+  it('runner：清掉的数量如实回传并打日志', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const runner = overlayRunner({ evaluate: vi.fn().mockResolvedValue({ removed: 2, left: 0 }) })
+    expect(await runner._dismissInheritedOverlays()).toBe(2)
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('2'))
+    log.mockRestore()
+  })
+
+  it('runner：清除后仍有残留必须抛错（remove 未生效不得放行）', async () => {
+    const runner = overlayRunner({ evaluate: vi.fn().mockResolvedValue({ removed: 1, left: 1 }) })
+    await expect(runner._dismissInheritedOverlays()).rejects.toThrow(/仍有 1 个/)
+  })
+
+  it('runner：取不到计数时 fail closed，不得当成没有浮层', async () => {
+    for (const bad of [undefined, null, {}, { removed: 1 }, { removed: NaN, left: 0 }]) {
+      const runner = overlayRunner({ evaluate: vi.fn().mockResolvedValue(bad) })
+      await expect(runner._dismissInheritedOverlays()).rejects.toThrow(/未取得计数/)
+    }
+  })
+
+  it('接线锁：必须在 goto 与可选 reload 之后、应用就绪等待之前清除', () => {
+    const source = fs.readFileSync(path.join(__dirname, 'test-runner.js'), 'utf8')
+    const iGoto = source.indexOf('await this.page.goto(targetUrl')
+    const iReload = source.indexOf('await this.page.reload({ waitUntil')
+    const iDismiss = source.indexOf('await this._dismissInheritedOverlays()')
+    const iReady = source.indexOf('await this._waitForApplicationReady(expectedHash')
+    // 先证坐标存在：indexOf 返回 -1 会让顺序断言退化成永真
+    expect(iGoto).toBeGreaterThan(-1)
+    expect(iReload).toBeGreaterThan(-1)
+    expect(iDismiss).toBeGreaterThan(-1)
+    expect(iReady).toBeGreaterThan(-1)
+    expect(iGoto).toBeLessThan(iDismiss)
+    expect(iReload).toBeLessThan(iDismiss)
+    expect(iDismiss).toBeLessThan(iReady)
+  })
+
+  it('范围锁：调用点恰好一处（搬进 settleForCapture 或给工作流步截图加清除都会变二）', () => {
+    const source = fs.readFileSync(path.join(__dirname, 'test-runner.js'), 'utf8')
+    const calls = source.split('await this._dismissInheritedOverlays()').length - 1
+    expect(calls).toBe(1)
+    const iSettle = source.indexOf('async settleForCapture() {')
+    expect(iSettle).toBeGreaterThan(-1)
+    expect(source.indexOf('await this._dismissInheritedOverlays()')).toBeLessThan(iSettle)
+  })
+})

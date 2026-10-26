@@ -1,0 +1,28 @@
+[Unit]
+Description=OpsCenter - 运营配置中心
+After=network.target
+
+[Service]
+Type=simple
+User=ops-center
+Group=ops-center
+WorkingDirectory=/opt/ops-center/backend
+EnvironmentFile=/etc/ops-center/env
+Environment=OPS_DB_PATH=/data/ops-center/config.db
+Environment=OPS_CONFIG_OUTPUT_DIR=/data/configs
+# feedback_media_dir 默认 "data/feedback-media" 是相对 WorkingDirectory 解析的；
+# 本 unit 开了 ProtectSystem=strict，该路径不可写 → 反馈图片上传会静默失败。
+# 显式指到 /data/ops-center 下（该目录已在 ReadWritePaths 内）。
+Environment=OPS_FEEDBACK_MEDIA_DIR=/data/ops-center/feedback-media
+Environment=ENVIRONMENT=production
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/data/ops-center /data/configs
+
+[Install]
+WantedBy=multi-user.target

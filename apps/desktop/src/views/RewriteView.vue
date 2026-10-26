@@ -1,0 +1,1125 @@
+<template>
+  <div class="rewrite-page">
+    <div class="cohere-page-header">
+      <div>
+        <div class="page-title">{{ t('rewritePage.title') }}</div>
+        <div class="page-subtitle">{{ t('rewritePage.subtitle') }}</div>
+      </div>
+    </div>
+
+    <div class="cohere-content">
+      <!-- 文本输入区 -->
+      <div class="cohere-card rewrite-input-card">
+        <div class="cohere-section-title">{{ t('rewritePage.inputSection') }}</div>
+        <!-- 标题参考 chip（viral-rewrite-integration：爆款分析页生成标题带入） -->
+        <div v-if="titleHint" class="rewrite-title-hint" data-testid="rewrite-title-hint">
+          <span class="title-hint-text">{{ t('rewritePage.titleHintLabel') }}：{{ titleHint }}</span>
+          <!-- P1-E 评审 W-2：信号注入用户可感知（计数标识）；W-1：移除 chip 同时清信号（语义一致） -->
+          <span v-if="viralAngles.length || viralKeywords.length" data-testid="rewrite-signal-badge" style="font-size: var(--font-size-xs);color:var(--muted)">
+            {{ t('rewritePage.signalBadge') }}（{{ viralAngles.length + viralKeywords.length }}）
+          </span>
+          <span v-if="viralEngagement" data-testid="rewrite-strength-badge" style="font-size: var(--font-size-xs);color:var(--muted)">{{ t('rewritePage.strengthRefLabel') }}</span>
+          <button
+            class="cohere-btn-secondary title-hint-remove"
+            data-testid="rewrite-title-hint-remove"
+            :disabled="rewriting"
+            @click="clearTitleHint"
+          >{{ t('rewritePage.titleHintRemove') }}</button>
+        </div>
+        <textarea
+          v-model="content"
+          class="rewrite-textarea"
+          rows="8"
+          :placeholder="t('rewritePage.inputPlaceholder')"
+          :disabled="rewriting"
+        ></textarea>
+        <div class="rewrite-input-meta">
+          <span class="char-count">{{ [...content].length }} {{ t('rewritePage.charCount') }}</span>
+          <span v-if="contentError" class="content-error">{{ contentError }}</span>
+        </div>
+      </div>
+
+      <!-- 配置选项 -->
+      <div class="cohere-card rewrite-config-card">
+        <div class="cohere-section-title">{{ t('rewritePage.configSection') }}</div>
+
+        <!-- 内容依据：两个来源开关并排（勾选框左置 + 固定尺寸；标题与说明纵向排列）
+             勾选框必须显式固定尺寸：父级是 flex 容器，checkbox 作为 flex item
+             会被 align-self:stretch 拉伸到整行宽，原生勾选框因而被绘制到行的中央、
+             脱离文字——这是改写设置区最主要的「错位 / 混乱」观感来源。 -->
+        <div class="config-switches">
+          <label class="config-switch" :class="{ disabled: rewriting, 'is-on': useViralLibrary }">
+            <input
+              type="checkbox"
+              v-model="useViralLibrary"
+              :disabled="rewriting"
+              class="coral-check"
+            />
+            <span class="switch-body">
+              <span class="checkbox-label switch-title">
+                <span class="checkbox-icon switch-icon" aria-hidden="true"><el-icon><TrendCharts /></el-icon></span>
+                <span>{{ t('rewritePage.useViralLibrary') }}</span>
+              </span>
+              <span class="checkbox-hint switch-hint">{{ t('rewritePage.useViralLibraryHint') }}</span>
+            </span>
+          </label>
+          <label class="config-switch" :class="{ disabled: rewriting, 'is-on': usePersonalExperience }">
+            <input
+              type="checkbox"
+              v-model="usePersonalExperience"
+              :disabled="rewriting"
+              class="coral-check"
+            />
+            <span class="switch-body">
+              <span class="checkbox-label switch-title">
+                <span class="checkbox-icon switch-icon" aria-hidden="true"><el-icon><Document /></el-icon></span>
+                <span>{{ t('rewritePage.usePersonalExperience') }}</span>
+              </span>
+              <span class="checkbox-hint switch-hint">{{ t('rewritePage.usePersonalExperienceHint') }}</span>
+            </span>
+          </label>
+        </div>
+
+        <!-- 改写模式 -->
+        <div class="config-row">
+          <label class="cohere-form-label">{{ t('rewritePage.modeLabel') }}</label>
+          <div class="mode-chips">
+            <button
+              v-for="m in rewriteModes"
+              :key="m.value"
+              :class="['mode-chip', { active: rewriteMode === m.value }]"
+              :disabled="rewriting"
+              @click="rewriteMode = m.value"
+            >{{ m.label }}</button>
+          </div>
+        </div>
+
+        <!-- 字数控制 + 目标平台：两个短字段并排，避免单列堆叠在宽卡片右侧留下大片空白 -->
+        <div class="config-grid">
+          <!-- 字数控制 -->
+          <div class="config-row">
+            <label class="cohere-form-label">{{ t('rewritePage.wordCountLabel') }}</label>
+            <WordCountRangeInput
+              v-model:min="wordCountMin"
+              v-model:max="wordCountMax"
+              :min-placeholder="t('rewritePage.wordCountMinPlaceholder')"
+              :max-placeholder="t('rewritePage.wordCountMaxPlaceholder')"
+              :unit="t('rewritePage.wordCountUnit')"
+              :error="wordCountError"
+              :disabled="rewriting"
+            />
+          </div>
+
+          <!-- 目标平台 -->
+          <div class="config-row">
+            <label class="cohere-form-label">{{ t('rewritePage.platformLabel') }}</label>
+            <select v-model="platform" class="cohere-input config-select" :disabled="rewriting">
+              <option value="">{{ t('rewriteEngine.platformGeneral') }}</option>
+              <option value="douyin">{{ t('rewriteEngine.platformDouyin') }}</option>
+              <option value="xiaohongshu">{{ t('rewriteEngine.platformXiaohongshu') }}</option>
+              <option value="wechat_mp">{{ t('rewriteEngine.platformWechatMp') }}</option>
+              <option value="bilibili">{{ t('rewriteEngine.platformBilibili') }}</option>
+              <option value="zhihu">{{ t('rewriteEngine.platformZhihu') }}</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- 策略选择（自动匹配默认 + 手动下拉，与 AiWriterPanel 行为一致） -->
+        <RewriteStrategyPicker
+          v-model:strategy-mode="strategyMode"
+          v-model:strategy-id="rewriteStrategyId"
+          :strategies="rewriteStrategies"
+          :preview-name="previewStrategyName"
+          :disabled="rewriting"
+          :labels="{
+            label: t('rewritePage.strategyLabel'),
+            auto: t('rewritePage.strategyAuto'),
+            manual: t('rewritePage.strategyManual'),
+            preview: t('rewritePage.strategyPreview'),
+            previewColon: t('rewritePage.strategyPreviewColon'),
+            placeholder: t('rewritePage.strategySelectPlaceholder'),
+          }"
+        />
+
+        <!-- 改写按钮：与上方配置字段用分隔线隔开，明确「先配置 → 后执行」的分段 -->
+        <div class="rewrite-submit">
+          <button
+            class="cohere-btn-primary rewrite-start-btn"
+            :disabled="rewriting || !canStartRewrite"
+            @click="startRewrite"
+          >
+            {{ rewriting ? t('rewritePage.rewritingBtn') : t('rewritePage.rewriteBtn') }}
+          </button>
+        </div>
+        <div v-if="rewriteError" class="rewrite-error" role="alert">{{ rewriteError }}</div>
+      </div>
+
+      <!-- 改写结果区 -->
+      <div v-if="rewriteResult" ref="rewriteResultCardEl" class="cohere-card rewrite-result-card">
+        <div class="cohere-section-title">{{ t('rewritePage.resultSection') }}</div>
+        <div class="rewrite-result-meta" v-if="rewriteMeta">
+          <span>{{ t('rewritePage.metaStrategy') }}：{{ rewriteMeta.strategyName }}</span>
+          <span>{{ t('rewritePage.metaAiTaste') }}：{{ rewriteMeta.aiTastePct }}</span>
+          <!-- 字数概览按模式分派用词：选题创作的输入是「主题种子」而非待改写正文，
+               标成「原文」会把种子误读为需保留语义的原文（设计评审 Q5，与评分口径同一概念陷阱） -->
+          <span>{{ t(rewriteMeta.mode === 'create' ? 'rewritePage.metaLengthFromTopic' : 'rewritePage.metaLength', { original: rewriteMeta.originalLength, result: rewriteMeta.resultLength }) }}</span>
+        </div>
+        <!-- 改写质量评估报告（content-quality-eval 桌面端闭环）
+             视觉：用左侧强调条表达结论等级，替代原先「卡片内再套一个带边框的卡片」 -->
+        <div
+          v-if="rewriteQuality"
+          class="rewrite-quality-report"
+          :class="'quality-accent-' + rewriteQuality.verdict"
+          data-testid="rewrite-quality-report"
+        >
+          <div class="quality-head">{{ t('rewritePage.qualitySection') }}</div>
+          <div class="rewrite-quality-metrics">
+            <span class="quality-metric">
+              {{ t('rewritePage.qualitySufficiency') }}：
+              <strong>{{ rewriteQuality.sufficiency }}</strong>
+            </span>
+            <span class="quality-metric">
+              {{ t('rewritePage.qualitySemantic') }}：
+              <strong>{{ rewriteQuality.semanticPreservation }}</strong>
+            </span>
+            <span class="quality-metric">
+              {{ t('rewritePage.qualityOriginality') }}：
+              <strong>{{ rewriteQuality.originality }}</strong>
+            </span>
+            <span class="quality-metric">
+              {{ t('rewritePage.qualityVerdict') }}：
+              <strong :class="'quality-verdict-' + rewriteQuality.verdict">
+                {{ t('rewritePage.qualityVerdict' + (rewriteQuality.verdict === 'pass' ? 'Pass' : rewriteQuality.verdict === 'warn' ? 'Warn' : 'Fail')) }}
+              </strong>
+            </span>
+            <span class="quality-metric" v-if="rewriteQuality.method">
+              {{ t('rewritePage.qualityMethod') }}：
+              {{ t(rewriteQuality.method === 'embedding' ? 'rewritePage.qualityMethodEmbedding' : 'rewritePage.qualityMethodSimhash') }}
+            </span>
+            <!-- 爆款潜力第 4 维（viral-rewrite-integration）：改写前后对比；delta 缺失显示占位符 -->
+            <span class="quality-metric" v-if="viralInfo" data-testid="rewrite-viral-info">
+              {{ t('rewritePage.qualityViralLabel') }}：{{ t('rewritePage.qualityViralBefore') }} {{ viralInfo.original }} → {{ t('rewritePage.qualityViralAfter') }} {{ viralInfo.rewritten }}（{{ t('rewritePage.qualityViralDelta') }} {{ viralInfo.delta === null ? '-' : viralInfo.delta }}）
+            </span>
+          </div>
+          <div v-if="Array.isArray(rewriteQuality.suggestions) && rewriteQuality.suggestions.length" class="rewrite-quality-suggestions">
+            <div class="quality-suggestions-title">{{ t('rewritePage.qualitySuggestions') }}</div>
+            <ul>
+              <li v-for="(s, i) in rewriteQuality.suggestions" :key="i">{{ s }}</li>
+            </ul>
+          </div>
+        </div>
+        <div v-else-if="rewriteResult" class="rewrite-quality-none" data-testid="rewrite-quality-none">
+          {{ t('rewritePage.qualityNone') }}
+        </div>
+        <!-- 改写结果标题（2026-09-18）：引擎从改写结果提炼 ≤20 字标题，纯文字展示（非输入框） -->
+        <div v-if="rewriteTitle" class="rewrite-result-title" data-testid="rewrite-result-title">
+          <span class="rewrite-result-title-label">{{ t('rewritePage.resultTitleLabel') }}</span>
+          <span class="rewrite-result-title-text">{{ rewriteTitle }}</span>
+        </div>
+        <textarea
+          v-model="rewriteResult"
+          class="rewrite-textarea result-textarea"
+          rows="8"
+        ></textarea>
+        <div class="rewrite-result-actions">
+          <!-- 复制按钮移到动作行最左侧（2026-09-18 用户要求） -->
+          <button
+            class="cohere-btn-secondary rewrite-copy-btn"
+            data-testid="btn-copy-result"
+            :disabled="!rewriteResult.trim()"
+            @click="copyResult"
+          >
+            {{ copied ? t('rewritePage.copyResultDone') : t('rewritePage.copyResult') }}
+          </button>
+          <button class="cohere-btn-secondary" @click="saveToDraft">
+            {{ t('rewritePage.saveDraft') }}
+          </button>
+          <button class="cohere-btn-secondary" data-testid="btn-video-create" @click="goToVideoCreate">
+            {{ t('rewritePage.goVideo') }}
+          </button>
+          <button class="cohere-btn-primary" @click="goToPublish">
+            {{ t('rewritePage.goPublish') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 去发布弹窗 -->
+    <PublishDestinationModal
+      v-if="showPublishModal"
+      :visible="showPublishModal"
+      @close="showPublishModal = false"
+      @publish-article="onPublishArticle"
+      @publish-video="onPublishVideo"
+    />
+  </div>
+</template>
+
+<script setup>
+import { Document, TrendCharts } from '@element-plus/icons-vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { aiRewrite, aiListRewriteStrategies, aiGetRecommendedStrategies, draftSave, applyKnowledgeFeedback } from '@/api/publisher'
+import { useNotify } from '@/composables/useNotify'
+import { formatUserError } from '@/utils/user-facing-error'
+import { useLoginGate } from '@/composables/useLoginGate'
+import { useWordCountValidation } from '@/composables/useWordCountValidation'
+import { useCopyLibrary } from '@/composables/useCopyLibrary'
+import { takeRewriteHandoff } from '@/utils/rewrite-handoff'
+import { useViralSignalStore } from '@/stores/viral-signal'
+import { takeViralSignalHandoff, hasActionableEngagement } from '@/utils/viral-signal-bridge'
+import { writeClipboard } from '@/utils/clipboard'
+import { extractRewriteHistoryId, attachRewriteLineage } from '@/utils/rewrite-lineage'
+import PublishDestinationModal from '@/components/PublishDestinationModal.vue'
+import RewriteStrategyPicker from '@/components/RewriteStrategyPicker.vue'
+import WordCountRangeInput from '@/components/WordCountRangeInput.vue'
+
+const router = useRouter()
+const route = useRoute()
+const { t } = useI18n()
+const { notifySuccess, notifyError, notifyWarning } = useNotify()
+const { ensureLogin } = useLoginGate()
+
+// ── 状态 ──
+const content = ref('')
+const rewriting = ref(false)
+const rewriteError = ref('')
+const rewriteResult = ref('')
+// 改写结果卡片模板引用：自动改写入口完成后 scrollIntoView 定位用（见 focusRewriteResult）
+const rewriteResultCardEl = ref(null)
+// 改写结果标题（2026-09-18）：引擎从改写结果提炼 ≤20 字标题，纯文字展示
+const rewriteTitle = ref('')
+const rewriteMeta = ref(null)
+// content-quality-eval 桌面端闭环：改写质量评估报告（RewriteQualityEvaluator 结果）
+const rewriteQuality = ref(null)
+// P2 隐式反馈：本次改写引用的知识条目（保存/发布=采纳 / 再次改写=弃用）
+const rewriteKnowledgeRefs = ref([])
+const contentError = ref('')
+// 复制按钮瞬时反馈态：复制成功后按钮文案切换为「已复制」，1.5s 后复位（BUGFIX-REWRITE-QUALITY-UX）
+const copied = ref(false)
+let copiedTimer = null
+
+// viral-rewrite-integration：标题参考（爆款分析页生成标题经路由 query 带入）+ 爆款潜力对比
+const titleHint = ref('')
+const viralInfo = ref(null)
+// P1-E：爆款分析信号（推荐角度 + 上升关键词）——titleHint 带入时从 Pinia store 快照
+const viralAngles = ref([])
+const viralKeywords = ref([])
+// P2-a：爆款强度定量信号（样本数 + 互动均值），随快照带入，作为软约束注入引擎
+const viralEngagement = ref(null)
+
+// 配置
+const useViralLibrary = ref(true)
+const usePersonalExperience = ref(false)
+const rewriteMode = ref('create')
+const platform = ref('')
+// 字数区间控制（默认 800-2000）
+const wordCountMin = ref(800)
+const wordCountMax = ref(2000)
+
+// 策略选择（2026-09-15 改为默认「手动选择」展开下拉，降低发现成本；未选时仍传 null 走引擎自动匹配）
+// 注：AiWriterPanel / Collection 采集页保持默认 auto，不受影响
+const strategyMode = ref('manual')
+const rewriteStrategyId = ref('')
+const rewriteStrategies = ref([])
+const previewStrategyName = ref('--')
+
+// 弹窗
+const showPublishModal = ref(false)
+let savedDraftId = null
+// 本次改写结果对应的 rewrite_history 行 id（归因链第一环，见 utils/rewrite-lineage）。
+// 每次开始新改写先置 null、成功后再赋值，所以"上一次改写结果的 id"不可能残留到下一次发布。
+let rewriteLineageId = null
+
+// ── 文案库交接（合并版「文案库」的【改写】按钮 → 本页）──
+// 载荷含 fromKey：改写成功后把结果回写文案库（同一来源只保留最新一次改写结果）。
+const libraryHandoff = ref(null)
+// 自动改写入口标志（2026-10-09 PRD-REWRITE-AUTO-JUMP-RESULT）：topic 带入 / from=collection 交接
+// 属「跳转即自动改写」入口 → 改写成功后视口直接定位到改写结果区；手动开始 / titleHint 预填不滚动。
+// 挂载期置位一次；非响应式（不参与渲染，仅控制成功分支的一次滚动行为）。
+let autoFocusResult = false
+const { upsertRewrite: upsertCopyRewrite } = useCopyLibrary()
+// 本页平台下拉白名单：交接平台不在白名单时不带入（保持「通用」）
+const REWRITE_PAGE_PLATFORMS = ['douyin', 'xiaohongshu', 'wechat_mp', 'bilibili', 'zhihu']
+
+/** 消费文案库交接载荷：填入正文 → 仿写模式 → 平台带入（白名单内）→ 自动开始改写 */
+function consumeLibraryHandoff () {
+  const handoff = takeRewriteHandoff()
+  if (!handoff || typeof handoff.content !== 'string' || !handoff.content.trim()) return
+  rewriteMode.value = 'imitate'
+  content.value = handoff.content
+  if (REWRITE_PAGE_PLATFORMS.includes(handoff.platform)) platform.value = handoff.platform
+  libraryHandoff.value = handoff
+  // 自动改写入口（2026-10-09）：与 topic 带入同待遇，完成后定位结果区
+  autoFocusResult = true
+  // 等登录门禁与 DOM 就绪后自动触发（与 topic 带入同模式）
+  Promise.resolve().then(() => startRewrite())
+}
+
+/**
+ * 自动改写入口完成后定位改写结果区（2026-10-09 PRD-REWRITE-AUTO-JUMP-RESULT）。
+ *
+ * 为什么需要：热门选题 / 文案库交接等入口跳转后自动开始改写，页面停在首屏；
+ * 改写完成时结果卡片在下方，用户不知道「已经改完了」，误以为只是带入了输入内容。
+ *
+ * 约束：
+ * - 仅 autoFocusResult（自动改写入口）为 true 时滚动，手动改写不滚（用户本就在看着页面）。
+ * - 失败不滚动：错误横幅 .rewrite-error 显示在结果卡片上方的配置卡内（首屏可见），
+ *   且失败时结果卡片 v-if="rewriteResult" 不渲染、目标不存在。
+ * - nextTick 守卫保证 v-if 新挂载的卡片已进 DOM；取不到元素或环境无 scrollIntoView
+ *   （jsdom/降级）时静默跳过，不影响改写成功主流程（与 ResultView.vue 同模式）。
+ */
+async function focusRewriteResult () {
+  if (!autoFocusResult) return
+  await nextTick()
+  // 用模板 ref 而非 document.querySelector：@vue/test-utils 默认挂载到游离 DOM，
+  // 全局查询拿不到；ref 引用对两种环境都成立（与 ResultView.vue 的 ref 滚动同模式）
+  const el = rewriteResultCardEl.value
+  if (el && typeof el.scrollIntoView === 'function') {
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+}
+
+/**
+ * 改写成功后回写文案库（同一 fromKey 覆盖为最新结果；失败静默，不影响改写主流程）。
+ * @param {object|null} handoff - 本次改写对应的交接载荷（一次性，由 startRewrite 捕获后传入）
+ */
+async function syncHandoffToLibrary (handoff) {
+  if (!handoff || !handoff.fromKey || !rewriteResult.value.trim()) return
+  try {
+    await upsertCopyRewrite({
+      fromKey: handoff.fromKey,
+      fromTitle: handoff.fromTitle || '',
+      title: rewriteTitle.value || handoff.title || '',
+      content: rewriteResult.value,
+      platform: handoff.platform || '',
+      sourceUrl: handoff.sourceUrl || '',
+    })
+  } catch {
+    // 文案库回写失败不阻塞改写主流程
+  }
+}
+
+/**
+ * 改写成功后写入文案库（2026-09-18 用户要求：改写完成后的文案应进入文案库）。
+ *
+ * 与 syncHandoffToLibrary 的区别：
+ * - syncHandoffToLibrary 仅处理「从文案库进入改写」的交接场景（按 fromKey 覆盖原记录）；
+ * - syncResultToLibrary 覆盖所有改写成功场景，按「正文哈希」稳定 key 写入：
+ *   同一正文连续改写视为更新（覆盖），不同正文追加新记录，避免文案库被重复改写刷屏。
+ * 交接场景（libraryHandoff 存在）由 syncHandoffToLibrary 按 fromKey 更新原记录，
+ * 此处跳过，避免同一条改写产生双份记录（双模型评审 MAJOR-2/3）。
+ * 失败静默，不影响改写主流程。
+ */
+async function syncResultToLibrary () {
+  if (!rewriteResult.value.trim()) return
+  try {
+    // 稳定 key：基于改写结果正文的简单哈希（同一正文连续改写 → 覆盖更新）
+    const contentKey = hashString(rewriteResult.value)
+    await upsertCopyRewrite({
+      fromKey: 'rewrite:' + contentKey,
+      fromTitle: '',
+      title: rewriteTitle.value || '',
+      content: rewriteResult.value,
+      platform: platform.value || '',
+      sourceUrl: '',
+    })
+  } catch {
+    // 文案库回写失败不阻塞改写主流程
+  }
+}
+
+/** 简单字符串哈希（djb2）：用于文案库稳定 key，避免同一正文重复改写刷屏 */
+function hashString (str) {
+  let h = 5381
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h + str.charCodeAt(i)) >>> 0
+  }
+  return h.toString(36)
+}
+// 跳转防重入（单一互斥锁）：连点/跨按钮并发点击不会重复存草稿、不会产生双草稿
+let navigatingToDestination = false
+
+// ── 选项 ──
+const rewriteModes = [
+  { value: 'imitate', label: t('rewritePage.modeImitate') },
+  { value: 'expand', label: t('rewritePage.modeExpand') },
+  { value: 'create', label: t('rewritePage.modeCreate') },
+]
+
+// ── 策略列表与匹配预览 ──
+/** 加载启用策略（内置 + 远程下发）；失败静默降级为空列表，改写仍可用自动匹配 */
+async function loadRewriteStrategies() {
+  try {
+    const res = await aiListRewriteStrategies()
+    if (res && res.code === 0) rewriteStrategies.value = res.data || []
+  } catch (_e) {
+    // 策略列表为空时改写仍可用（走自动匹配）
+  }
+}
+
+/** 预览请求序列号：快速切换平台时只保留最后一次请求的结果（竞态防护） */
+let previewSeq = 0
+
+/** 刷新自动匹配预览：取推荐列表第一名；失败降级为 --，不阻塞改写 */
+async function refreshStrategyPreview() {
+  if (rewriting.value) return
+  const seq = ++previewSeq
+  try {
+    const res = await aiGetRecommendedStrategies({ platform: platform.value || undefined })
+    if (seq !== previewSeq) return // 已有更新的请求，丢弃本次过期结果
+    if (res && res.code === 0 && Array.isArray(res.data) && res.data.length > 0) {
+      previewStrategyName.value = res.data[0].name || '--'
+    } else {
+      previewStrategyName.value = '--'
+    }
+  } catch (_e) {
+    if (seq === previewSeq) previewStrategyName.value = '--'
+  }
+}
+
+// 目标平台变化 → 预览随新 userSettings 刷新（refreshStrategyPreview 内含竞态守卫）
+watch(platform, refreshStrategyPreview)
+
+// 改写结果被用户编辑（textarea v-model）→ 已存草稿内容过期：置空 id，下次操作按当前内容重存
+// （saveToDraft 成功后 savedDraftId 更新，此处仅在内容再次变化时失效，不构成循环）
+// 双模型评审 MINOR-7：手动编辑结果后标题与正文可能不一致 → 同步清空标题（存草稿时回退原文前 64 字）。
+// 程序赋值（startRewrite 成功分支）通过 suppressTitleClear 标志跳过，避免刚生成的标题被误清。
+let suppressTitleClear = false
+watch(rewriteResult, (next, prev) => {
+  if (next !== prev) {
+    if (savedDraftId) invalidateSavedDraft()
+    if (suppressTitleClear) {
+      suppressTitleClear = false
+    } else if (rewriteTitle.value) {
+      rewriteTitle.value = ''
+    }
+  }
+})
+
+// ── 热门选题带入：/rewrite?topic=xxx → 填入输入框 + 选题创作模式 + 自动开始 ──
+// ── 标题参考带入：/rewrite?titleHint=xxx → 显示可移除 chip，改写时作为软约束注入引擎 ──
+// ── 文案库交接带入：/rewrite?from=collection → 取 sessionStorage 交接载荷，仿写模式 + 自动开始 ──
+// 交接载荷由 Collection.vue 合并版「文案库」的【改写】按钮写入（正文可能上万字，避免 URL 超长）。
+onMounted(() => {
+  void loadRewriteStrategies()
+  void refreshStrategyPreview()
+  const hint = typeof route.query.titleHint === 'string' ? route.query.titleHint.trim().slice(0, 200) : ''
+  if (hint) {
+    titleHint.value = hint
+    // P1-E：标题来自爆款分析页 → 快照该次分析的爆款信号（角度 + 关键词），改写时注入软约束
+    try {
+      // P2-a：优先读一次性 sessionStorage 中转快照（读后即焚），无则回落同窗口 Pinia store
+      const signal = takeViralSignalHandoff() || useViralSignalStore().signal
+      if (signal && Array.isArray(signal.angles)) {
+        viralAngles.value = signal.angles
+        viralKeywords.value = Array.isArray(signal.keywords) ? signal.keywords : []
+        viralEngagement.value = hasActionableEngagement(signal.engagement) ? signal.engagement : null
+      }
+    } catch { /* 信号快照失败不影响改写主流程 */ }
+  }
+  const topic = typeof route.query.topic === 'string' ? route.query.topic.trim() : ''
+  if (topic) {
+    rewriteMode.value = 'create'
+    // 选题带入：不再有 ≥20 字符限制（2026-09-12 移除最少字数）
+    content.value = topic
+    // 自动改写入口（2026-10-09）：改写完成后直接定位到改写结果区，
+    // 让用户一眼看到「已经改好了」，而不是停在首屏误以为只是带入了输入内容
+    autoFocusResult = true
+    // 等登录门禁与 DOM 就绪后自动触发（nextTick 保证 textarea 绑定完成）
+    Promise.resolve().then(() => startRewrite())
+    return
+  }
+  // 选题带入与文案库交接互斥：topic 优先（老入口），否则尝试文案库交接
+  if (route.query.from === 'collection') consumeLibraryHandoff()
+})
+
+// 组件卸载时清掉复制反馈定时器，避免卸载后 setState（BUGFIX-REWRITE-QUALITY-UX）
+onUnmounted(() => {
+  if (copiedTimer) {
+    clearTimeout(copiedTimer)
+    copiedTimer = null
+  }
+})
+
+// ── 计算 ──
+const canStartRewrite = computed(() => {
+  return content.value.trim().length > 0 && !wordCountError.value
+})
+
+// ── 字数区间校验（共享 composable，与 Collection 页一致）──
+const { error: wordCountError } = useWordCountValidation(wordCountMin, wordCountMax, (key) => t('rewritePage.' + key))
+
+// ── 方法 ──
+
+/** P1-E 评审 W-1：移除标题参考 chip 时同步清空爆款信号（信号与标题同源，语义一致） */
+function clearTitleHint() {
+  titleHint.value = ''
+  viralAngles.value = []
+  viralKeywords.value = []
+  viralEngagement.value = null
+}
+
+/** 开始改写 */
+async function startRewrite() {
+  const trimmed = content.value.trim()
+  if (!trimmed) {
+    contentError.value = t('rewritePage.contentEmpty')
+    return
+  }
+  if (wordCountError.value) return
+  contentError.value = ''
+  if (!(await ensureLogin({ message: t('rewritePage.needLogin') }))) return
+
+  rewriting.value = true
+  rewriteError.value = ''
+  // 交接一次性语义（审查 W-1）：无论本次改写成败都消费掉交接载荷，
+  // 防止失败后残留的 fromKey 被后续无关改写静默覆盖文案库记录
+  const handoffForRun = libraryHandoff.value
+  libraryHandoff.value = null
+  // P2 隐式反馈：上次改写结果未被保存/发布就再次改写 → 弃用上次引用的知识条目
+  if (rewriteResult.value && rewriteKnowledgeRefs.value.length > 0) {
+    sendKnowledgeFeedback('rejected', rewriteKnowledgeRefs.value)
+  }
+  rewriteResult.value = ''
+  rewriteTitle.value = ''
+  rewriteMeta.value = null
+  rewriteKnowledgeRefs.value = []
+  // CCG 评审修复：新改写开始前重置质量报告，避免上一次改写（无 quality）的旧报告残留
+  rewriteQuality.value = null
+  viralInfo.value = null
+  // 归因链：上一次改写的 id 不得跟着这一次的发布走（置空后由成功分支重新赋值；
+  // 本次改写若没落库成功就是 null，宁缺毋滥）
+  rewriteLineageId = null
+
+  try {
+    const params = {
+      mode: rewriteMode.value,
+      content: trimmed,
+      userSettings: {
+        platform: platform.value || undefined,
+        wordCountRange: {
+          min: Number(wordCountMin.value),
+          max: Number(wordCountMax.value),
+        },
+        knowledgeOptions: {
+          useViralLibrary: useViralLibrary.value,
+          usePersonalKnowledge: usePersonalExperience.value,
+        },
+      },
+      // 策略传参契约（与 AiWriterPanel 一致）：手动=所选 id（未选 null），自动=null 走引擎匹配
+      strategyId: strategyMode.value === 'manual' ? (rewriteStrategyId.value || null) : null,
+      // viral-rewrite-integration：标题参考软约束（引擎侧清洗：空白折叠 + 200 字截断）
+      titleHint: titleHint.value || undefined,
+      // P1-E：爆款信号软约束（推荐角度 + 上升关键词；引擎侧清洗，空数组不注入）
+      viralAngles: viralAngles.value.length ? viralAngles.value : undefined,
+      viralKeywords: viralKeywords.value.length ? viralKeywords.value : undefined,
+      // P2-a：定量强度信号（引擎侧 _sanitizeEngagement 二次把关：<3 或非有限数不注入）
+      engagement: viralEngagement.value || undefined,
+    }
+
+    const res = await aiRewrite(params)
+    if (res && res.code === 0 && res.data && res.data.success) {
+      const data = res.data
+      // 程序赋值结果：跳过 watch 的标题清空（用户编辑才清空标题）
+      suppressTitleClear = true
+      rewriteResult.value = data.result || ''
+      // 改写结果标题（2026-09-18）：引擎返回 ≤20 字标题；缺失/非法回退空串
+      rewriteTitle.value = (typeof data.title === 'string' && data.title.trim()) ? [...data.title.trim()].slice(0, 20).join('') : ''
+      // 新改写结果产生：旧草稿（如有）内容已过期，置空 id 让发布/视频创作按当前文案重存
+      invalidateSavedDraft()
+      // P2 隐式反馈：记录本次改写引用的知识条目
+      rewriteKnowledgeRefs.value = data.knowledgeRefs || []
+      // 归因链第一环：主进程已把本次改写落进 rewrite_history，这里只把它给的 id 接住。
+      // 判据唯一实现在 utils/rewrite-lineage（未落库/信封异常 ⇒ null，不挂键）。
+      rewriteLineageId = extractRewriteHistoryId(res)
+      // content-quality-eval：读取改写质量评估报告（RewriteQualityEvaluator 结果）
+      // CCG 评审修复：quality 必须为纯对象（非数组）；verdict/method 非法值归一化；suggestions 必须为数组
+      const q = data.quality && typeof data.quality === 'object' && !Array.isArray(data.quality) ? data.quality : null
+      rewriteQuality.value = q ? {
+        ...q,
+        verdict: ['pass', 'warn', 'fail'].includes(q.verdict) ? q.verdict : 'fail',
+        method: q.method === 'embedding' ? 'embedding' : 'simhash',
+        suggestions: Array.isArray(q.suggestions) ? q.suggestions : [],
+      } : null
+      // viral-rewrite-integration：爆款潜力对比（引擎 viralScorer 注入时才有；无效值归 null）
+      const v = data.viral && typeof data.viral === 'object' && !Array.isArray(data.viral) ? data.viral : null
+      viralInfo.value = v
+        && typeof v.original === 'number' && Number.isFinite(v.original)
+        && typeof v.rewritten === 'number' && Number.isFinite(v.rewritten)
+        ? {
+            original: v.original,
+            rewritten: v.rewritten,
+            delta: typeof v.delta === 'number' && Number.isFinite(v.delta) ? v.delta : null,
+          }
+        : null
+      rewriteMeta.value = {
+        strategyName: data.strategy?.name || '',
+        aiTastePct: data.metadata?.aiTasteLevel != null ? (data.metadata.aiTasteLevel * 100).toFixed(0) + '%' : 'N/A',
+        originalLength: data.metadata?.originalLength || 0,
+        resultLength: data.metadata?.resultLength || 0,
+        // 实际生效的改写模式（用于字数概览的用词分派；缺省 imitate）
+        mode: data.metadata?.mode || 'imitate',
+      }
+      if (data.warnings && data.warnings.length > 0) {
+        rewriteError.value = data.warnings.join('；')
+      }
+      notifySuccess('collection.rewriteSuccess')
+      // 自动改写入口（2026-10-09）：改写完成 → 视口定位到改写结果区（旁路，不阻塞主流程）
+      void focusRewriteResult()
+      // 文案库回写（2026-09-18 用户要求：改写完成后的文案应进入文案库）：
+      // 交接场景按 fromKey 更新原记录；普通改写按正文哈希稳定 key 写入。
+      // 两者互斥（双模型评审 MAJOR-2：避免同一条改写产生双份记录），旁路触发不阻塞改写主流程。
+      if (handoffForRun && handoffForRun.fromKey) {
+        void syncHandoffToLibrary(handoffForRun)
+      } else {
+        void syncResultToLibrary()
+      }
+    } else if (res && res.code === 0 && res.data && res.data.error) {
+      rewriteError.value = res.data.error
+      notifyError('collection.rewriteFailed', { message: res.data.error })
+    } else {
+      rewriteError.value = (res && res.message) || t('collection.rewriteFailed')
+      notifyError('collection.rewriteFailed', { message: rewriteError.value || t('collection.rewriteFailed') })
+    }
+  } catch (e) {
+    rewriteError.value = formatUserError(e, { fallback: t('collection.rewriteFailed') }).message
+    notifyError('collection.rewriteFailed', { message: rewriteError.value || t('collection.rewriteFailed') })
+  } finally {
+    rewriting.value = false
+    // 改写结束后刷新预览：改写期间平台可能已变化（rewriting 中不刷新），且引擎
+    // 的用户历史（userHistory）在每次改写后更新，会影响下次自动匹配的推荐结果
+    refreshStrategyPreview()
+  }
+}
+
+/**
+ * 复制改写结果到系统剪贴板（BUGFIX-REWRITE-QUALITY-UX）
+ *
+ * - 结果为空时不动作，仅提示（避免把空串写进剪贴板覆盖用户已有内容）
+ * - 复制成功：toast + 按钮文案切「已复制」1.5s
+ * - 复制失败：提示用户手动选中复制，并立即复位按钮态
+ */
+async function copyResult() {
+  const text = rewriteResult.value
+  if (!text || !text.trim()) {
+    notifyWarning('rewritePage.copyEmpty')
+    return
+  }
+  const ok = await writeClipboard(text)
+  if (!ok) {
+    if (copiedTimer) {
+      clearTimeout(copiedTimer)
+      copiedTimer = null
+    }
+    copied.value = false
+    // key 已在 locales 成对登记，无需冗余 fallback（CCG 评审 I-4）
+    notifyError('rewritePage.copyFailed')
+    return
+  }
+  notifySuccess('rewritePage.copySuccess')
+  copied.value = true
+  if (copiedTimer) clearTimeout(copiedTimer)
+  copiedTimer = setTimeout(() => {
+    copied.value = false
+    copiedTimer = null
+  }, 1500)
+}
+
+/** 存入草稿 */
+async function saveToDraft() {
+  if (!rewriteResult.value.trim()) return
+  try {
+    const saved = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      // 标题优先用改写结果标题（≤20 字，2026-09-18）；缺失时回退原文前 64 字
+      title: rewriteTitle.value || content.value.trim().slice(0, 64) || t('rewritePage.title'),
+      content: rewriteResult.value,
+      source: 'rewrite',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+    // 归因链：改写关联只在这一个地方挂，且只在真有 id 时挂（键缺席 = 下游不挂载）
+    attachRewriteLineage(saved, rewriteLineageId)
+    const res = await draftSave(saved)
+    if (res && res.code === 0) {
+      savedDraftId = saved.id
+      // P2 隐式反馈：保存草稿 = 采纳被引用的知识条目
+      sendKnowledgeFeedback('adopted', rewriteKnowledgeRefs.value)
+      notifySuccess('collection.draftCreated')
+    } else {
+      notifyError('collection.rewriteFailed', { message: (res && res.message) || t('rewritePage.draftSaveFailed') })
+    }
+  } catch (e) {
+    notifyError('collection.rewriteFailed', { message: formatUserError(e, { fallback: t('rewritePage.draftSaveFailed') }).message })
+  }
+}
+
+/** P2 隐式反馈：把用户对改写结果的自然操作转换为知识反馈（静默失败不影响主流程） */
+function sendKnowledgeFeedback(action, refs) {
+  if (!refs || refs.length === 0) return
+  try {
+    applyKnowledgeFeedback(action, refs)
+  } catch (_e) {
+    // 知识反馈失败不影响改写主流程
+  }
+}
+
+/** 去发布 — 先存草稿再弹窗 */
+async function goToPublish() {
+  if (!rewriteResult.value.trim()) return
+  if (navigatingToDestination) return
+  navigatingToDestination = true
+  try {
+    if (!savedDraftId) {
+      await saveToDraft()
+    }
+    if (savedDraftId) {
+      showPublishModal.value = true
+    }
+  } finally {
+    navigatingToDestination = false
+  }
+}
+
+/** 改写结果变化后旧草稿失效：置空 savedDraftId，下次发布/视频创作按当前文案重存。
+ *  归因链必须一起失效（PRD §六.2 / QM-6 后端轴 W-1）：用户手改正文后，界面上那份内容
+ *  已经不是 rewrite_history 行里存的那条改写了 —— 继续带旧 id 进 payload，
+ *  归因榜就把新文案的表现归给旧的爆款引用组合，那是**假归因**，比没关联更糟。 */
+function invalidateSavedDraft() {
+  savedDraftId = null
+  rewriteLineageId = null
+}
+
+/** 视频创作 — 先存草稿，再带草稿 id 跳转视频创作页（用户在创作页选择流水线） */
+async function goToVideoCreate() {
+  if (!rewriteResult.value.trim()) return
+  if (navigatingToDestination) return
+  navigatingToDestination = true
+  try {
+    if (!savedDraftId) {
+      await saveToDraft()
+    }
+    if (!savedDraftId) return // 保存失败已由 saveToDraft 提示，不再跳转
+    router.push({ path: '/create', query: { draft: savedDraftId } })
+  } finally {
+    navigatingToDestination = false
+  }
+}
+
+/** 弹窗回调：直接发图文 */
+function onPublishArticle() {
+  showPublishModal.value = false
+  if (savedDraftId) {
+    router.push('/publish?draft=' + savedDraftId)
+  }
+}
+
+/** 弹窗回调：生成视频 */
+function onPublishVideo(pipelineId) {
+  showPublishModal.value = false
+  if (!savedDraftId) return
+  const query = { draft: savedDraftId }
+  if (pipelineId) query.pipeline = pipelineId
+  router.push({ path: '/create', query })
+}
+</script>
+
+<style scoped>
+/* ═══════════════════════════════════════════════════════════════════
+   改写页视觉重构（2026-09-16）
+   设计原则（交互设计师视角）：
+   1. 一组内容 = 一组字段：配置项按「内容依据 → 改写模式 → 输出控制」
+      三段组织；段内每个字段行布局完全统一（标签独占一行 + 控件下一行）。
+   2. 一个控件只有一个视觉焦点：卡片标题建立层级；开关在勾选态用校色边框 +
+      浅底表达「已启用」，未勾选为白底灰边。
+   3. 交互信号不得误导：表单卡片不显示手型光标、不随悬停浮起（全局
+      .cohere-card 是「卡片墙」语义，用在表单容器上会让人误以为整块可点）。
+   4. 结果区有主次：元信息（轻文本）→ 质量评估（结论强调条）→ 动作（主次分离）。
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── 卡片与标题 ──
+   特异性取到 (0,3,0) 以稳定覆盖全局 .cohere-card:hover（(0,2,0)），
+   不依赖样式表加载顺序。 */
+.rewrite-input-card,
+.rewrite-config-card,
+.rewrite-result-card {
+  margin-bottom: var(--space-lg);
+  padding: var(--space-xl);
+  cursor: default;
+}
+.rewrite-input-card.cohere-card:hover,
+.rewrite-config-card.cohere-card:hover,
+.rewrite-result-card.cohere-card:hover {
+  background: var(--canvas);
+  box-shadow: none;
+}
+
+/* 卡片标题：全局 .cohere-section-title 没有任何样式定义，此前退化为正文字号，
+   卡片内所有内容层级相同——这是「界面混乱」的根因之一。 */
+.cohere-section-title {
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.4;
+  letter-spacing: -0.1px;
+  margin-bottom: var(--space-lg);
+}
+
+/* ── 内容依据：两个来源开关并排（两列网格，窄屏回落单列）── */
+.config-switches {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-sm);
+  margin-bottom: var(--space-xl);
+}
+@media (max-width: 820px) {
+  .config-switches { grid-template-columns: minmax(0, 1fr); }
+}
+.config-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--r-sm);
+  background: var(--canvas);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.config-switch:hover { border-color: var(--coral); }
+.config-switch.is-on {
+  border-color: var(--coral);
+  background: var(--coral-soft);
+}
+.config-switch.disabled { opacity: 0.6; cursor: default; }
+.config-switch.disabled:hover { border-color: var(--border-light); }
+.config-switch.disabled.is-on { background: var(--coral-soft); }
+
+/* 关键修复：勾选框固定尺寸。
+   .config-switch 是 flex 容器，checkbox 作为 flex item 默认 align-self:stretch，
+   会被拉伸到整行宽，原生勾选框因而绘制在行的中央、与文字脱离。 */
+.config-switch input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--coral);
+}
+.switch-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.switch-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--ink);
+  line-height: 1.4;
+}
+.switch-icon { font-size: var(--font-size-base); line-height: 1; }
+.switch-hint {
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+/* ── 字段行：标签独占一行、控件在下一行。
+   原实现里「目标平台」是唯一样式不同的字段（标签与下拉同一行），
+   字段布局不统一正是「混乱」的来源；此处一次性拉齐，
+   并用 :deep() 覆盖子组件（策略选择器）内部的同名标签。 ── */
+.rewrite-config-card :deep(.cohere-form-label) {
+  display: block;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--ink);
+  line-height: 1.4;
+  margin-bottom: 6px;
+}
+
+.mode-chips {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+.mode-chip {
+  padding: 6px 14px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--r-sm);
+  background: var(--canvas);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  color: var(--ink);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.mode-chip:hover:not(:disabled) { border-color: var(--coral); }
+.mode-chip.active {
+  border-color: var(--coral);
+  background: var(--coral-soft);
+  color: var(--coral);
+  font-weight: 500;
+}
+.mode-chip:disabled { opacity: 0.5; cursor: default; }
+
+/* 字数区间：label 传空串时隐藏，避免 flex gap 留下 8px 视觉空隙 */
+.config-row :deep(.word-count-label:empty) { display: none; }
+/* 校验错误独占一行，避免把「- 2000 字」挤到下一行 */
+.config-row :deep(.word-count-error) { flex-basis: 100%; margin-top: 2px; }
+
+/* 短字段并排：字数控制 + 目标平台。只设列间距，行距交给 .config-row 的
+   margin-bottom，保证与其它字段的垂直节奏一致。 */
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: var(--space-xl);
+}
+@media (max-width: 820px) {
+  .config-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* 策略选择器内部的单选文案字号与其它字段保持一致（子组件默认 12px） */
+.rewrite-config-card :deep(.strategy-radio) { font-size: var(--font-size-sm); }
+.rewrite-config-card :deep(.strategy-mode-row) { gap: var(--space-lg); }
+
+/* 字段控件宽度对齐（下拉类统一 280px） */
+.config-select {
+  max-width: 280px;
+  width: 100%;
+}
+.rewrite-config-card :deep(.strategy-select) {
+  max-width: 280px;
+  width: 100%;
+}
+.rewrite-config-card :deep(.strategy-preview) {
+  margin-top: 6px;
+  display: inline-block;
+}
+
+/* ── 执行区：与配置字段用分隔线断开，明确「先配置 → 后执行」 ── */
+.rewrite-submit {
+  margin-top: var(--space-lg);
+  padding-top: var(--space-lg);
+  border-top: 1px solid var(--border-light);
+}
+.rewrite-submit .rewrite-start-btn { margin-top: 0; }
+
+/* ── 结果区 ── */
+.rewrite-result-card .result-textarea { margin-top: var(--space-md); }
+
+/* 改写结果标题（2026-09-18）：引擎提炼 ≤20 字标题，纯文字展示（非输入框） */
+.rewrite-result-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: var(--space-md);
+  padding: 10px 12px;
+  background: var(--coral-soft);
+  border-radius: var(--r-sm);
+}
+.rewrite-result-title-label {
+  flex: 0 0 auto;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--coral);
+}
+.rewrite-result-title-text {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+/* 质量评估：左侧结论强调条取代原先「结果卡片内再套一个带边框的卡片」，
+   结论等级用颜色直接编码（合格 / 需注意 / 建议优化）。 */
+.rewrite-quality-report {
+  margin: 0 0 var(--space-md);
+  padding: 2px 0 2px var(--space-lg);
+  background: transparent;
+  border: none;
+  border-left: 3px solid var(--border-light);
+  border-radius: 0;
+}
+.quality-accent-pass { border-left-color: #2e9e5b; }
+.quality-accent-warn { border-left-color: #d97706; }
+/* 结论=「建议优化」：去错误红，与 .quality-verdict-fail 同步降级为暖橙提示色
+   （BUGFIX-REWRITE-QUALITY-UX 与 #1892 视觉重构的整合） */
+.quality-accent-fail { border-left-color: #ea580c; }
+.quality-head {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.rewrite-quality-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+}
+.quality-metric {
+  font-size: var(--font-size-xs);
+  color: var(--muted);
+}
+.quality-metric strong { font-weight: 600; color: var(--ink); }
+/* 结论区配色（与 #1892 视觉重构整合后的最终方案）：
+   #1892 已将结论文字统一为中性 --ink，并由左侧 3px 强调条（.quality-accent-*）承载三态颜色。
+   本次沿用该设计，**不再给结论文字上色**，原因：
+   ① 三态色在 12-13px 小字号下对比度均低于 WCAG AA 4.5:1（实测 pass 3.23:1 / warn 3.02:1 /
+      fail 3.37:1），彩色文字反而降低可读性；
+   ② 三态中 warn 与 fail 色相仅差约 12°，小字号下几乎无法区分，颜色信息本就不该由文字承载；
+   ③ 颜色信号已由强调条承担（非文本图形，仅需 3:1，暖橙 #ea580c 对白底 3.37:1 达标）。
+   本次中性化的是**文案**（不合格 → 建议优化），颜色中性化体现为强调条去红（见下）。 */
+.rewrite-quality-suggestions {
+  margin: var(--space-sm) 0 0;
+  padding-left: 18px;
+  font-size: var(--font-size-xs);
+  line-height: 1.7;
+  color: var(--muted);
+}
+.rewrite-quality-suggestions li { margin-bottom: 2px; }
+.quality-suggestions-title {
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  color: var(--ink);
+  margin-bottom: 4px;
+}
+.rewrite-quality-none {
+  margin: 0 0 var(--space-md);
+  font-size: var(--font-size-xs);
+  color: var(--muted);
+}
+
+/* ── 改写结果快捷操作：复制（BUGFIX-REWRITE-QUALITY-UX）── */
+.rewrite-copy-row {
+  display: flex;
+  /* 与下方动作行的次按钮**同为左对齐**：动作行是 flex + gap、次按钮靠左，
+     仅主按钮「去发布」用 margin-left:auto 推到右侧。若复制行右对齐，会与
+     紧邻的动作行形成 Z 形错位（设计评审 Q4）。 */
+  justify-content: flex-start;
+  margin-top: var(--space-sm);
+}
+/* 固定最小宽度：按钮文案在「复制 / 已复制」间切换时不产生宽度跳动
+   （88px 可容纳较宽的「✅ 已复制」，且远小于卡片宽度，不影响 BUGFIX-REWRITE-PAGE-WIDTH 的列宽稳定） */
+.rewrite-copy-btn { min-width: 88px; }
+.rewrite-copy-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 结果区次操作按钮：全局 .cohere-btn-secondary 是零内边距的纯文本样式，
+   在动作行与复制行中补内边距与悬停底色，使其成为可识别的按钮。 */
+.rewrite-result-actions .cohere-btn-secondary,
+.rewrite-copy-row .cohere-btn-secondary {
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  transition: background 0.15s, color 0.15s;
+}
+.rewrite-result-actions .cohere-btn-secondary:hover,
+.rewrite-copy-row .cohere-btn-secondary:hover {
+  background: var(--coral-soft);
+  color: var(--coral);
+}
+</style>
+

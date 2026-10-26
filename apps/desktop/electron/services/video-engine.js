@@ -1,0 +1,175 @@
+// @ts-check
+/**
+ * VideoEngine — 视频处理工具引擎
+ * 桥接 Python 视频处理/分析/增强/字幕/素材检索工具
+ */
+
+const path = require('path');
+const fs = require('fs');
+const { findFfmpeg } = require('./media-tool-paths');
+
+const PROCESS_TYPES = ['trim'];
+
+const ANALYZE_TYPES = [
+  'scene-detect', 'transcript', 'face-track', 'audio-energy',
+];
+
+const STOCK_SOURCES = [
+  { id: 'pexels', name: 'Pexels', type: 'video+image' },
+  { id: 'pixabay', name: 'Pixabay', type: 'video+image+audio' },
+  { id: 'unsplash', name: 'Unsplash', type: 'image' },
+  { id: 'videvo', name: 'Videvo', type: 'video' },
+  { id: 'mixkit', name: 'Mixkit', type: 'video+audio' },
+  { id: 'nasa', name: 'NASA', type: 'video+image' },
+  { id: 'archive', name: 'Archive.org', type: 'video' },
+  { id: 'coverr', name: 'Coverr', type: 'video' },
+  { id: 'wikimedia', name: 'Wikimedia', type: 'image' },
+  { id: 'pond5', name: 'Pond5 PD', type: 'video' },
+];
+
+class VideoEngine {
+  constructor() {
+    this._status = null;
+  }
+
+  /** 获取支持的处理类型列表 */
+  listProcessTypes() {
+    return [...PROCESS_TYPES];
+  }
+
+  /** 获取支持的分析类型列表 */
+  listAnalyzeTypes() {
+    return [...ANALYZE_TYPES];
+  }
+
+  /** 获取素材来源列表 */
+  listStockSources() {
+    return [...STOCK_SOURCES];
+  }
+
+  /** 获取引擎状态 */
+  getStatus() {
+    return {
+      ffmpegAvailable: this._checkFfmpeg(),
+      processTypes: PROCESS_TYPES,
+      analyzeTypes: ANALYZE_TYPES,
+    };
+  }
+
+  /** 检测 FFmpeg 可用性 */
+  _checkFfmpeg() {
+    const ffmpeg = findFfmpeg();
+    if (!ffmpeg) return false;
+
+    try {
+      const { spawnSync } = require('child_process');
+      const result = spawnSync(ffmpeg, ['-version'], { timeout: 3000 });
+      return result.status === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 音频混流 */
+  async mixAudio({ narration, music, sfx }, outputPath, onProgress) {
+    // 调用 Python 后端
+    const bridge = this._getPythonBridge();
+    if (bridge && bridge.isRunning()) {
+      return bridge.requestBackend('POST', '/api/video/mix-audio', {
+        narration, music, sfx, outputPath,
+      }, 60000);
+    }
+    throw new Error('Python backend not available');
+  }
+
+  /** 视频处理 */
+  async process(type, params, onProgress) {
+    if (!PROCESS_TYPES.includes(type)) {
+      throw new Error('Unsupported process type: ' + type);
+    }
+    let normalizedParams = params
+    if (type === 'trim') normalizedParams = this._normalizeTrimParams(params)
+    const bridge = this._getPythonBridge();
+    if (bridge && bridge.isRunning()) {
+      return bridge.requestBackend('POST', '/api/video/process', {
+        type, params: normalizedParams,
+      }, 300000);
+    }
+    throw new Error('Python backend not available');
+  }
+
+  _normalizeTrimParams(params) {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw new Error('裁剪参数无效')
+    }
+    const inputPath = path.resolve(String(params.input_path || ''))
+    let inputStat
+    try {
+      inputStat = fs.lstatSync(inputPath)
+    } catch {
+      throw new Error('裁剪输入视频不存在')
+    }
+    if (!inputStat.isFile() || inputStat.isSymbolicLink() || inputStat.size <= 0) {
+      throw new Error('裁剪输入视频无效')
+    }
+    const startSeconds = Number(params.start_seconds ?? 0)
+    const endSeconds = Number(params.end_seconds)
+    if (!Number.isFinite(startSeconds) || startSeconds < 0 || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
+      throw new Error('裁剪时间范围无效')
+    }
+    const extension = path.extname(inputPath).toLowerCase() || '.mp4'
+    const outputPath = path.join(
+      path.dirname(inputPath),
+      path.basename(inputPath, extension) + '_trim_' + Date.now() + extension,
+    )
+    return {
+      input_path: fs.realpathSync.native(inputPath),
+      output_path: outputPath,
+      start_seconds: startSeconds,
+      end_seconds: endSeconds,
+      codec: 'libx264',
+    }
+  }
+
+  /** 视频/音频分析 */
+  async analyze(type, filePath) {
+    if (!ANALYZE_TYPES.includes(type)) {
+      throw new Error('Unsupported analyze type: ' + type);
+    }
+    const bridge = this._getPythonBridge();
+    if (bridge && bridge.isRunning()) {
+      return bridge.requestBackend('POST', '/api/video/analyze', {
+        type, filePath,
+      }, 120000);
+    }
+    throw new Error('Python backend not available');
+  }
+
+  /** 素材检索 */
+  async searchStock(query, source, limit) {
+    const bridge = this._getPythonBridge();
+    if (bridge && bridge.isRunning()) {
+      return bridge.requestBackend('POST', '/api/video/search-stock', {
+        query, source, limit: limit || 10,
+      }, 15000);
+    }
+    return { success: false, error: 'Python backend not available' };
+  }
+
+  /** 字幕生成 */
+  async generateSubtitle(audioPath, language) {
+    const bridge = this._getPythonBridge();
+    if (bridge && bridge.isRunning()) {
+      return bridge.requestBackend('POST', '/api/video/generate-subtitle', {
+        audioPath, language: language || 'zh',
+      }, 120000);
+    }
+    throw new Error('Python backend not available');
+  }
+
+  _getPythonBridge() {
+    try { return require('./python-bridge'); } catch { return null; }
+  }
+}
+
+module.exports = { VideoEngine };

@@ -1,0 +1,410 @@
+node_modules/
+dist/
+dist-electron/
+dist-electron-*/
+.vite/
+# DSH 插件运行时数据（上传附件等），不进入版本库，仅供会话使用
+.dsh/
+*.enc
+browser-data/
+python/__pycache__/
+*.pyc
+data/
+# API 服务运行时状态，不进入版本库
+packages/api-publish-engine/config/api-keys.json
+packages/api-publish-engine/config/publish-api.json
+packages/api-publish-engine/config/*.tmp
+.DS_Store
+*.log
+# Monorepo
+# 供应链可复现性：pnpm-lock.yaml 必须提交（2026-08-13 由 package-lock.json 迁移至 pnpm）
+# package-lock.json
+# pnpm 调试日志（如有）
+# 鍐椾綑鏂囦欢锛岄厤缃粺涓€鍦?package.json
+electron-builder.yml
+build/*.exe
+latest.yml
+*.exe
+
+# Playwright browsers (bundled in installer)
+.playwright-browsers/
+
+# 涓存椂鏂囦欢
+*.part
+# Test artifacts
+gen_frames.py
+network-learning-animation.html
+neural-network-learning.mp4
+# Reports (not tracked)
+REFACTORING-REPORT.md
+TEST-REPORT.md
+docs/test-report-*.md
+# Memory artifacts
+memory/
+.handoff/
+# Test screenshots
+apps/desktop/tests/electron-gui-test.js
+apps/desktop/tests/screenshot-home.png
+
+.codex/
+
+# 璐ㄩ噺鑺傛媿 skill 鏂囦欢锛堜笉鍙?.codex/ 蹇界暐瑙勫垯褰卞搷锛?
+!.codex/skills/璐ㄩ噺鑺傛媿/
+
+# Temp scripts & artifacts
+fix_*.js
+
+# Test artifacts
+*.sched-*.json
+test-*.js
+# Logto/Stryker 本地运行可能包含凭据或完整源码备份
+.pytest-tmp-logto*/
+apps/desktop/stryker-identity-tmp/
+apps/desktop/stryker-setup-*.js
+apps/desktop/stryker.identity.conf.json
+!packages/api-publish-engine/test/test-runner.test.js
+!packages/api-publish-engine/test/test-publish-api-server.js
+!packages/api-publish-engine/test/test-publish-api-server.test.js
+# test-setup.js 是 vitest setupFiles 引用的源文件，必须纳入版本控制
+!apps/desktop/test-setup.js
+# test-setup-locale.js 同属 vitest setupFiles（首项，语言确定性），必须纳入版本控制
+!apps/desktop/test-setup-locale.js
+!apps/desktop/tests/visual-testing/test-runner.js
+!apps/desktop/tests/visual-testing/test-runner.test.js
+!packages/visual-test-runner/src/test-runner.js
+!packages/api-publish-engine/test/test-runner.test.js
+apps/desktop/tests/screenshots/
+
+# Scratch files
+HANDOFF.md
+
+# E2E test credentials (real account data - DO NOT COMMIT)
+config/e2e-credentials.json
+apps/desktop/tests/bilibili-cookies.json
+apps/desktop/tests/*.b64
+apps/desktop/tests/e2e-cookies*.json
+apps/desktop/tests/*-cookies.json
+
+# E2E test results (screenshots, reports)
+test-results/
+
+# E2E functional test 临时调试脚本（根目录）
+apps/desktop/check-vite.mjs
+apps/desktop/debug-monitor.js
+apps/desktop/list-failures.js
+apps/desktop/run-all.js
+
+# E2E functional test 运行时产物（每次跑测试都会重新生成）
+apps/desktop/tests/e2e/reports/*.functional.json
+apps/desktop/tests/e2e/reports/integration.flow-*.json
+apps/desktop/tests/e2e/reports/b1-core-publish.json
+apps/desktop/tests/e2e/reports/routes-scan.json
+apps/desktop/tests/e2e/reports/screenshots/
+apps/desktop/tests/e2e/reports/film-engineering-real/
+
+# 涓存椂鑴氭湰鍜屾埅鍥?
+scripts/*.js
+!scripts/ci-pr-changeset.js
+!scripts/ci-pr-changeset.test.js
+# GUI 相关性判据本体：第 106 行 scripts/*.js 会把它静默忽略，而 gui-test.yml 的 changes 作业
+# 与 gui-ci-exit-contract.test.js 都按路径点名它 —— 漏这条 negation 的症状是本地全绿、CI 上
+# Cannot find module（#3011 / Gate 2c3 同族，第三次）。
+!scripts/ci-gui-relevance.js
+# pre-commit 进程创建预算锁本体：第 106 行 scripts/*.js 会把判据本体静默忽略（CI 上 Cannot find module）。
+# 测试文件不单独反选 —— 第 204 行 !scripts/*.test.js 的通用例外已兜住（同上方各条注释口径）。
+!scripts/check-precommit-spawn-budget.js
+!scripts/quality-rhythm-wrapper.js
+!scripts/ccg-gate.js
+!scripts/ccg-deep-review.js
+!scripts/ccg-review-decider.js
+!scripts/plan-review.sh
+!scripts/deep-review.sh
+!scripts/openspec-sync-check.js
+# 横幅按钮配色对比度本地校验本体（2026-10-17）。⚠ 同 #3011 同族：第 106 行
+# `scripts/*.js` 会把判据本体静默忽略（本地全绿、CI 上 Cannot find module）。
+# 它是 Gate 7c（暗色文本对比度）的本地前置判据 —— 少了它，改色只能等 4 分钟的
+# CI 才知道达标与否；该按钮配色实测改了三轮才定稿，判据必须随代码入库。
+!scripts/check-trial-banner-contrast.js
+# 像素 diff 分布分析本体（2026-10-17）。用途：视觉回归报 N% 时，用**差异铺在哪儿**
+# 替代"肉眼看截图"来判断是否可接受 —— 本项目实测过「两张 PNG 差 127 字节、
+# 像素差 9.41%」，肉眼不可靠。同 #3011 同族：第 106 行 scripts/*.js 会静默忽略它。
+!scripts/analyze-pixel-diff.js
+# Gate 9 覆盖审计的 PR 画像判据（2026-10-12，change: gate9-scope-fix）。
+# ⚠ 同 #3011 同族：`scripts/*.js` 会把门禁本体静默忽略掉 —— 实测三个 commit 反复 CI 红，
+# 根因是判据模块没入库（.test.js 后缀不同逃过忽略，被测模块没有），CI 上
+# MODULE_NOT_FOUND 而本机全绿。新增 scripts/ 下的门禁模块必须在此放行。
+!scripts/gate9-classify.js
+!scripts/gate9-prd-status.js
+# 渲染层跨包导入边界门禁（PR #3011 事故预防措施）。
+# ⚠ 本条反选是必需的：`scripts/*.js` 会把门禁本体静默忽略掉，而 `*.test.js` 有通用例外，
+# 于是「测试进了仓库、被测门禁没进」——CI 上表现为 `Cannot find module`，
+# 本地却全绿（文件在磁盘上）。2026-10-07 实测踩过一次。
+!scripts/check-renderer-cjs-boundary.js
+!scripts/check-renderer-cjs-boundary.test.js
+# CHANGELOG 重复条目门禁（2026-10-07 事故：main 上 277→1157 条目、最坏同一标题重复 16 次）。
+# 同上一条理由：`scripts/*.js` 会把门禁本体静默忽略，本地在盘上、CI 上 Cannot find module。
+!scripts/check-changelog-duplicate-entries.js
+!scripts/check-changelog-duplicate-entries.test.js
+# Gate 4 选择集自检（2026-10-11：desktop 混进 30 分钟预算那条根因的判据本体）。
+# 同上一条理由：第 106 行的 scripts/*.js 会**静默忽略门禁本体**，而 *.test.js 有通用例外，
+# 于是「锁进了仓库、锁要读的那个门禁没进」—— CI 上 `Cannot find module`，本地全绿。
+# 而且 quality-gate.yml 的 Gate 4 会在 Start-Process 之前直接 `node scripts/check-gate4-selection.js`，
+# 文件缺席会把整条 QG Unit Tests 判红，不是"少跑一个可选检查"。
+!scripts/check-gate4-selection.js
+!scripts/check-gate4-selection.test.js
+# 视觉判定域对账（2026-10-11：注册 37+19 个视图却只比对 20 个，且没有任何门禁能看见）。
+# 同上一条理由：第 106 行 scripts/*.js 会静默忽略门禁本体，而 Gate 2b 是点名执行它的，
+# 文件缺席 ⇒ CI 上 Cannot find module。登记表是 JSON，不在 *.js 忽略域内，但一并显式反选，
+# 免得下一次有人往 scripts/ 里加 .js 时把它连带影响。
+!scripts/check-visual-coverage.js
+!scripts/check-visual-coverage.test.js
+!scripts/visual-coverage-debt.json
+# 删除守卫（AGENTS.md R0）。同上一条理由：scripts/*.js 会把守卫本体静默忽略，
+# 本地在盘上、CI 上 Cannot find module —— 而守卫一旦缺席，删除就退回裸 mavis-trash，
+# 2026-10-07 单日误删 .ccg/ 1161 个受管文件 5 次正是这么发生的。
+!scripts/safe-delete.js
+!scripts/safe-delete.test.js
+# 条目模型的单一实现（被上面两个门禁 require）；漏这条会让"判据本体"不进仓库，
+# 于是 CI 与本地跑的是两份不同东西（第 106 行 scripts/*.js 会静默忽略新建脚本）。
+!scripts/changelog-entries.js
+# 清理结果的独立对账器（QM-6 F-A）；漏这条同样是把工具挡在仓库外，CI 与本仓各跑一份
+!scripts/changelog-dedup-reconcile.js
+# re-sync 后重新生成"清理结果 + 授权文件"的可复跑命令（不留在某人脑子里）
+!scripts/changelog-dedup-regen.js
+!scripts/openspec-sync-check.test.js
+!scripts/affected-report.js
+!scripts/verify-worktree-deps.js
+!scripts/run-package-install.js
+!scripts/launch-worktree.js
+!scripts/ensure-electron.js
+!scripts/check-dep-audit.js
+!scripts/check-dep-audit.test.js
+!scripts/check-blanket-fs-mock.js
+!scripts/check-test-egress-ledger.js
+!scripts/nx-affected-probe.js
+!scripts/ensure-desktop-deps.js
+!scripts/ensure-desktop-deps.test.js
+!scripts/start-desktop-identity.js
+!scripts/check-no-brand-residue.js
+!scripts/check-no-brand-residue.test.js
+!scripts/detect-unwired-exports.js
+!scripts/detect-unwired-exports.test.js
+!scripts/sync-platform-config.js
+!scripts/sync-platform-config.test.js
+!scripts/check-unwired-tests.js
+!scripts/check-step-failfast.js
+!scripts/check-gate-record-debt.js
+# 同一族第三次：判据本体若被 scripts/*.js 静默忽略，CI 会以 MODULE_NOT_FOUND 红在别人身上，而不是"这条门禁没跑"。
+!scripts/check-no-conflict-markers.js
+!scripts/check-baseline-freshness.js
+!scripts/classify-docs-only.js
+!scripts/lock-timing-audit.js
+# 执行记录存在性判据（change: enforce-gate-record-presence）；其 .test.js 由下面
+# !scripts/*.test.js
+!scripts/lib/ 兜住，但脚本本体必须逐条放行，否则 git add 当场报错、CI 永远看不见它
+!scripts/check-pr-exec-record.js
+!scripts/check-changelog-growth.js
+# 主规格 Purpose 去 TBD 门禁（change: spec-purpose-tbd-gate）；测试文件由下面 !scripts/*.test.js 兜住
+!scripts/check-spec-purpose.js
+# QM-5 行集棘轮（qm5-row-ratchet）。第 106 行 `scripts/*.js` 会把判据**本体**静默忽略 ——
+# 漏这条 negation 的后果不是报错，而是 `git status` 里它根本不存在：本地在盘、跑得通，
+# 而 Gate 2c3 在 CI 上 Cannot find module。判据一律用 `git check-ignore --no-index` 量，不用 status。
+!scripts/check-record-qm5-rows.js
+# scripts/*.js is ignored wholesale above, so every tracked script needs its own
+# negation. That per-file allowlist silently loses NEW test files (git add won't
+# warn). Test files must always be tracked, so un-ignore them by pattern instead.
+!scripts/*.test.js
+!scripts/compare-scheduler-models.js
+!scripts/gate-budget.js
+!scripts/gate-budget-probe.js
+!scripts/check-desktop-shard-forwarding.js
+!scripts/check-desktop-shard-forwarding.test.js
+# P0-1 平台分类 ID 转换器（ARCH-REUSE-INTEGRATION R-1）：需入库，非临时脚本
+!scripts/import-platform-taxonomy.js
+!scripts/import-platform-taxonomy.test.js
+# P1-1 平台指标矩阵转换器（ARCH-REUSE-INTEGRATION §4.2/§4.3）：需入库，非临时脚本
+!scripts/import-platform-metric-matrix.js
+screenshot_script*.js
+temp_debug.txt
+coverage/
+stryker-tmp/
+reports/mutation/
+# Stryker 报告和增量缓存由本地测试自动生成，不进入版本控制。
+apps/desktop/reports/mutation/
+reports/stryker-incremental.json
+tests/sessions/
+# TypeScript compiled output
+dist-ts/
+
+# Temp scripts (specific files, not directories)
+temp_*.py
+fix_*.py
+_fix_*.py
+gen_*.py
+
+# Test artifacts
+*.png
+!01-docs/ui-reference/screenshots/mp-live-20260724/*.png
+!01-docs/assets/story2video-scene-context-architecture.png
+# 产品品牌资产（非测试产物）：侧边栏左上角品牌 Logo，打包时必须随源码入库
+!apps/desktop/src/assets/brand/*.png
+
+# Python build artifacts
+.pytest_cache/
+__pycache__/
+*.egg-info/
+
+# Build output
+*.exe
+*.dmg
+*.AppImage
+
+# Test artifacts
+.sched-*
+
+# Windows NUL device
+NUL
+
+# Test auto-generated keys
+packages/api-publish-engine/test/.test-open-api-keys.json
+
+# Analysis temp files
+_py_*.txt
+_qw.txt
+_scoring.txt
+_bigfiles.txt
+
+# Environment
+.env
+.env.local
+.coverage
+
+# coverage annotate output
+*.py,cover
+"logs/" 
+
+# Artifacts from test runs
+*.log.gz
+heygen_video_exec_*.mp4
+# Subtitle test outputs
+subtitles.srt
+subtitles.vtt
+subtitles*.json
+# AI Agent Judge CLI test outputs
+apps/desktop/tests/visual-testing/reports/agent-judge-prompt-*.md
+apps/desktop/tests/visual-testing/reports/agent-judge-summary-*.json
+
+# 本机 Agent 技能与工作区状态（不属于应用源码）
+/.agents/
+/skills-lock.json
+/.claude/settings.local.json
+# Qoder 工作区产物（repowiki / 知识卡）。这里还有一条不显然的耦合：
+# scripts/guard-shared-root-writes.ps1 对 gitignored 路径直接放行，不列这一行则每次生成都被整份移进隔离区。
+/.qoder/
+/.tmp/
+/.tmp-logto-qm1-*/
+apps/desktop/.media-tools/
+
+# 本地质量门禁生成报告
+apps/desktop/tests/e2e/reports/e2e-preflight.json
+
+# Test artifacts
+packages/ai-autonomous-tester/tests/.tmp
+packages/ai-autonomous-tester/tests/.tmp-*
+
+# Visual testing artifacts (generated locally, not tracked)
+apps/desktop/tests/visual-testing/meta/
+packages/ai-autonomous-tester/tests/visual-testing/
+# Tesseract OCR traineddata (downloaded at runtime by tesseract.js)
+packages/ai-autonomous-tester/*.traineddata
+
+.gstack/
+.publish-api-runner-*/
+
+# Local agent/runtime acceptance artifacts
+.codex-runtime-acceptance/
+.tmp-*/
+deploy-temp/
+
+# Nx task cache (generated)
+.nx/
+
+# Session-local branch guard state (written by scripts/session-guard.ps1)
+.agent_context/
+
+# E2E runtime artifacts (reports/screenshots, never committed)
+apps/desktop/tests/e2e-output/
+
+
+
+# Shared user data dir (WSL/Windows 共享运行时数据，锚点文件用于自动检测)
+shared-user-data/
+shared-user-data.backups/
+.ccg/tasks/*
+
+# 嵌入式 Agent 子项目：各自为独立 git 仓库（含自有 .git），非本应用源码，不纳入版本控制
+/caura/
+/eion/
+/everos/
+/memx/
+/mnemoverse/
+/mnemory/
+/rcll/
+
+# 本地分析/交付文档产物（任务报告，非源码；保留 01-docs 下图片放行规则）
+#
+# ⚠️ 历史陷阱（2026-10-03 修复）：原规则是「01-docs 一层 .md」+「01-docs 递归 .md」
+# 两条全量忽略，把文档主目录（PRD.md / learnings.md / PRD-*.md）整个划成忽略，
+# 迫使每个正式文档都要 git add -f，且普通 add 静默失败（不报错不提示）——
+# 曾导致 PR #2792 的两份 PRD/使用说明「写了却从未入库」，合并后 PRD 链接 404
+# （复盘见 01-docs/learnings.md「01-docs 下的 .md 会被 .gitignore 静默吞掉」条目）。
+#
+# 现收窄为只忽略真正的本地交付产物（report / analysis / brief 等临时命名）。
+# 已跟踪文件不受 ignore 规则影响；新增未跟踪文档按新规则判定。
+/01-docs/*report*.md
+/01-docs/*analysis*.md
+/01-docs/*brief*.md
+/01-docs/**/*report*.md
+/deliverables/
+
+# 项目记忆与自动化产物（机器生成，不入库）
+.workbuddy/artifacts/
+.workbuddy/automations/
+
+# Git worktree 隔离目录（会话工作区，不入库）
+.worktrees/
+# P3-1 扩平台自检脚本（scripts/*.js 默认忽略，需显式白名单）
+!scripts/verify-platform-onboarding.js
+!scripts/verify-platform-onboarding.test.js
+!scripts/gen-prd-copy-table.js
+!scripts/gen-prd-copy-table.test.js
+# 时钟位移 oracle（2026-10-13，clock-shift-oracle）。同族两条静默忽略坑都要显式反选：
+# ① 第 106 行 scripts/*.js 会忽略判据本体（本地在盘上、CI 上 Cannot find module，先例 #3011/#3308）。
+# ② 第 59 行 test-*.js 未锚定目录，会连 **vitest setupFiles 点名的那个 setup 文件**一起忽略掉 ——
+#    它是 apps/desktop/test-setup-clock-shift.js，缺席时 vitest 会大声失败，但根因仍是这条忽略规则。
+!scripts/check-clock-shift-oracle.js
+!scripts/check-clock-shift-oracle.test.js
+!apps/desktop/test-setup-clock-shift.js
+
+# oss-b1-rpa-hardening: evasions 提取脚本被 106 行 scripts/*.js 默认忽略, 不 negation 则 CI 与本地 require 不到 (同 #3011 家族)
+!scripts/extract-evasions.js
+# 旧载体冻结基线的重取工具（2026-10-15，change: freeze-legacy-gate-carrier）。第 106 行 scripts/*.js
+# 会把脚本本体静默忽略：漏这条 negation 时 git status 里它根本不存在，本地在盘、跑得通，
+# 而 Gate 2c 在 CI 上 Cannot find module（同 #3011 家族）。基线 JSON 不在该 glob 内，无需放行。
+!scripts/freeze-gate-carrier.js
+# CCG 深度审查的工作产物（提案/评审/裁决），不进主干；判定记录 .ccg/reviews/*.json 才是留痕
+.adversarial/
+# 构建产物（由 build:preload / build:paginator 生成，不进版本控制）
+# 2026-10-17（change: bundle-untrack）：这 5 个文件是构建产物，曾被跟踪，导致
+# `build:vue` 后 `git status` 出现 stat-dirty（内容归一后无差异，但行尾/mtime 变化）。
+# 所有入口（build / build:win / build:dir / dev:electron / CI build.yml）都以
+# build:preload + build:paginator 开头，因此移出版本控制不影响任何构建路径。
+# 需要它们时跑：cd apps/desktop && pnpm run build:preload && pnpm run build:paginator
+apps/desktop/electron/preload/index.bundle.js
+apps/desktop/electron/home-shell-preload.bundle.js
+apps/desktop/electron/monitor-preload.bundle.js
+apps/desktop/electron/services/generated/card-paginator.iife.js
+apps/desktop/electron/services/stealth/stealth-preload-enhanced.bundle.js
+
+# WorkBuddy 记忆日志（含个人工作记录，不入库）
+.workbuddy/memory/

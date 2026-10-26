@@ -1,0 +1,364 @@
+// @ts-check
+/**
+ * run-state-store.test.js — RunStateStore owner 隔离单测（W1 技术债务闭环）
+ *
+ * 覆盖：owner-scoped 保存/读取、跨账号隔离（A 读不到 B 的快照）、
+ * legacy 平铺快照读取自动迁移、remove 清理两处路径、owner provider 校验。
+ * 全部使用 os.tmpdir() 独立目录。
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import os from 'os'
+import path from 'path'
+import fs from 'fs'
+import crypto from 'crypto'
+
+const { RunStateStore } = require('./run-state-store')
+
+function tempDir (label) {
+  return path.join(os.tmpdir(), `run-state-test-${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+}
+
+function hash (subject) {
+  return crypto.createHash('sha256').update(subject, 'utf8').digest('hex')
+}
+
+function makeRun (id) {
+  return {
+    id,
+    pipeline: 'story2video-compose',
+    status: 'failed',
+    currentStage: 2,
+    stages: [{ name: 'a', status: 'completed' }, { name: 'b', status: 'completed' }, { name: 'c', status: 'failed' }],
+    context: { prompt: '私密文案' },
+    params: {},
+    error: 'network timeout',
+    orchestrationMode: 'orchestrator',
+  }
+}
+
+describe('RunStateStore owner 隔离', () => {
+  let dir
+  let currentOwner
+
+  beforeEach(() => {
+    dir = tempDir('case')
+    currentOwner = null
+  })
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  function makeStore () {
+    const store = new RunStateStore({ dir, log: { warn() {}, info() {} } })
+    if (currentOwner) store.setOwnerProvider(() => currentOwner)
+    return store
+  }
+
+  it('已登录时快照保存到 owners/{hash} 目录并可读取', () => {
+    currentOwner = 'user-a'
+    const store = makeStore()
+    expect(store.saveFailed(makeRun('run-1'))).toBe(true)
+
+    const ownerPath = path.join(dir, 'owners', hash('user-a'), 'run-1.json')
+    expect(fs.existsSync(ownerPath)).toBe(true)
+    expect(fs.existsSync(path.join(dir, 'run-1.json'))).toBe(false)
+
+    const loaded = store.load('run-1')
+    expect(loaded).not.toBeNull()
+    expect(loaded.runId).toBe('run-1')
+    expect(loaded.owner).toBe('user-a')
+
+    // 持久化快照含 createdAt，供历史记录展示创建时间
+    const run = makeRun('run-1')
+    run.createdAt = '2026-08-08T00:00:00.000Z'
+    expect(store.saveFailed(run)).toBe(true)
+    expect(store.load('run-1').createdAt).toBe('2026-08-08T00:00:00.000Z')
+    expect(loaded.error).toBe('network timeout')
+  })
+
+  it('跨账号隔离：A 保存的快照 B 无法读取', () => {
+    currentOwner = 'user-a'
+    const storeA = makeStore()
+    expect(storeA.saveFailed(makeRun('run-secret'))).toBe(true)
+
+    currentOwner = 'user-b'
+    const storeB = makeStore()
+    expect(storeB.load('run-secret')).toBeNull()
+    expect(fs.existsSync(path.join(dir, 'owners', hash('user-b'), 'run-secret.json'))).toBe(false)
+  })
+
+  it('未登录（无 owner provider）时回退 legacy 平铺路径并兼容读取', () => {
+    const store = makeStore()
+    expect(store.saveFailed(makeRun('run-legacy'))).toBe(true)
+    expect(fs.existsSync(path.join(dir, 'run-legacy.json'))).toBe(true)
+    expect(store.load('run-legacy').runId).toBe('run-legacy')
+  })
+
+  it('legacy 平铺快照在已登录后首次读取时迁移到 owner 目录', () => {
+    // 先按 legacy 落盘
+    const legacyStore = makeStore()
+    expect(legacyStore.saveFailed(makeRun('run-migrate'))).toBe(true)
+    expect(fs.existsSync(path.join(dir, 'run-migrate.json'))).toBe(true)
+
+    // 登录后读取 → 自动迁移
+    currentOwner = 'user-a'
+    const migrated = makeStore()
+    const loaded = migrated.load('run-migrate')
+    expect(loaded.runId).toBe('run-migrate')
+    expect(fs.existsSync(path.join(dir, 'owners', hash('user-a'), 'run-migrate.json'))).toBe(true)
+    expect(fs.existsSync(path.join(dir, 'run-migrate.json'))).toBe(false)
+  })
+
+  it('remove 同时清理 owner 与 legacy 两处路径', () => {
+    currentOwner = 'user-a'
+    const store = makeStore()
+    store.saveFailed(makeRun('run-1'))
+    // 额外造一个 legacy 残留
+    fs.mkdirSync(path.join(dir, 'owners', hash('user-a')), { recursive: true })
+    fs.copyFileSync(path.join(dir, 'owners', hash('user-a'), 'run-1.json'), path.join(dir, 'run-1.json'))
+
+    store.remove('run-1')
+    expect(fs.existsSync(path.join(dir, 'owners', hash('user-a'), 'run-1.json'))).toBe(false)
+    expect(fs.existsSync(path.join(dir, 'run-1.json'))).toBe(false)
+  })
+
+  it('remove 删除其中一处快照失败时恢复已删快照', () => {
+    currentOwner = 'user-a'
+    const store = makeStore()
+    const runId = 'run-rollback'
+    store.saveFailed(makeRun(runId))
+    const ownerPath = path.join(dir, 'owners', hash('user-a'), runId + '.json')
+    const legacyPath = path.join(dir, runId + '.json')
+    fs.copyFileSync(ownerPath, legacyPath)
+    const originalRmSync = fs.rmSync
+    const removeSpy = vi.spyOn(fs, 'rmSync').mockImplementation((filePath, options) => {
+      if (filePath === legacyPath) {
+        const error = new Error('legacy snapshot locked')
+        error.code = 'EPERM'
+        throw error
+      }
+      return originalRmSync(filePath, options)
+    })
+
+    expect(store.remove(runId)).toBe(false)
+    expect(fs.existsSync(ownerPath)).toBe(true)
+    expect(fs.existsSync(legacyPath)).toBe(true)
+    removeSpy.mockRestore()
+  })
+
+  it('setOwnerProvider 拒绝非函数参数', () => {
+    const store = makeStore()
+    expect(() => store.setOwnerProvider('not-a-function')).toThrow(TypeError)
+  })
+
+  it('owner provider 抛错时安全回退 legacy（不中断保存）', () => {
+    const store = new RunStateStore({ dir, log: { warn() {}, info() {} } })
+    store.setOwnerProvider(() => { throw new Error('boom') })
+    expect(store.saveFailed(makeRun('run-safe'))).toBe(true)
+    expect(fs.existsSync(path.join(dir, 'run-safe.json'))).toBe(true)
+  })
+})
+
+describe('RunStateStore listFailed（历史记录展示失败任务）', () => {
+  let dir
+  let currentOwner
+
+  beforeEach(() => {
+    dir = tempDir('list')
+    currentOwner = null
+  })
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  function makeStore () {
+    const store = new RunStateStore({ dir, log: { warn() {}, info() {} } })
+    if (currentOwner) store.setOwnerProvider(() => currentOwner)
+    return store
+  }
+
+  it('未登录（legacy 平铺）保存的快照可被列出', () => {
+    const store = makeStore()
+    store.saveFailed(makeRun('run-a'))
+    store.saveFailed(makeRun('run-b'))
+
+    const failed = store.listFailed()
+    expect(failed.map((s) => s.runId).sort()).toEqual(['run-a', 'run-b'])
+    expect(failed[0]).toMatchObject({ kind: 'orchestration-run-state', status: 'failed' })
+  })
+
+  it('已登录（owner 目录）保存的快照可被列出', () => {
+    currentOwner = 'user-a'
+    const store = makeStore()
+    store.saveFailed(makeRun('run-owner'))
+
+    const failed = store.listFailed()
+    expect(failed.map((s) => s.runId)).toEqual(['run-owner'])
+  })
+
+  it('owner 与 legacy 同 runId 只返回一条（去重）', () => {
+    const store = makeStore()
+    store.saveFailed(makeRun('run-dup'))
+    // 手动在 legacy 平铺目录写入同 id 快照，模拟迁移残留
+    fs.writeFileSync(path.join(dir, 'run-dup.json'), JSON.stringify({ ...makeRun('run-dup'), kind: 'orchestration-run-state', runId: 'run-dup' }), 'utf8')
+
+    const failed = store.listFailed()
+    expect(failed.filter((s) => s.runId === 'run-dup')).toHaveLength(1)
+  })
+
+  it('损坏或非快照文件被静默跳过', () => {
+    const store = makeStore()
+    store.saveFailed(makeRun('run-ok'))
+    fs.writeFileSync(path.join(dir, 'corrupt.json'), '{not-json', 'utf8')
+    fs.writeFileSync(path.join(dir, 'readme.txt'), 'ignore', 'utf8')
+
+    const failed = store.listFailed()
+    expect(failed.map((s) => s.runId)).toEqual(['run-ok'])
+  })
+})
+
+describe('RunStateStore saveRunning / listRunning（运行中任务持久化）', () => {
+  let dir
+  let currentOwner
+
+  beforeEach(() => {
+    dir = tempDir('running')
+    currentOwner = null
+  })
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  function makeStore () {
+    const store = new RunStateStore({ dir, log: { warn() {}, info() {} } })
+    if (currentOwner) store.setOwnerProvider(() => currentOwner)
+    return store
+  }
+
+  function makeRunningRun (id) {
+    return {
+      id,
+      pipeline: 'story2video-compose',
+      status: 'running',
+      currentStage: 2,
+      stages: [{ name: 'split', status: 'completed' }, { name: 'optimize', status: 'completed' }, { name: 'generate_assets', status: 'running' }],
+      context: { prompt: '运行中文案' },
+      params: {},
+      error: null,
+      orchestrationMode: 'orchestrator',
+      createdAt: '2026-08-09T00:00:00.000Z',
+    }
+  }
+
+  it('saveRunning 写入 running 快照：endedAt 为 null、可 load 回读', () => {
+    const store = makeStore()
+    expect(store.saveRunning(makeRunningRun('run-running-1'))).toBe(true)
+
+    const loaded = store.load('run-running-1')
+    expect(loaded).not.toBeNull()
+    expect(loaded.status).toBe('running')
+    expect(loaded.endedAt).toBeNull()
+    expect(loaded.error).toBeNull()
+    expect(loaded.currentStage).toBe(2)
+  })
+
+  it('saveRunning 拒绝非法 run（与 saveFailed 一致）', () => {
+    const store = makeStore()
+    expect(store.saveRunning(null)).toBe(false)
+    expect(store.saveRunning({ id: '' })).toBe(false)
+  })
+
+  it('listRunning 只返回 running 快照；listFailed 过滤 running 快照', () => {
+    const store = makeStore()
+    store.saveFailed(makeRun('run-fail'))
+    store.saveRunning(makeRunningRun('run-running'))
+
+    expect(store.listRunning().map((s) => s.runId)).toEqual(['run-running'])
+    expect(store.listFailed().map((s) => s.runId)).toEqual(['run-fail'])
+  })
+
+  it('owner 隔离：A 保存的 running 快照 B 无法读取/列出', () => {
+    currentOwner = 'user-a'
+    const storeA = makeStore()
+    storeA.saveRunning(makeRunningRun('run-running-secret'))
+
+    currentOwner = 'user-b'
+    const storeB = makeStore()
+    expect(storeB.load('run-running-secret')).toBeNull()
+    expect(storeB.listRunning()).toEqual([])
+  })
+
+  it('remove 同时清理 running 快照两处路径', () => {
+    currentOwner = 'user-a'
+    const store = makeStore()
+    store.saveRunning(makeRunningRun('run-running-rm'))
+    fs.mkdirSync(path.join(dir, 'owners', hash('user-a')), { recursive: true })
+    fs.copyFileSync(path.join(dir, 'owners', hash('user-a'), 'run-running-rm.json'), path.join(dir, 'run-running-rm.json'))
+
+    store.remove('run-running-rm')
+    expect(fs.existsSync(path.join(dir, 'owners', hash('user-a'), 'run-running-rm.json'))).toBe(false)
+    expect(fs.existsSync(path.join(dir, 'run-running-rm.json'))).toBe(false)
+  })
+
+  it('跨平台原子写入：保存后不残留 .tmp 临时文件（rename/copy 两路径）', () => {
+    const store = makeStore()
+    store.saveFailed(makeRun('run-tmp-failed'))
+    store.saveRunning(makeRunningRun('run-tmp-running'))
+
+    // 覆盖写入已存在文件也走原子路径（Windows copy 回退 / POSIX rename 覆盖）
+    store.saveRunning(makeRunningRun('run-tmp-running'))
+
+    const leftovers = []
+    const walk = (p) => {
+      for (const entry of fs.readdirSync(p, { withFileTypes: true })) {
+        const full = path.join(p, entry.name)
+        if (entry.isDirectory()) walk(full)
+        else if (entry.name.endsWith('.tmp')) leftovers.push(full)
+      }
+    }
+    walk(dir)
+    expect(leftovers).toEqual([])
+  })
+})
+
+describe('RunStateStore 已用时累计（activeMs）持久化', () => {
+  let dir
+
+  beforeEach(() => {
+    dir = tempDir('active-ms')
+  })
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('saveFailed/saveRunning 持久化 activeMs，load 往返不丢失（version 保持 1）', () => {
+    const store = new RunStateStore({ dir, log: { warn() {}, info() {} } })
+    const run = makeRun('run-active')
+    run.activeMs = 123456
+
+    expect(store.saveFailed(run)).toBe(true)
+    const loadedFailed = store.load('run-active')
+    expect(loadedFailed.activeMs).toBe(123456)
+    expect(loadedFailed.version).toBe(1)
+
+    run.status = 'running'
+    expect(store.saveRunning(run)).toBe(true)
+    const loadedRunning = store.load('run-active')
+    expect(loadedRunning.status).toBe('running')
+    expect(loadedRunning.activeMs).toBe(123456)
+  })
+
+  it('无 activeMs 的旧 run 落盘后回退为 0，不影响既有字段', () => {
+    const store = new RunStateStore({ dir, log: { warn() {}, info() {} } })
+    const legacy = makeRun('run-legacy-active')
+    delete legacy.activeMs
+    expect(store.saveFailed(legacy)).toBe(true)
+    const loaded = store.load('run-legacy-active')
+    expect(loaded.activeMs).toBe(0)
+    expect(loaded.error).toBe('network timeout')
+  })
+})

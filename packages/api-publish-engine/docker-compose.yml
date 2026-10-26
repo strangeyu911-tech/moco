@@ -1,0 +1,62 @@
+services:
+  publish-api:
+    build:
+      context: ../..
+      dockerfile: packages/api-publish-engine/Dockerfile
+    ports:
+      # 容器内端口保持稳定；生产宿主机的 3000 已被占用，仅通过回环端口暴露。
+      - "127.0.0.1:3030:3000"
+    # BUSINESS_DATABASE_URL 使用 deploy/logto 的 postgres 服务名时，必须加入该 Compose 网络。
+    networks:
+      - default
+      - logto
+    environment:
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=3000
+      - API_KEYS_PATH=/app/packages/api-publish-engine/config/api-keys.json
+      - MULTI_PUBLISH_PLUGINS_DIR=/app/data/plugins
+      - DRY_RUN=false
+      - API_KEY=${API_KEY:-}
+      - MAX_RPM=${MAX_RPM:-100}
+      - ENABLE_SCHEDULE=${ENABLE_SCHEDULE:-false}
+      - IDENTITY_AUTH_ENABLED=${IDENTITY_AUTH_ENABLED:?请设置 IDENTITY_AUTH_ENABLED}
+      - IDENTITY_AUTH_REQUIRED=${IDENTITY_AUTH_REQUIRED:-false}
+      - BUSINESS_DATABASE_AUTO_MIGRATE=false
+      - BUSINESS_DATABASE_URL=${BUSINESS_DATABASE_URL:?请设置 BUSINESS_DATABASE_URL}
+      - LOGTO_ENDPOINT=${LOGTO_ENDPOINT:?请设置 LOGTO_ENDPOINT}
+      - LOGTO_API_RESOURCE=${LOGTO_API_RESOURCE:?请设置 LOGTO_API_RESOURCE}
+      - LOGTO_CLIENT_ID=${LOGTO_CLIENT_ID:?请设置 LOGTO_CLIENT_ID}
+      - LOGTO_CLIENT_SECRET=${LOGTO_CLIENT_SECRET:?请设置 LOGTO_CLIENT_SECRET}
+      - LOGTO_WEBHOOK_SIGNING_KEY=${LOGTO_WEBHOOK_SIGNING_KEY:?请设置 LOGTO_WEBHOOK_SIGNING_KEY}
+      - ENTITLEMENT_KEY_ID=${ENTITLEMENT_KEY_ID:?请设置 ENTITLEMENT_KEY_ID}
+      - ENTITLEMENT_PRIVATE_KEY=${ENTITLEMENT_PRIVATE_KEY:?请设置 ENTITLEMENT_PRIVATE_KEY}
+    volumes:
+      # API Key 与可选 publish-api.json 都在包内 config/ 目录读写，必须持久化到该路径。
+      - type: bind
+        source: ./config
+        target: /app/packages/api-publish-engine/config
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /app/data
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/v1/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  logto:
+    external: true
+    name: ${LOGTO_COMPOSE_NETWORK:-multi-publish-logto_default}

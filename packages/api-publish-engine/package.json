@@ -1,0 +1,59 @@
+{
+  "name": "@multi-publish/api-publish-engine",
+  "version": "1.0.0",
+  "description": "Multi-platform publish HTTP API — 零依赖发布引擎，支持 29+ 平台",
+  "main": "src/index.js",
+  "bin": {
+    "publish-api": "bin/publish-api"
+  },
+  "files": [
+    "src/",
+    "upload/",
+    "bin/",
+    "scripts/",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node scripts/run-tests.js",
+    "start": "node bin/publish-api",
+    "migrate:postgres": "node scripts/migrate-postgres.js",
+    "validate:production": "node scripts/validate-production-config.js",
+    "smoke:production": "node scripts/production-smoke.js",
+    "prepublishOnly": "node -e \"require('./test/config-loader.test.js'); require('./test/publish-api-client.test.js')\""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Colinchiu007/mulpub.git",
+    "directory": "packages/api-publish-engine"
+  },
+  "keywords": [
+    "publish",
+    "multiplatform",
+    "api",
+    "content-publishing",
+    "social-media",
+    "rpa"
+  ],
+  "bugs": {
+    "url": "https://github.com/Colinchiu007/mulpub/issues"
+  },
+  "homepage": "https://github.com/Colinchiu007/mulpub/tree/main/packages/api-publish-engine",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "aws4": "^1.13.2",
+    "axios": "^1.20.0",
+    "form-data": "^4.0.6",
+    "http-proxy-agent": "^5.0.0",
+    "https-proxy-agent": "^5.0.1",
+    "js-yaml": "^4.2.0",
+    "pg": "8.16.3",
+    "proper-lockfile": "4.1.2"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "checkJs": true,
+    "strict": false
+  },
+  "exclude": [
+    "**/*.test.js",
+    "**/*.test.ts",
+    "electron/stealth-preload.js",
+    "electron/auth-preload.js",
+    "electron/auth-qrcode-preload.js",
+    "electron/monitor-preload.js",
+    "electron/services/stealth-helper.js",
+    "**/__mocks__/**"
+  ],
+  "include": [
+    "electron/core/**/*.ts",
+    "electron/ipc-handlers/**/*.ts",
+    "electron/services/**/*.ts",
+    "electron/**/*.js"
+  ]
+}

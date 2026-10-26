@@ -1,0 +1,495 @@
+/**
+ * Platform Definitions — 平台元数据单一数据源
+ *
+ * 集中管理所有平台的登录 URL、显示名称、Dashboard URL、登录检测模式/选择器。
+ * 所有 Electron 主进程模块从此文件引入，消除 6+ 处重复定义。
+ *
+ * 覆盖 15 个平台：
+ *   wechat_mp, zhihu, weibo, douyin, xiaohongshu
+ *   tencent_video, kuaishou, toutiao, bilibili, baijiahao
+ *   youtube, tiktok, twitter, instagram, facebook
+ *
+ * 新增平台时只需在此文件添加一条记录，并确保 config/platforms.yaml 有对应配置。
+ * 各消费者模块无需修改。
+ *
+ * @see config/platforms.yaml — 平台级配置（类型、URL、尺寸限制等）
+ */
+
+// ─── 登录页 URL ────────────────────────────
+// 内嵌浏览器打开登录页时使用
+const PLATFORM_LOGIN_URLS = {
+  wechat_mp: 'https://mp.weixin.qq.com/',
+  zhihu: 'https://www.zhihu.com/signin',
+  weibo: 'https://weibo.com/login',
+  douyin: 'https://creator.douyin.com/',
+  xiaohongshu: 'https://creator.xiaohongshu.com/',
+  tencent_video: 'https://channels.weixin.qq.com/',
+  kuaishou: 'https://cp.kuaishou.com/',
+  toutiao: 'https://mp.toutiao.com/',
+  bilibili: 'https://passport.bilibili.com/login',
+  baijiahao: 'https://baijiahao.baidu.com/',
+  youtube: 'https://studio.youtube.com/',
+  tiktok: 'https://www.tiktok.com/upload/',
+  twitter: 'https://twitter.com/i/flow/login',
+  instagram: 'https://www.instagram.com/accounts/login/',
+  facebook: 'https://www.facebook.com/login/',
+}
+
+// ─── 创作者后台/Dashboard URL（分屏监控用）───
+const PLATFORM_DASHBOARD_URLS = {
+  wechat_mp: 'https://mp.weixin.qq.com/',
+  zhihu: 'https://www.zhihu.com/',
+  weibo: 'https://weibo.com/',
+  douyin: 'https://creator.douyin.com/',
+  xiaohongshu: 'https://creator.xiaohongshu.com/',
+  tencent_video: 'https://channels.weixin.qq.com/',
+  kuaishou: 'https://cp.kuaishou.com/',
+  toutiao: 'https://mp.toutiao.com/',
+  bilibili: 'https://member.bilibili.com/',
+  baijiahao: 'https://baijiahao.baidu.com/',
+  youtube: 'https://studio.youtube.com/',
+  tiktok: 'https://www.tiktok.com/',
+  twitter: 'https://twitter.com/home',
+  instagram: 'https://www.instagram.com/',
+  facebook: 'https://www.facebook.com/',
+}
+
+// ─── 登录成功后 URL 特征（URL 包含检测）──────
+// auth-view-manager 使用 URL 变化检测登录完成
+const PLATFORM_LOGIN_SUCCESS_PATTERNS = {
+  wechat_mp: ['cgi-bin/home', 'cgi-bin/appmsg'],
+  zhihu: ['zhihu.com/people', 'zhihu.com/home', 'zhuanlan.zhihu.com', 'www.zhihu.com/creator'],
+  weibo: ['weibo.com/home', 'weibo.com/u/'],
+  douyin: ['douyin.com'],
+  xiaohongshu: ['creator.xiaohongshu.com'],
+  // 视频号登录页与创作后台同域（channels.weixin.qq.com）：登录页为
+  // /login.html（参考产品 authorizeUrl 同款），裸域名模式会把预登录登录页
+  // 误判为“登录成功”，导致登录视图提前关闭并保存只有预登录 localStorage
+  // 的无 Cookie 凭证（E2E 实测 cookies=0）。登录成功后的创作者后台路径为
+  // /platform，据此精确匹配。
+  tencent_video: ['channels.weixin.qq.com/platform'],
+  // 快手登录页在独立域 passport.kuaishou.com/pc/account/login，登录成功后由平台自己的
+  // 回调跳板 cp.kuaishou.com/rest/infra/sts 送回 cp.kuaishou.com/profile。
+  // 2026-09-25 实测：未登录访问 cp.kuaishou.com/ 也会被前端路由到同一个 /profile
+  // （只渲染营销壳），所以 cp 域无法靠路径区分登录态，必须靠 hasPlatformSessionCookie
+  // 的会话凭证判定；而 passport 是纯登录域，任何路径都不可能是登录成功信号。
+  // 此前 passport.kuaishou.com 被同时列入 AUTH_HOSTS 与成功模式，导致登录视图刚打开
+  // 就被判「登录成功」，把只有埋点 Cookie 的登录页存成有效账号（账号名即登录页标题）。
+  kuaishou: ['cp.kuaishou.com'],
+  // 头条号登录页与创作后台同域（mp.toutiao.com）：未登录访问会 302 到
+  // /login（2026-09-13 实测），裸域名模式会把预登录登录页误判为“登录成功”，
+  // 导致登录视图提前关闭并保存无效账号（与百家号同款 bug）。
+  // 登录成功后的创作者中心路径为 /profile_v4/...，据此精确匹配。
+  toutiao: ['profile_v4'],
+  bilibili: ['www.bilibili.com/', 'member.bilibili.com/'],
+  // 百家号登录页与创作后台同域：未登录访问 baijiahao.baidu.com/ 会 302 到
+  // /pcui/register/index 与 /builder/theme/bjh/login（2026-08-12 实测），裸域名
+  // 模式会把预登录登录页误判为“登录成功”，导致登录视图提前关闭并保存无效账号。
+  // 该平台关闭 URL 自动完成，改由用户点击“我已完成登录”（auth:complete-login）
+  // 在提取到真实凭证后完成入库。
+  baijiahao: [],
+  youtube: ['studio.youtube.com', 'accounts.google.com/o/oauth2/approval'],
+  tiktok: ['tiktok.com/upload'],
+  twitter: ['twitter.com/home', 'twitter.com/explore', 'x.com/home', 'x.com/explore'],
+  instagram: ['instagram.com/'],
+  facebook: ['facebook.com/'],
+}
+
+// 登录完成判定和凭证提取共用的可信域名边界。
+// 只允许明确的创作者/平台域名，避免把 query/hash 中伪造的成功路径当成登录完成。
+const PLATFORM_AUTH_HOSTS = {
+  wechat_mp: ['mp.weixin.qq.com'],
+  zhihu: ['www.zhihu.com', 'zhihu.com', 'zhuanlan.zhihu.com'],
+  weibo: ['weibo.com', 'www.weibo.com'],
+  douyin: ['www.douyin.com', 'creator.douyin.com'],
+  xiaohongshu: ['creator.xiaohongshu.com'],
+  tencent_video: ['channels.weixin.qq.com'],
+  // 不含 passport.kuaishou.com：那是登录域，见上方成功模式注释。Cookie 采集域
+  // （PLATFORM_COOKIE_DOMAINS）仍保留它，登录态由根域 Cookie 承载，不受影响。
+  kuaishou: ['cp.kuaishou.com'],
+  toutiao: ['mp.toutiao.com'],
+  bilibili: ['www.bilibili.com', 'bilibili.com', 'member.bilibili.com'],
+  baijiahao: ['baijiahao.baidu.com'],
+  youtube: ['studio.youtube.com', 'accounts.google.com'],
+  tiktok: ['www.tiktok.com', 'tiktok.com'],
+  twitter: ['twitter.com', 'www.twitter.com', 'x.com', 'www.x.com'],
+  instagram: ['www.instagram.com', 'instagram.com'],
+  facebook: ['www.facebook.com', 'facebook.com'],
+}
+
+// 平台可能使用父域 Cookie；仍然限定在对应平台的根域内。
+const PLATFORM_COOKIE_DOMAINS = {
+  wechat_mp: ['mp.weixin.qq.com', 'weixin.qq.com'],
+  tencent_video: ['channels.weixin.qq.com', 'weixin.qq.com'],
+  zhihu: ['zhihu.com'],
+  weibo: ['weibo.com', 'sina.com.cn'],
+  douyin: ['douyin.com'],
+  xiaohongshu: ['xiaohongshu.com'],
+  kuaishou: ['kuaishou.com', 'passport.kuaishou.com'],
+  toutiao: ['toutiao.com'],
+  bilibili: ['bilibili.com'],
+  // BDUSS/BAIDUID 等真实登录态由 passport.baidu.com 设置在 .baidu.com 父域上，
+  // 仅白名单 baijiahao.baidu.com/passport.baidu.com 会把登录态静默滤掉导致发布失败。
+  baijiahao: ['baijiahao.baidu.com', 'passport.baidu.com', 'baidu.com'],
+  youtube: ['youtube.com', 'studio.youtube.com', 'accounts.google.com'],
+  tiktok: ['tiktok.com'],
+  twitter: ['twitter.com', 'x.com'],
+  instagram: ['instagram.com'],
+  facebook: ['facebook.com'],
+}
+
+// ─── 登录成功后补跳 URL（二段式会话补抓）──────
+// 部分平台登录页域与发布 API 所需会话域不同：小红书登录窗是 creator.xiaohongshu.com，
+// 登录成功只种 creator 会话，主站 web_session 从未被设置，edith note API 因此判
+// 「无登录信息」（code -100）。配置了该表的平台，登录完成抓凭据快照前，登录窗会自动
+// loadURL 到此地址——creator 父域 Cookie 随请求带上，主站识别登录态后种下 web_session，
+// 快照里才有完整会话。未配置的平台保持原行为（登录完成直接抓取，零回归）。
+const PLATFORM_POST_LOGIN_REDIRECT = {
+  xiaohongshu: 'https://www.xiaohongshu.com/',
+}
+
+// 二段式补跳「生效」的凭证 Cookie 名：补跳结束后用它校验主站是否真的种下会话
+//（loadURL resolve 或 15s 超时都不保证——主站可能整页加载后才由 JS/XHR 种 cookie，
+// 或因未识别登录态跳去登录页）。缺失时输出独立失败标记日志（不阻断登录），让
+// 「二段式是否真生效」可观测；未声明的平台跳过校验（保持旧行为）。
+const PLATFORM_POST_LOGIN_PROOF_COOKIES = {
+  xiaohongshu: ['web_session'],
+}
+
+// 二段式补跳的等待预算（毫秒）：凭证轮询在此窗口内反复复查（主站可能整页加载
+// 后才由 JS/XHR 种会话 cookie，就绪判据是「凭证真出现」而非页面加载完成），
+// 耗尽则 stop 在途导航、按当前快照继续，不阻断登录。与 redirect/proof 表同源
+// 导出，消费者与测试都从这里取值，避免两处魔数失同步。
+const POST_LOGIN_REDIRECT_WAIT_MS = 15000
+
+// 平台 localStorage 会话标记：部分平台（如视频号）登录态依赖 localStorage 而非仅 Cookie。
+// 供 checkLocalCredentials 判定 cookies=0 的快照是否仍能构成有效凭证；值为非空即视为会话证据。
+// 未列入的平台视为不依赖 localStorage 登录态。新增标记键必须以 CDP 实测取证为准，
+// 且不得混入埋点/上报类噪声键（__ml::aid、UvFirstReportLocalKey 等）。
+const PLATFORM_LS_SESSION_MARKERS = {
+  tencent_video: ['finder_username'],
+}
+
+/**
+ * 判定 localStorage 是否含有该平台已知会话标记的非空值。
+ * @param {string} platform
+ * @param {Object} localStorageData
+ * @returns {boolean}
+ */
+function hasPlatformLsSessionMarker (platform, localStorageData) {
+  const markers = PLATFORM_LS_SESSION_MARKERS[platform]
+  if (!Array.isArray(markers) || markers.length === 0) return false
+  if (!localStorageData || typeof localStorageData !== 'object') return false
+  return markers.some(key => {
+    const value = localStorageData[key]
+    return typeof value === 'string' ? value.trim().length > 0 : Boolean(value)
+  })
+}
+
+function normalizeHost (value) {
+  return String(value || '').trim().toLowerCase().replace(/^\.+/, '').replace(/\.$/, '')
+}
+
+// 平台会话凭证标记：登录页本身也会写入埋点 Cookie，「有 Cookie」不等于「已登录」。
+// 快手实测：未登录访问 cp.kuaishou.com 即有 did/wid/kwssectoken/kwpsecproductname/
+// kwfv1/kwscode 六个匿名 Cookie，登录成功后才出现 kuaishou.web.cp.api_st（会话票据，
+// 名字即登录 URL 里的 sid）、userId 与 bUserId。因此凡声明了标记的平台，登录完成
+// 与凭证入库都必须命中其中至少一个非空值；未声明的平台沿用既有行为。
+// 新增标记键必须以真实登录态 DevTools/CDP 实测取证为准，且不得混入设备/埋点标识
+// （did、_did、wid、divid 等一律不可用）。
+// 2026-09-27 起，下方除 kuaishou 外的三个平台按同一手法取证：负向基线由本机自建——用与主进程
+// 同版本的 electron.exe、复刻 configureUserAgentFallback 的 UA 净化，在全新隔离分区匿名访问
+// 各平台登录页与创作者首页，采集「不登录也会种」的 Cookie 名；正向样本取自本机登录视图分区
+// （persist:auth-<平台>-<ts>，只读，绝不读取值）。标记 = 正向独有 ∧ 匿名基线没有 ∧ 语义上是
+// 会话身份。据此排除的埋点/设备类噪声见测试里的匿名基线夹具（抖音 ttwid/s_v_web_id/bit_env、
+// B 站 buvid3/b_nut/**bili_ticket**、小红书 a1/webId/gid/websectiga 等）。
+// 知乎按同一手法实测后**故意不声明** Cookie 标记：登录视图内 .zhihu.com 域没有任何会话 Cookie
+// （A−B 唯一独有项是验证码票据 captcha_ticket_v2），声明它会把每次知乎登录都判成失败。
+const PLATFORM_SESSION_COOKIE_MARKERS = {
+  kuaishou: ['kuaishou.web.cp.api_st', 'userId', 'bUserId'],
+  // 抖音：passport 登录成功后才下发的会话/身份四件套（均 httpOnly）。
+  // 不取 sid_guard/session_tlb_tag/ssid_ucp_v1（分片提示）、passport_mfa_token（MFA 阶段 ≠ 登录
+  // 完成）、odin_tt/d_ticket/n_mh（设备与 passport 流程产物）。
+  douyin: ['sessionid', 'sessionid_ss', 'sid_tt', 'uid_tt'],
+  // B 站：SESSDATA 是会话票据，DedeUserID 只在已登录时出现；bili_ticket 匿名也会种，不可用。
+  bilibili: ['SESSDATA', 'DedeUserID'],
+  // 小红书创作平台：两个键由服务端在登录写入（httpOnly），名字本身即 access token 与用户 id。
+  xiaohongshu: ['access-token-creator.xiaohongshu.com', 'x-user-id-creator.xiaohongshu.com'],
+}
+
+/**
+ * 该平台是否已声明会话凭证标记（即 hasPlatformSessionCookie 是否真的在把关）。
+ * 未声明标记时 hasPlatformSessionCookie 一律返回 true（沿用既有宽松行为），调用方若把
+ * 它当作「已登录」的证据就会拿到假成功，必须先用本判据区分。
+ * @param {string} platform
+ * @returns {boolean}
+ */
+function hasPlatformSessionCookieMarkers (platform) {
+  const markers = PLATFORM_SESSION_COOKIE_MARKERS[platform]
+  return Array.isArray(markers) && markers.length > 0
+}
+
+/**
+ * 判定已采集的 Cookie 是否构成该平台的真实登录态。
+ * @param {string} platform
+ * @param {Array<{name?: string, value?: string}>} cookies
+ * @returns {boolean} 未声明标记的平台返回 true（不改变既有行为）
+ */
+/**
+ * 会话证据日志共用的 Cookie 名投影：去重、限量，**只出名字、绝不出值**。
+ * 四处「声明了标记就必须命中」的门禁（auth-view-manager / qrcode-login /
+ * credential-saver / account-manager captureCookies）的 reject 日志统一用它——
+ * 收紧门禁之后，没有名字现场就无法区分「用户没登录」与「标记收得太窄」。
+ * @param {Array<{name?: string}>} cookies
+ * @returns {string[]}
+ */
+function sessionCookieNames (cookies) {
+  return [...new Set((Array.isArray(cookies) ? cookies : [])
+    .map(cookie => cookie && cookie.name).filter(Boolean))].slice(0, 40)
+}
+
+function hasPlatformSessionCookie (platform, cookies) {
+  const markers = PLATFORM_SESSION_COOKIE_MARKERS[platform]
+  if (!Array.isArray(markers) || markers.length === 0) return true
+  if (!Array.isArray(cookies)) return false
+  return cookies.some(cookie => {
+    if (!cookie || !markers.includes(cookie.name)) return false
+    const value = cookie.value
+    return typeof value === 'string' ? value.trim().length > 0 : Boolean(value)
+  })
+}
+
+/**
+ * @param {string} platform
+ * @param {string} hostname
+ * @returns {boolean}
+ */
+function isPlatformAuthHost (platform, hostname) {
+  const normalized = normalizeHost(hostname)
+  return (PLATFORM_AUTH_HOSTS[platform] || []).some(host => normalizeHost(host) === normalized)
+}
+
+/**
+ * 登录页路径指纹：路径里出现这些串，当前页面本身就是登录/注册流程的一部分，
+ * 无论该平台成功模式多宽都不算登录成功。裸域名成功模式（douyin/xiaohongshu/
+ * instagram/facebook/youtube/bilibili/zhihu）必然命中登录页自己，此层是它们
+ * 在补上会话标记取证之前的唯一泛化防线。
+ * 只扫路径、不扫 query/hash：OAuth 回跳地址常把 /login 放在 continue 参数里，
+ * 拿 query 判会把登录成功页反判成登录页。
+ * 刻意不含 auth/authorize/oauth：youtube 已声明 accounts.google.com/o/oauth2/approval
+ * 为登录成功回跳点，纳入即误杀（见 platform-definitions.test.js 对应用例）。
+ * 每一项都必须对应一个真实测过的落地页，不得靠猜测加词（signup/sso/verify 因无实测证据未列入）：
+ *   login    小红书 creator.xiaohongshu.com/login（用户实测）、facebook /login/device-based/...
+ *   signin   知乎 www.zhihu.com/signin（本文件配置）、Google accounts.google.com/v3/signin/identifier（实测）
+ *   register 百家号 /pcui/register/index（2026-08-12 实测，见上方成功模式注释）
+ *   passport 快手 passport.kuaishou.com/pc/account/login（2026-09-25 实测）、B站 passport.bilibili.com/login
+ */
+const LOGIN_PAGE_PATH_MARKERS = ['login', 'signin', 'register', 'passport']
+
+/** @param {string} pathname @returns {boolean} */
+function isPlatformLoginPagePath (pathname) {
+  const path = String(pathname || '').toLowerCase()
+  return LOGIN_PAGE_PATH_MARKERS.some(marker => path.includes(marker))
+}
+
+/**
+ * @param {string} platform
+ * @param {string} rawUrl
+ * @returns {boolean}
+ */
+function isPlatformLoginSuccessUrl (platform, rawUrl) {
+  let parsed
+  try { parsed = new URL(String(rawUrl)) } catch (_) { return false }
+  if (!['http:', 'https:'].includes(parsed.protocol)) return false
+  if (!isPlatformAuthHost(platform, parsed.hostname)) return false
+  if (isPlatformLoginPagePath(parsed.pathname)) return false
+  try {
+    const loginUrl = new URL(PLATFORM_LOGIN_URLS[platform])
+    const normalizePath = pathname => pathname.replace(/\/+$/, '') || '/'
+    if (
+      parsed.origin === loginUrl.origin &&
+      normalizePath(parsed.pathname) === normalizePath(loginUrl.pathname)
+    ) return false
+  } catch (_) { /* 未配置登录页时由下方模式匹配决定 */ }
+  const haystack = `${parsed.hostname}${parsed.pathname}${parsed.search}`.toLowerCase()
+  return (PLATFORM_LOGIN_SUCCESS_PATTERNS[platform] || [])
+    .some(pattern => haystack.includes(String(pattern).toLowerCase()))
+}
+
+/**
+ * 采集侧「已离开登录页」判据：供 Playwright 等待用户登录时替代裸 host 比较。
+ * 必须同时满足①host 相对登录页发生变化②落在平台可信域③不是登录/passport 页。
+ * 注意本函数只证明「导航离开了登录流程」，不证明「已登录」——后者一律由
+ * hasPlatformSessionCookie 与登录成功选择器把守，不得用它替代。
+ * @param {string} platform
+ * @param {string} rawUrl
+ * @returns {boolean}
+ */
+function isPlatformLeftLoginPage (platform, rawUrl) {
+  const loginUrl = PLATFORM_LOGIN_URLS[platform]
+  if (!loginUrl) return false
+  let parsed
+  let loginHost
+  try {
+    parsed = new URL(String(rawUrl))
+    loginHost = normalizeHost(new URL(loginUrl).hostname)
+  } catch (_) { return false }
+  if (!['http:', 'https:'].includes(parsed.protocol)) return false
+  const host = normalizeHost(parsed.hostname)
+  if (!host || !loginHost || host === loginHost) return false
+  if (!isPlatformAuthHost(platform, host)) return false
+  return !isPlatformLoginPagePath(parsed.pathname)
+}
+
+/**
+ * 判断 Cookie domain 是否属于指定平台，允许平台配置的父域。
+ * @param {string} platform
+ * @param {string} domain
+ * @returns {boolean}
+ */
+function isPlatformCookieDomain (platform, domain) {
+  const normalized = normalizeHost(domain)
+  if (!normalized) return false
+  return (PLATFORM_COOKIE_DOMAINS[platform] || []).some(host => {
+    const candidate = normalizeHost(host)
+    // baidu.com 父域条目只允许精确匹配（BDUSS 由 passport 设置在 .baidu.com），
+    // 不允许任意 *.baidu.com 子域 cookie 冒充（例如 .evil.baidu.com）。
+    if (candidate === 'baidu.com') return normalized === 'baidu.com'
+    return normalized === candidate || normalized.endsWith(`.${candidate}`)
+  })
+}
+
+// ─── 登录成功 CSS 选择器（DOM 检测）──────────
+// 用于 Playwright / RPA 引擎页面内检测登录状态
+const PLATFORM_LOGIN_SUCCESS_SELECTORS = {
+  wechat_mp: ['.index_main', '.menu_box', 'a[href*="cgi-bin/home"]'],
+  zhihu: ['.AppHeader-profileAvatar', '.ProfileHeader-avatar', 'img[alt="avatar"]', '[class*="ProfileHeader"]'],
+  weibo: ['.gn_name', '.Avatar', '[node-type="userInfo"]'],
+  douyin: ['.user-info', '.account-info', '.creator-header'],
+  xiaohongshu: ['[class*="avatar"]', '[class*="userInfo"]', '.user-avatar'],
+  tencent_video: ['.channel-header', '.creator-header', '[class*="weixinChannel"]'],
+  kuaishou: ['.user-info', '.profile-avatar', '[class*="creator-header"]'],
+  toutiao: ['.user-avatar', '.header-avatar', '[class*="avatar"]', '.nickname'],
+  bilibili: [],
+  baijiahao: ['.user-info', '.user-avatar', '.nickname', '[class*="user"]'],
+  youtube: ['#avatar-btn', 'ytcp-avatar', '[class*="avatar"]'],
+  tiktok: ['[data-testid="user-avatar"]', '[class*="avatar"]', '.user-avatar'],
+  twitter: ['div[data-testid="primaryColumn"]', 'div[data-testid="SideNav_AccountSwitcher_Button"]', 'header[role="banner"]'],
+  instagram: ['svg[aria-label="Home"]', 'nav[role="navigation"]', 'section main article', 'a[href="/direct/inbox/"]'],
+  facebook: ['a[aria-label*="profile"]', 'a[aria-label*="Profile"]', 'div[aria-label*="Account"]', 'div[data-pagelet*="root"]'],
+}
+
+// ─── 平台账号信息提取选择器（昵称/粉丝/平台ID）──────
+// 用于 Playwright 页面内提取账号信息；各平台按创作者中心 DOM 定制。
+// 字段：nickname(昵称), followers(粉丝数), platformAccountId(平台用户ID)
+const PLATFORM_ACCOUNT_INFO_SELECTORS = {
+  wechat_mp: { nickname: ['.weui-desktop-account__name'], followers: ['.weui-desktop-account__fans'], platformAccountId: ['[data-account-id]'] },
+  zhihu: { nickname: ['.ProfileHeader-name', '.AppHeader-profileAvatar + *'], followers: ['.NumberBoard-itemValue'], platformAccountId: ['[data-account-id]'] },
+  weibo: { nickname: ['.gn_name', '.ProfileHeader-name'], followers: ['.gn_count span'], platformAccountId: ['[data-account-id]'] },
+  douyin: { nickname: ['.user-name', '[class*="user-name"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  xiaohongshu: { nickname: ['.user-name', '[class*="user-name"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  tencent_video: { nickname: ['.channel-name', '[class*="channel-name"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  kuaishou: { nickname: ['.user-name', '[class*="user-name"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  toutiao: { nickname: ['.nickname', '[class*="nickname"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  bilibili: { nickname: ['.nickname', '[class*="nickname"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  baijiahao: { nickname: ['.user-name', '[class*="user-name"]'], followers: ['.fans-count', '[class*="fans"]'], platformAccountId: ['[data-account-id]'] },
+  youtube: { nickname: ['#channel-name', '#text.ytd-channel-name'], followers: ['#subscriber-count'], platformAccountId: ['[data-account-id]'] },
+  tiktok: { nickname: ['[data-e2e="user-title"]'], followers: ['[data-e2e="followers-count"]'], platformAccountId: ['[data-account-id]'] },
+  twitter: { nickname: ['[data-testid="UserName"]'], followers: ['[href*="verified_followers"]'], platformAccountId: ['[data-account-id]'] },
+  instagram: { nickname: ['h1'], followers: ['[href*="/followers/"]'], platformAccountId: ['[data-account-id]'] },
+  facebook: { nickname: ['h1'], followers: ['[href*="/followers"]'], platformAccountId: ['[data-account-id]'] },
+}
+
+// ─── 平台展示元数据 ───────────────────────────
+// JSON 同时被 Vite 浏览器端与 CommonJS 主进程消费，避免跨模块复制和 CJS 命名导入失败。
+const { PLATFORM_NAMES, PLATFORM_ICONS } = require('./platform-display-definitions.json')
+
+// ─── 支持二维码登录的平台列表 ─────────────────
+const QR_CODE_PLATFORMS = ['wechat_mp', 'tencent_video', 'zhihu', 'weibo', 'toutiao', 'kuaishou']
+
+// ─── 素材来源 URL（采集页「去哪找素材」快捷入口专用）─────────────────────
+//
+// ⚠ 语义独立，禁止与 PLATFORM_DASHBOARD_URLS 合并或互相引用。
+// PLATFORM_DASHBOARD_URLS 是「创作者后台/发布目的地」，同时被三处复用：
+//   ① Accounts.vue 卡片点击 → openCreatorCenter（开创作者中心）
+//   ② electron/publishers/http-login-checker.js（用 PLATFORM_DASHBOARD_URLS.zhihu
+//      作登录态 DOM 校验的目标页）
+//   ③ electron/publishers/account-manager.js（goto 目标）
+// 改这张表会连带改变登录态判定与创作者中心入口，因此「找素材」必须是另一张表。
+//
+// 取值口径：这里是「热门选题素材来源」，即用户在浏览器里能浏览别人内容、
+// 挑选题的地方；不是自己发内容的地方。
+//
+// 2026-10-12 实测（web_fetch 纯 HTTP，无 UA/无 Cookie/不执行 JS）：
+//   · 微博：weibo.com/ 与 s.weibo.com/** 一律 302 → passport.weibo.com →
+//     login.sina.com.cn，属**服务端强制登录墙**。s.weibo.com/top/summary 相对
+//     裸首页语义正确（热搜榜 vs 消费端信息流），但**登录墙不变** —— 用户点开
+//     仍会被要求登录。不要以为换 URL 能绕过登录。
+//   · 知乎：www.zhihu.com/hot 返回 403（反爬拦截，裸首页同样 403，故 403 ≠ 失效）；
+//     www.zhihu.com/creator 已确证强制登录（302 → /signin?next=%2Fcreator）。
+//     取 /hot 是因为它是热榜，语义远优于首页推荐流。
+//   · 今日头条：mp.toutiao.com 实测 200 → 重定向 profile_v4，是**头条号创作后台**
+//     （发布目的地），放在「素材来源」里属分类错误，故改为消费端热榜页。
+//     www.toutiao.com/hot/ 实测 404（不可用）；hot-event/hot-board 需带
+//     origin 参数才返回数据，缺参则 {"status":"fail","message":"parameter err"}。
+const PLATFORM_SOURCE_URLS = {
+  weibo: 'https://s.weibo.com/top/summary',
+  zhihu: 'https://www.zhihu.com/hot',
+  toutiao: 'https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc',
+}
+
+// ─── 已登录创作者首页（账号标签「创作者中心」开卡入口专用）─────────────────
+//
+// ⚠ 语义 = 「已登录状态下直接打开就是创作者首页」的 URL；**只在取值与
+// PLATFORM_DASHBOARD_URLS 不同时才登记**（相同则不登记，调用方 `||` 回退）。
+// 与 PLATFORM_DASHBOARD_URLS 是两张表、禁止合并：后者另被 http-login-checker.js
+// 抓 HTML 提 uid、被 checkLoginStatus 用 hostname 兜底判定，改动影响面远超开卡。
+// 每个值的 host 必须与同平台 PLATFORM_LOGIN_URLS 同源（跨域＝开到别的站点）。
+//
+// 2026-10-13 真机取证（xhs-creator-home-url，完整证据与 A/B 见
+// 01-docs/PRD-CREATOR-CENTER-LOGIN-FLASH-2026-10-13.md）：小红书 dashboard 值
+// `https://creator.xiaohongshu.com/` 是该 SPA 的**路由入口**——已登录时先渲染登录
+// 路由约 1.2s 再跳 `/new/home`（CDP 逐帧 `/`→`/login`→`/new/home`），即用户看到的
+// 登录页闪动；同分区开 `/new/home` 全程无 `/login`，干净分区开它会重定向到
+// `/login?...redirectReason=401`（无死路）。契约锁见 src/__tests__/ 的同名 describe。
+const PLATFORM_CREATOR_HOME_URLS = {
+  xiaohongshu: 'https://creator.xiaohongshu.com/new/home',
+}
+
+/**
+ * 获取平台显示名称
+ * @param {string} platform
+ * @returns {string}
+ */
+function getPlatformName(platform) {
+  return PLATFORM_NAMES[platform] || platform
+}
+
+module.exports = {
+  PLATFORM_LOGIN_URLS,
+  PLATFORM_DASHBOARD_URLS,
+  PLATFORM_CREATOR_HOME_URLS,
+  PLATFORM_SOURCE_URLS,
+  PLATFORM_LOGIN_SUCCESS_PATTERNS,
+  PLATFORM_AUTH_HOSTS,
+  PLATFORM_COOKIE_DOMAINS,
+  PLATFORM_POST_LOGIN_REDIRECT,
+  PLATFORM_POST_LOGIN_PROOF_COOKIES,
+  POST_LOGIN_REDIRECT_WAIT_MS,
+  PLATFORM_LS_SESSION_MARKERS,
+  PLATFORM_SESSION_COOKIE_MARKERS,
+  isPlatformAuthHost,
+  hasPlatformLsSessionMarker,
+  hasPlatformSessionCookie,
+  hasPlatformSessionCookieMarkers,
+  sessionCookieNames,
+  isPlatformLoginSuccessUrl,
+  isPlatformLeftLoginPage,
+  isPlatformCookieDomain,
+  PLATFORM_LOGIN_SUCCESS_SELECTORS,
+  PLATFORM_ACCOUNT_INFO_SELECTORS,
+  PLATFORM_NAMES,
+  PLATFORM_ICONS,
+  QR_CODE_PLATFORMS,
+  getPlatformName,
+}

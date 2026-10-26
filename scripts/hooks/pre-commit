@@ -1,0 +1,210 @@
+#!/bin/bash
+# 质量节拍 + 分支守卫 Pre-commit Hook
+# 权威源：scripts/hooks/pre-commit；安装：scripts/install-git-hooks.ps1（同步到共享 .git/hooks/）
+# 行为：
+#   1) 分支守卫（所有提交，含 docs-only）：
+#      - 隔离 worktree（per-worktree git-dir != 公共 git-dir）：声明自动跟随当前分支，零手动步骤
+#      - 共享主工作区：严格 fail-closed，当前分支必须 == .agent_context/expected-branch
+#   2) 质量节拍检查（保留原逻辑）：代码文件变更时执行 scripts/quality-rhythm-wrapper.js check
+set -u
+
+echo "=== 质量节拍 + 分支守卫 Pre-commit 检查 ==="
+
+GIT_DIR="$(git rev-parse --git-dir)"
+GIT_COMMON_DIR="$(git rev-parse --git-common-dir)"
+CURRENT_BRANCH="$(git branch --show-current 2>/dev/null || true)"
+EXPECTED_FILE=".agent_context/expected-branch"
+VIOLATION_FILE=".agent_context/shared-root-violation"
+
+# 隔离 worktree 判定：linked worktree 的 per-worktree git-dir 与公共 git-dir 不同
+ISOLATED_WORKTREE=0
+if [ -n "$GIT_DIR" ] && [ -n "$GIT_COMMON_DIR" ] && [ "$GIT_DIR" != "$GIT_COMMON_DIR" ]; then
+    ISOLATED_WORKTREE=1
+fi
+
+# A failed post-checkout recovery leaves a persistent marker. Some Git clients
+# ignore hook exit codes, so commits must remain blocked until recovery finishes.
+if [ "$ISOLATED_WORKTREE" = "0" ] && [ -f "$VIOLATION_FILE" ]; then
+    echo "错误：共享主工作区仍处于分支切换事故状态"
+    cat "$VIOLATION_FILE"
+    echo "  先保护本地变更并恢复 main；确认无误后删除 $VIOLATION_FILE"
+    exit 1
+fi
+
+
+# ---------- 0. 主目录保护（铁律：主目录永远 main） ----------
+if [ "$ISOLATED_WORKTREE" = "0" ] && [ "$CURRENT_BRANCH" != "main" ] && [ -n "$CURRENT_BRANCH" ]; then
+    echo ""
+    echo "🚫 主目录保护拦截 —— 当前分支: $CURRENT_BRANCH"
+    echo ""
+    echo "主目录必须保持在 main 分支。所有任务必须在独立 worktree 中进行。"
+    echo ""
+    echo "修复步骤："
+    echo "  1) 暂存当前变更:   git stash push --include-untracked -m 'auto-stash'"
+    echo "  2) 切回 main:       git checkout main"
+    echo "  3) 创建 worktree:   bash scripts/gwm-task.sh start <task-name>"
+    SHARED_ROOT="$(git rev-parse --show-toplevel)"
+    echo "  4) 进入 worktree:   cd \"$(dirname "$SHARED_ROOT")/mp-worktrees/mp-<task-name>\""
+    echo ""
+    echo "或一键自动修复:  bash scripts/session-init.sh"
+    echo ""
+    exit 1
+fi
+
+# ---------- 1. 分支守卫 ----------
+if [ "$ISOLATED_WORKTREE" = "1" ]; then
+    # 隔离 worktree：单会话独占，无共享竞态 → 声明自动跟随当前分支（零手动步骤）
+    if [ -z "$CURRENT_BRANCH" ]; then
+        # detached：rebase 重放等，跳过断言
+        if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ]; then
+            echo "分支守卫：HEAD 处于 rebase 重放（detached），跳过本次分支断言"
+        fi
+    else
+        mkdir -p ".agent_context"
+        printf '%s' "$CURRENT_BRANCH" > "$EXPECTED_FILE"
+        echo "分支守卫：隔离 worktree 自动声明期望分支 $CURRENT_BRANCH"
+    fi
+else
+    # 共享主工作区：严格 fail-closed（事故场景保护层）
+    if [ -f "$EXPECTED_FILE" ]; then
+        EXPECTED_BRANCH="$(tr -d '[:space:]' < "$EXPECTED_FILE")"
+        if [ -z "$EXPECTED_BRANCH" ]; then
+            echo "错误：.agent_context/expected-branch 内容为空"
+            echo "  修复：powershell -ExecutionPolicy Bypass -File scripts/session-guard.ps1 -Branch <期望分支>"
+            exit 1
+        fi
+        if [ -z "$CURRENT_BRANCH" ]; then
+            # rebase 重放时 HEAD 处于 detached 状态，跳过断言避免误拦；其余 detached 提交视为上下文缺失
+            if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ]; then
+                echo "分支守卫：HEAD 处于 rebase 重放（detached），跳过本次分支断言"
+            else
+                echo "错误：会话声明期望分支 $EXPECTED_BRANCH，但当前 HEAD 未指向任何命名分支"
+                echo "  修复：git switch $EXPECTED_BRANCH"
+                exit 1
+            fi
+        elif [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
+            echo "错误：分支守卫拦截 —— 期望分支: $EXPECTED_BRANCH，当前分支: $CURRENT_BRANCH"
+            echo "  可能原因：共享工作区被并发会话执行了 git checkout，HEAD 被切到其他分支"
+            echo "  修复选项："
+            echo "    1) 若本次提交本应落在 $EXPECTED_BRANCH：先 git switch $EXPECTED_BRANCH，再重试提交"
+            echo "    2) 若确实要提交到 $CURRENT_BRANCH：先更新声明 scripts/session-guard.ps1 -Branch $CURRENT_BRANCH"
+            exit 1
+        else
+            echo "分支守卫：当前分支 $CURRENT_BRANCH 与会话声明一致（共享主工作区）"
+        fi
+    else
+        echo "错误：缺少会话分支声明 .agent_context/expected-branch"
+        echo "  共享主工作区存在并发切换风险，提交前必须声明期望分支："
+        echo "  修复：powershell -ExecutionPolicy Bypass -File scripts/session-guard.ps1 -Branch <期望分支>"
+        echo "  例：  powershell -ExecutionPolicy Bypass -File scripts/session-guard.ps1 -Branch main"
+        echo "  （隔离 worktree 会自动声明，无需手动执行）"
+        exit 1
+    fi
+fi
+
+# ---------- 1.5 版本号同步（根 -> apps/desktop） ----------
+# 单一真相源 = 根 package.json；提交前把 apps/desktop 对齐，避免两处漂移
+if [ -f "scripts/sync-version.mjs" ]; then
+  node scripts/sync-version.mjs
+  if git diff --name-only | grep -q '^apps/desktop/package.json$'; then
+    git add apps/desktop/package.json
+    echo "版本同步：apps/desktop/package.json 已对齐到根版本并暂存"
+  fi
+fi
+
+# ---------- 2. 质量节拍检查（保留既有逻辑） ----------
+if [ ! -f "scripts/quality-rhythm-wrapper.js" ]; then
+    echo "错误：未找到质量节拍wrapper（scripts/quality-rhythm-wrapper.js）"
+    echo "请先安装质量节拍系统"
+    exit 1
+fi
+
+if git diff --cached --name-only | grep -qE '\.(js|ts|vue|jsx|tsx|py|java|go|rs|c|cpp|h|json|yaml|yml|toml|css|scss|less)$'; then
+    echo "检测到代码文件修改，执行质量节拍检查..."
+    node scripts/quality-rhythm-wrapper.js check
+    CHECK_RESULT=$?
+    if [ $CHECK_RESULT -ne 0 ]; then
+        echo "质量节拍检查失败，禁止提交"
+        echo "请先执行质量节拍"
+        exit 1
+    fi
+    echo "质量节拍检查通过"
+else
+    echo "未检测到代码文件修改，跳过质量节拍检查"
+fi
+
+if [ -f ".quality-rhythm-pending" ]; then
+    echo "警告：存在未完成的质量节拍检查"
+    echo "请先完成质量节拍检查再提交"
+    rm -f ".quality-rhythm-pending"
+    exit 1
+fi
+
+# ---------- 3. CCG 质量门禁（质量节拍 §5.6.1）----------
+# CCG 未安装时 scripts/ccg-gate.js 自身告警跳过并返回 0，不会阻断提交。
+# 临时豁免：SKIP_CCG_GATE=1 git commit
+if [ -f "scripts/ccg-gate.js" ]; then
+    node scripts/ccg-gate.js || exit 1
+    # 判定记录自动入库（防 .ccg/reviews 未跟踪堆积的根治）：
+    # ccg-review-decider.js 把 layer=diff 记录写到 <cwd>/.ccg/reviews/<sha>.json，
+    # 但它以【提交前的 HEAD sha】命名，而本仓 squash 合并会换掉 sha ——
+    # 记录永远不会因"引用它"而被提交，只能靠有人手动 git add。
+    # 不 stage 的实测后果（2026-10-12 排查）：22 小时内 10+ 个任务在共享根与
+    # 36 个 worktree 堆积 300+ 个未跟踪判定记录，其中按文件名反查
+    # 「已在 origin/main = 0」——结构性无法随 PR 入主，只能本地堆积。
+    # 所以在门禁跑完后立刻把本次生成的记录 stage 进同一个提交。
+    # 候选集由 git 自身视图派生，进程创建次数与树上记录数无关。
+    # 旧写法逐文件 fork 2~3 次 git；而这些记录一旦入库就被每个 worktree 检出继承
+    # （origin/main 该目录现有 600+ 个 .json，且按月自增），于是 N 只增不减：
+    # 拥堵现场（13 条链并发、18.2 次创建/秒）实测：单次提交约 1,218 次进程创建、单次创建约 1.175 秒
+    # => 24-30 分钟/提交；风暴排空后同法复测单次仅 53ms => 这是并发放大的读数，不是机器常数。
+    # O(N) 的 spawn 形态正是制造该拥堵的源头，所以消掉它是拆掉放大器，不只是少等一会。
+    # 两集合按定义互斥（未跟踪=不在 index；已改动=在 index 且工作树不等于 index），拼接即全集，无需去重。
+    # pathspec 必须加引号交给 git 匹配（交给 shell 展开会在无匹配时留下字面量）。
+    # 必须带 :(glob) 路径魔法：git 裸 pathspec 的 * 跨 /（实测会取到 .ccg/reviews/inner/*.json），
+    # 而旧形态的 shell glob 不跨 /。不加魔法则候选域是旧集合的超集，违反 spec「恰好等于旧集合」那条 MUST。
+    # 批量 add 走 stdin + NUL：绕开 Windows CreateProcess 约 32k 命令行上限，并兼容含空格/中文的文件名。
+    # 契约见 openspec/changes/fix-precommit-reviews-spawn-storm/；回归锁 scripts/hooks/pre-commit.test.sh scenario16
+    RECORD_PATHSPEC=':(glob).ccg/reviews/*.json'
+    # 两次扫描各自落一个临时清单，**不吞 stderr**：旧写法带 2>/dev/null 会把「index 损坏 / 扫描失败」
+    # 压成「没记录要暂存」，于是判定记录无声滞留未跟踪区 —— 那正是 #3396 要消除的形态，且比逐文件
+    # 老写法更隐蔽（老写法逐条尝试时 git 的报错会露出来）。失败必须点名，且不静默跳过。
+    rev_tmp="${TMPDIR:-/tmp}/mp-ccg-reviews-$$"
+    scan_untracked_ok=1
+    scan_modified_ok=1
+    git ls-files --others --exclude-standard -z -- "$RECORD_PATHSPEC" > "$rev_tmp.u" || scan_untracked_ok=0
+    git diff --name-only -z -- "$RECORD_PATHSPEC" > "$rev_tmp.m" || scan_modified_ok=0
+    # 每一侧独立判定：一侧扫描失败不得连带弃掉另一侧的健康清单（QM-6 i1）——否则"扫描失败"会把
+    # 损失放大成全部弃投，且与批量失败有逐条回退的处置不对称。失败侧点名并报**放弃条数**，
+    # 让损失可见；健康侧照常暂存。
+    if [ "$scan_untracked_ok" = 0 ] || [ "$scan_modified_ok" = 0 ]; then
+        dropped=0
+        if [ "$scan_untracked_ok" = 0 ]; then
+            dropped="$(tr -cd '\0' < "$rev_tmp.u" | wc -c | tr -d ' ')"
+        fi
+        if [ "$scan_modified_ok" = 0 ]; then
+            dropped="$((dropped + $(tr -cd '\0' < "$rev_tmp.m" | wc -c | tr -d ' ')))"
+        fi
+        echo "   [reviews] 扫描失败（untracked=$scan_untracked_ok modified=$scan_modified_ok），该侧清单不可信、本轮放弃该侧暂存；已读到条数=$dropped（下界，不代表损失量）"
+    fi
+    # --exclude-standard 与「.ccg 是否被 ignore」耦合：若将来把 .ccg 加入 .gitignore 作无界增长治理，
+    # 本段就不再 stage 判定记录。该语义由 scenario15 钉住（未跟踪记录必须入库），改动会当场变红而非静默。
+    if [ -s "$rev_tmp.u" ] || [ -s "$rev_tmp.m" ]; then
+        # 走 stdin+NUL：不经 argv，绕开 Windows CreateProcess 约 32k 命令行上限，且兼容含空格/中文文件名
+        if ! { [ "$scan_untracked_ok" = 1 ] && [ -s "$rev_tmp.u" ] && cat "$rev_tmp.u"; [ "$scan_modified_ok" = 1 ] && [ -s "$rev_tmp.m" ] && cat "$rev_tmp.m"; } \
+                | git add --pathspec-from-file=- --pathspec-file-nul; then
+            # 回退逐条以保持「单条失败不阻断提交」的既有语义；必须出声，否则批量恒失败会静默退化无人知道
+            # 同时带出 git 版本：--pathspec-from-file 需要 git>=2.25，缺该旗标时这一行就是唯一现场证据
+            echo "   [reviews] 批量 git add 失败，已回退逐条暂存（git=$(git --version 2>/dev/null || echo unknown)）"
+            n_rev=0
+            while IFS= read -r -d "" rec; do
+                git add -- "$rec" || true
+                n_rev=$((n_rev + 1))
+            done < <( { [ "$scan_untracked_ok" = 1 ] && [ -s "$rev_tmp.u" ] && cat "$rev_tmp.u"; [ "$scan_modified_ok" = 1 ] && [ -s "$rev_tmp.m" ] && cat "$rev_tmp.m"; } )
+            echo "   [reviews] 回退完成，共逐条暂存 $n_rev 个文件"
+        fi
+    fi
+    rm -f "$rev_tmp.u" "$rev_tmp.m"
+fi
+echo "=== Pre-commit 检查完成 ==="
+exit 0

@@ -1,0 +1,297 @@
+// @ts-check
+/**
+ * LicenseManager — 许可证管理器
+ *
+ * 管理：免费/试用/Pro 许可证状态
+ * 存储：userData/license.json（加密存储防篡改）
+ * Pro 功能门控依赖此模块
+ */
+
+const fs = require("fs")
+const path = require("path")
+const crypto = require("crypto")
+const { app } = require("electron")
+const log = require("./logger")
+
+let _instance = null
+
+const FREE_FEATURES = [
+  "single-publish",
+  "platform-basic",
+]
+
+const PRO_FEATURES = [
+  "single-publish",
+  "batch-publish",
+  "scheduled-publish",
+  "platform-all",
+  "templates",
+  "analytics",
+  "content-intelligence",
+  "api-access",
+]
+
+const TRIAL_DAYS = 7
+
+// S1（2026-10-09）：本地激活码格式守卫——与服务端兑换码格式对齐
+// （packages/api-publish-engine/src/auth/subscription-service.js 的 REDEEM_CODE_PATTERN：
+//   4-4-4 段、大写字母+数字、字母表无易混淆 0/O/1/I/L；允许有/无连字符，便于测试与
+//   payment-manager 构造的键通过格式层）。这不是「码有效」的证明——真实核销在服务端。
+const LICENSE_KEY_PATTERN = /^[A-HJ-NP-Z2-9]{4}-?[A-HJ-NP-Z2-9]{4}-?[A-HJ-NP-Z2-9]{4}$/
+
+function getDataPath(dataPath) {
+  return dataPath || path.join(app.getPath("userData"), "license.json")
+}
+
+// AES-256-GCM 加密：密钥从机器 userData 路径 + 随机盐派生（每台机器不同 + 每次加密不同盐），防伪造 Pro 许可证
+// 安全修复（2026-07-16）：静态盐 "license-salt" → 随机盐（16 字节），v2 格式带 salt 前缀
+const ALGORITHM = "aes-256-gcm"
+const IV_LENGTH = 16
+const TAG_LENGTH = 16
+const SALT_LENGTH = 16
+const V2_PREFIX = "v2:"
+
+function _deriveKey(salt) {
+  // keyMaterial 机器特定（userData 路径包含用户名 + 应用名），salt 每次随机
+  return crypto.scryptSync(app.getPath("userData"), salt, 32)
+}
+
+function encrypt(str) {
+  if (!str) return ""
+  const salt = crypto.randomBytes(SALT_LENGTH)
+  const key = _deriveKey(salt)
+  const iv = crypto.randomBytes(IV_LENGTH)
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
+  const encrypted = Buffer.concat([cipher.update(str, "utf-8"), cipher.final()])
+  const tag = cipher.getAuthTag()
+  // v2 格式：v2: 前缀 + salt + iv + tag + encrypted
+  return V2_PREFIX + Buffer.concat([salt, iv, tag, encrypted]).toString("base64")
+}
+
+function decrypt(encoded) {
+  if (!encoded) return null
+  try {
+    // v2 格式：带随机盐
+    if (encoded.startsWith(V2_PREFIX)) {
+      const buf = Buffer.from(encoded.slice(V2_PREFIX.length), "base64")
+      const salt = buf.subarray(0, SALT_LENGTH)
+      const iv = buf.subarray(SALT_LENGTH, SALT_LENGTH + IV_LENGTH)
+      const tag = buf.subarray(SALT_LENGTH + IV_LENGTH, SALT_LENGTH + IV_LENGTH + TAG_LENGTH)
+      const encrypted = buf.subarray(SALT_LENGTH + IV_LENGTH + TAG_LENGTH)
+      const key = _deriveKey(salt)
+      const decipher = crypto.createDecipheriv(ALGORITHM, key, iv)
+      decipher.setAuthTag(tag)
+      const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
+      return decrypted.toString("utf-8")
+    }
+    // 旧格式（v1）：静态盐向后兼容，解密成功后 save() 会自动升级为 v2
+    const buf = Buffer.from(encoded, "base64")
+    const iv = buf.subarray(0, IV_LENGTH)
+    const tag = buf.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH)
+    const encrypted = buf.subarray(IV_LENGTH + TAG_LENGTH)
+    const legacyKey = crypto.scryptSync(app.getPath("userData"), "license-salt", 32)
+    const decipher = crypto.createDecipheriv(ALGORITHM, legacyKey, iv)
+    decipher.setAuthTag(tag)
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
+    return decrypted.toString("utf-8")
+  // eslint-disable-next-line no-unused-vars
+  } catch (e) {
+    return null
+  }
+}
+
+class LicenseManager {
+  constructor(dataPath) {
+    this._dataPath = getDataPath(dataPath)
+    this._data = this._defaultData()
+  }
+
+  _defaultData() {
+    return { type: "free", licenseKey: "", activatedAt: null, expiresAt: null, features: [] }
+  }
+
+  load() {
+    try {
+      if (fs.existsSync(this._dataPath)) {
+        const raw = fs.readFileSync(this._dataPath, "utf-8").trim()
+        if (!raw) return
+        const decoded = decrypt(raw)
+        if (decoded) {
+          const parsed = JSON.parse(decoded)
+          if (parsed && parsed.type) {
+            this._data = parsed
+            log.info("LicenseManager", "License loaded: " + this._data.type)
+            return
+          }
+        }
+        // decrypt 返回 null 或 JSON 解析失败 → 主文件损坏，抛异常触发 .bak 恢复
+        throw new Error("Primary license file corrupted or undecryptable")
+      }
+    } catch (e) {
+      log.warn("LicenseManager", "Failed to load primary: " + e.message)
+      // 修复 P6：损坏时先尝试 .bak 备份，避免静默降级为 free 丢失 Pro 许可
+      try {
+        const bakPath = this._dataPath + ".bak"
+        if (fs.existsSync(bakPath)) {
+          const rawBak = fs.readFileSync(bakPath, "utf-8").trim()
+          const decodedBak = decrypt(rawBak)
+          if (decodedBak) {
+            const parsedBak = JSON.parse(decodedBak)
+            if (parsedBak && parsedBak.type) {
+              this._data = parsedBak
+              log.info("LicenseManager", "License restored from backup: " + this._data.type)
+              return
+            }
+          }
+        }
+      } catch (e2) {
+        log.warn("LicenseManager", "Backup also failed: " + e2.message)
+      }
+      this._data = this._defaultData()
+      log.warn("LicenseManager", "License corrupted, fell back to free. Please re-activate if you had Pro.")
+    }
+  }
+
+  save() {
+    try {
+      const dir = path.dirname(this._dataPath)
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      const encoded = encrypt(JSON.stringify(this._data))
+      // 修复 P6：原子写（tmp + rename）+ 备份双副本
+      const tmpPath = this._dataPath + ".tmp"
+      fs.writeFileSync(tmpPath, encoded, "utf-8")
+      fs.renameSync(tmpPath, this._dataPath)
+      // 同步备份
+      try {
+        const bakPath = this._dataPath + ".bak"
+        fs.writeFileSync(bakPath, encoded, "utf-8")
+      } catch (e2) { /* best-effort backup */ }
+    } catch (e) {
+      log.warn("LicenseManager", "Failed to save: " + e.message)
+    }
+  }
+
+  activate(licenseKey) {
+    if (!licenseKey) return false
+    // Don't re-activate if already activated with same or different key
+    if (this._data.type === "pro" || this._data.type === "lifetime") return false
+    // 2026-10-07：这里原本只 `trim()` 后就写库，**没有任何有效性校验**。
+    // 实测（node 直驱本类）：输入 `a` / `x` / `随便什么字符串` / `"   "` / `!!!`
+    // 一律返回 true，并写入 type=pro + expiresAt=null（永不过期）+ 8 项 PRO_FEATURES。
+    // 叠加 #3064 保留的正式包激活码入口 ⇒ 任意非空字符串即可获得永久 Pro。
+    //
+    // 最小止血（第 1 步，#3085）：正式包在 IPC 层拒收本地激活码（license.js:47），
+    // 开发构建保留本路径。
+    // 最小止血（第 2 步，2026-10-09 S1）：开发构建里本方法仍可达，故补**格式守卫**——
+    // 只接受服务端 `subscription-service.js` REDEEM_CODE_PATTERN 同款格式
+    // （4-4-4 段，大写字母+数字，无易混淆 0/O/1/I/L，可带连字符）。垃圾字符串
+    // 一律拒绝且不写库。格式通过 ≠ 码有效：真实核销仍必须走服务端 /api/v1/redeem，
+    // 客户端校验本质可绕过，本守卫只封「手滑/瞎猜都能激活」的面。
+    const key = String(licenseKey).trim()
+    if (!key) return false
+    if (!LICENSE_KEY_PATTERN.test(key)) {
+      log.warn("LicenseManager", "Activate rejected: key does not match redemption code format")
+      return false
+    }
+    this._data.type = "pro"
+    this._data.licenseKey = key
+    this._data.activatedAt = new Date().toISOString()
+    this._data.expiresAt = null
+    this._data.features = PRO_FEATURES.slice()
+    this.save()
+    log.info("LicenseManager", "Activated with key: " + key.slice(0, 8) + "...")
+    return true
+  }
+
+  activateTrial() {
+    if (this._data.type !== "free") return false
+    this._data.type = "trial"
+    this._data.activatedAt = new Date().toISOString()
+    const expires = new Date()
+    expires.setDate(expires.getDate() + TRIAL_DAYS)
+    this._data.expiresAt = expires.toISOString()
+    this._data.features = PRO_FEATURES.slice()
+    this.save()
+    log.info("LicenseManager", "Trial activated, expires: " + this._data.expiresAt)
+    return true
+  }
+
+  deactivate() {
+    this._data = this._defaultData()
+    this.save()
+    log.info("LicenseManager", "Deactivated")
+  }
+
+  isPro() {
+    if (this._data.type === "pro" || this._data.type === "lifetime") return true
+    if (this._data.type === "trial") {
+      if (!this._data.expiresAt) return false
+      const now = new Date()
+      const expires = new Date(this._data.expiresAt)
+      // R29 修复：Invalid Date 守卫，无效日期视为非 Pro（与 isTrialExpired 返回 true 一致）
+      if (!Number.isFinite(expires.getTime())) return false
+      return now < expires
+    }
+    return false
+  }
+
+  isTrial() {
+    return this._data.type === "trial" && this.isPro()
+  }
+
+  isTrialExpired() {
+    if (this._data.type !== "trial") return false
+    if (!this._data.expiresAt) return false
+    const expires = new Date(this._data.expiresAt)
+    // R29 修复：Invalid Date 守卫，无效日期视为已过期（与 isPro 返回 false 一致）
+    if (!Number.isFinite(expires.getTime())) return true
+    return new Date() > expires
+  }
+
+  getInfo() {
+    return {
+      type: this._data.type,
+      licenseKey: this._data.licenseKey || "",
+      activatedAt: this._data.activatedAt,
+      expiresAt: this._data.expiresAt,
+      features: this._data.features || [],
+      isPro: this.isPro(),
+      isTrial: this.isTrial(),
+      isTrialExpired: this.isTrialExpired(),
+      daysRemaining: this._daysRemaining(),
+    }
+  }
+
+  getFeatures() {
+    if (this.isPro()) return PRO_FEATURES.slice()
+    return FREE_FEATURES.slice()
+  }
+
+  hasFeature(featureName) {
+    return this.getFeatures().indexOf(featureName) >= 0
+  }
+
+  _daysRemaining() {
+    if (this._data.type !== "trial" || !this._data.expiresAt) return 0
+    const now = new Date()
+    const expires = new Date(this._data.expiresAt)
+    const diff = expires.getTime() - now.getTime()
+    // R29 修复：Invalid Date 导致 diff=NaN，Math.max(0,NaN)=NaN，NaN<=0 为 false 试用永不过期
+    if (!Number.isFinite(diff)) return 0
+    return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)))
+  }
+
+  static getInstance(dataPath) {
+    if (!_instance) {
+      _instance = new LicenseManager(dataPath)
+      _instance.load()
+    }
+    return _instance
+  }
+
+  static get FREE_FEATURES() { return FREE_FEATURES.slice() }
+  static get PRO_FEATURES() { return PRO_FEATURES.slice() }
+  static get TRIAL_DAYS() { return TRIAL_DAYS }
+}
+
+module.exports = LicenseManager

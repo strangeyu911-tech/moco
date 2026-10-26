@@ -1,0 +1,238 @@
+name: AI Agent Judge
+
+# AI AgentJudge 需求覆盖审计（v0.8.0+）
+# - 触发：PR / push 主分支 / 手动 dispatch
+# - 默认：无 LLM Key → 输出 prompt 包给 Agent 读（exit 2 = NEED_HUMAN，CI 只告警）
+# - 可选：手动 dispatch 选择 provider 并注入对应密钥 → 自动跑 verdict 并 PR 评论
+# - 始终上传 verdict.json + reports 作为 artifact
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/ai-autonomous-tester/**'
+      - '01-docs/PRD.md'
+      - 'apps/desktop/src/**'
+      - '.github/workflows/agent-judge.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/ai-autonomous-tester/**'
+      - '01-docs/PRD.md'
+  workflow_dispatch:
+    inputs:
+      llm_provider:
+        description: 'LLM provider (openai | anthropic | none)'
+        required: false
+        default: 'none'
+      threshold:
+        description: 'Coverage threshold (0.0-1.0)'
+        required: false
+        default: '0.8'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  agent-judge:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      LLM_PROVIDER: ${{ github.event.inputs.llm_provider || 'none' }}
+      COVERAGE_THRESHOLD: ${{ github.event.inputs.threshold || '0.8' }}
+      PRD_PATH: 01-docs/PRD.md
+      SRC_PATH: apps/desktop/src
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ---- 主步骤: 跑 AgentJudge ----
+      - name: Run AI Agent Judge
+        id: judge
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Host "================================================================"
+          Write-Host "  AI Agent Judge — Coverage Audit"
+          Write-Host "================================================================"
+          Write-Host "PRD:         $env:PRD_PATH"
+          Write-Host "Source:      $env:SRC_PATH"
+          Write-Host "LLM:         $env:LLM_PROVIDER"
+          Write-Host "Threshold:   $env:COVERAGE_THRESHOLD"
+          Write-Host "================================================================"
+          $reportStart = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          "AGENT_JUDGE_REPORT_START=$reportStart" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $judgeArgs = @(
+            "packages/ai-autonomous-tester/scripts/run-agent-judge.js",
+            "--prd=$env:PRD_PATH",
+            "--src=$env:SRC_PATH",
+            "--llm=$env:LLM_PROVIDER",
+            "--coverageThreshold=$env:COVERAGE_THRESHOLD",
+            "--out=apps/desktop/tests/visual-testing/reports"
+          )
+          & node @judgeArgs
+          $judgeExit = $LASTEXITCODE
+          Write-Host "Exit: $judgeExit"
+          exit $judgeExit
+
+      # ---- 上传 artifacts（始终）----
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-judge-reports
+          path: |
+            apps/desktop/tests/visual-testing/reports/agent-judge-*.json
+            apps/desktop/tests/visual-testing/reports/agent-judge-*.md
+          retention-days: 5
+          if-no-files-found: warn
+
+      # ---- PR 评论: 仅 verdict 可用时 ----
+      - name: Comment PR with verdict
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const reportsDir = 'apps/desktop/tests/visual-testing/reports';
+            const reportStart = Number(process.env.AGENT_JUDGE_REPORT_START);
+            if (!Number.isFinite(reportStart) || !fs.existsSync(reportsDir)) {
+              console.log('No current-run Agent Judge report directory found, skipping comment');
+              return;
+            }
+            const verdictFiles = fs.readdirSync(reportsDir)
+              .filter(f => f.startsWith('agent-judge-verdict-') && f.endsWith('.json'))
+              .map(f => ({
+                name: f,
+                path: path.join(reportsDir, f),
+                mtime: fs.statSync(path.join(reportsDir, f)).mtime.getTime(),
+              }))
+              .filter(({ mtime }) => mtime >= reportStart)
+              .sort((a, b) => b.mtime - a.mtime);
+
+            if (verdictFiles.length === 0) {
+              console.log('No verdict files found, skipping comment');
+              return;
+            }
+
+            const latest = verdictFiles[0];
+            const verdict = JSON.parse(fs.readFileSync(latest.path, 'utf8'));
+
+            const decisionEmoji = {
+              PASS: '✅', FAIL: '❌', NEED_HUMAN: '⚠️'
+            }[verdict.decision] || '❓';
+
+            const rate = (verdict.summary?.coverageRate ?? 0) * 100;
+
+            const md = [
+              `## ${decisionEmoji} AI Agent Judge — Coverage Audit`,
+              ``,
+              `**Decision**: \`${verdict.decision}\` &nbsp; **Score**: ${verdict.score} &nbsp; **Coverage**: ${rate.toFixed(1)}%`,
+              ``,
+              `| Status | Count |`,
+              `|--------|------:|`,
+              `| ✅ Covered | ${verdict.summary?.covered ?? 0} |`,
+              `| ⚠️ Partial | ${verdict.summary?.partial ?? 0} |`,
+              `| ❌ Missing | ${verdict.summary?.missing ?? 0} |`,
+              ``,
+            ];
+
+            if (verdict.items && verdict.items.length > 0) {
+              md.push(`### PRD Feature Status`, ``);
+              md.push(`| PRD Feature | Status | Matched |`);
+              md.push(`|-------------|--------|---------|`);
+              for (const it of verdict.items) {
+                const icon = it.status === 'COVERED' ? '✅' : it.status === 'PARTIAL' ? '⚠️' : '❌';
+                md.push(`| ${it.prdFeature} | ${icon} ${it.status} | ${it.matchedImpl || '—'} |`);
+              }
+              md.push(``);
+            }
+
+            if (verdict.recommendations && verdict.recommendations.length > 0) {
+              md.push(`### Recommendations`, ``);
+              for (const rec of verdict.recommendations) md.push(`- ${rec}`);
+              md.push(``);
+            }
+
+            if (verdict.reasoning) {
+              md.push(`### Reasoning`, ``, verdict.reasoning, ``);
+            }
+
+            md.push(`---`, ``);
+            md.push(`📦 Full report: [artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`);
+            md.push(`🤖 Generated by [\`run-agent-judge.js\`](packages/ai-autonomous-tester/scripts/run-agent-judge.js) v0.8.0`);
+
+            const body = md.join('\n');
+
+            // 查找本 workflow 之前发过的评论（用 marker）并更新，避免刷屏
+            const marker = '<!-- ai-agent-judge-marker -->';
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.data.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: marker + '\n' + body,
+              });
+              console.log(`Updated existing comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: marker + '\n' + body,
+              });
+              console.log('Created new comment');
+            }
+
+      # ---- 决策 gate: PASS 允许合入，FAIL/NEED_HUMAN 阻塞 ----
+      - name: Enforce coverage gate
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          # 未配置 LLM 时 Agent Judge 无法产出真实 verdict，降级为非阻塞（设计意图：NEED_HUMAN 仅告警）
+          if ($env:LLM_PROVIDER -eq 'none') {
+            Write-Host "::warning::Agent Judge LLM not configured; skipping coverage gate (non-blocking). Configure OPENAI_API_KEY / LLM_BASE_URL / LLM_MODEL to enable verdict."
+            exit 0
+          }
+          $gateArgs = @(
+            ".github/scripts/agent-review-gate.js",
+            "agent-judge",
+            "--report-dir=apps/desktop/tests/visual-testing/reports",
+            "--started-after=$env:AGENT_JUDGE_REPORT_START",
+            "--llm-provider=$env:LLM_PROVIDER"
+          )
+          & node @gateArgs
+          exit $LASTEXITCODE

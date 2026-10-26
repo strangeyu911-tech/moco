@@ -1,0 +1,453 @@
+<template>
+  <div class="app-root">
+    <OfflineIndicator />
+
+    <template v-if="isFullScreenRoute">
+      <main class="fullscreen-main" data-testid="fullscreen-view">
+        <router-view />
+      </main>
+    </template>
+
+    <!-- 内嵌主页壳态（PRD-TAB-INDEPENDENT-HOME F1）：+ 新标签中的独立 SPA 实例
+         运行于 WebContentsView（仅覆盖内容矩形），外层窗口的 TabBar/NavBar/Sidebar
+         已在其视野之外——本实例若再渲染一份会造成双份 chrome 视觉错乱，故只渲染
+         模块导航 + 工作区内容。 -->
+    <template v-else-if="isHomeShell">
+      <div class="mp-home-shell-root" data-testid="mp-home-shell">
+        <MpModuleNav />
+        <main class="mp-workspace cohere-main" data-testid="mp-workspace">
+          <RouteLoadError v-if="routeLoadError" v-bind="routeLoadError" @retry="retryRouteLoad" @refresh="refreshRouteLoad" />
+          <router-view />
+        </main>
+      </div>
+    </template>
+
+    <template v-else>
+      <div class="mp-shell" data-testid="mp-shell">
+        <MpSidebar @open-settings="showSettingsDialog = true" />
+        <div class="mp-shell-main">
+          <!-- 浏览器式标签栏 -->
+          <TabBar
+            @switch-tab="onSwitchTab"
+            @close-tab="onCloseTab"
+            @create-tab="onCreateTab"
+          />
+          <!-- 导航栏（后退/前进/URL）。
+               壳态收敛 6a 修订（2026-09-23）：首页虚拟标签不再用空白占位行，
+               改为渲染 NavBar 的「只读态」——地址栏置灰禁用、刷新按钮隐藏，
+               前进/后退经 vue-router SPA 历史（useSpaNavHistory）仍有效，🏠 回首页。
+               与浏览器标签视觉一致，消除「首页无、新标签有」的割裂；
+               NavBar 高度 40px 不变，主进程 WebContentsView TOP=76px 契约保持。
+               浏览器/登录标签（含「保存账号」入口）渲染完整可用 NavBar。 -->
+          <NavBar
+            :current-url="navigation.url"
+            :current-title="navigation.title"
+            :can-go-back="navCanGoBack"
+            :can-go-forward="navCanGoForward"
+            :is-home="isHomeTab"
+            :loading="navigation.loading"
+            :is-login-tab="isLoginTab"
+            :account-unsaved="activeTabUnsaved"
+            :saving="savingAccount"
+            @go-back="onGoBack"
+            @go-forward="onGoForward"
+            @reload="tabStore.reload()"
+            @go-home="goHome"
+            @navigate="onNavigate"
+            @save-account="onSaveAccount"
+          />
+          <!-- 模块导航（仅首页标签显示） -->
+          <MpModuleNav v-if="isHomeTab" />
+          <!-- 主内容区 -->
+          <main class="mp-workspace cohere-main" data-testid="mp-workspace">
+            <RouteLoadError v-if="routeLoadError" v-bind="routeLoadError" @retry="retryRouteLoad" @refresh="refreshRouteLoad" />
+            <!-- 两层「不丢草稿」保障：
+                 ① v-show 而非 v-if：登录/账号标签激活时内嵌 WebContentsView 已覆盖内容矩形，
+                    这里只需「隐藏」工作区避免重叠，绝不能「卸载」——否则切到账号标签会销毁当前
+                    路由组件、切回首页丢未保存草稿（v-if→v-show 的回归锁见 publish-tab-state-keepalive.test.js）。
+                 ② keep-alive(:include=['Publish'])：让发布页在【路由切换】（离开发布页再回来）时也保留
+                    实例，解决「在首页里点左侧菜单/模块导航离开 /publish 再回来，草稿丢失」这条独立缺口。
+                    include 只缓存发布页，其余页面维持「重挂载取最新数据」的既有语义，不引入陈旧数据。
+                 v-show 挂在 v-slot 实际渲染的组件上，隐藏语义与 ① 一致。 -->
+            <router-view v-slot="{ Component }">
+              <keep-alive :include="['Publish']">
+                <component :is="Component" v-show="!isLoginTab" />
+              </keep-alive>
+            </router-view>
+          </main>
+        </div>
+      </div>
+      <BackToTop />
+    </template>
+
+    <UpdateNotification />
+    <SettingsDialog :visible="showSettingsDialog" :initial-tab="settingsDialogInitialTab" @close="closeSettingsDialog" />
+    <PipelineBackgroundToast />
+    <!-- 发布进度全局面板（publish-progress-ux）：App 级常驻，setup 内完成事件订阅 -->
+    <PublishProgressPanel />
+  </div>
+</template>
+
+<script setup>
+import { getApi, invokePageManager } from '@/api/electron-bridge'
+import MpModuleNav from '@/layouts/MpModuleNav.vue'
+import MpSidebar from '@/layouts/MpSidebar.vue'
+import TabBar from '@/components/TabBar.vue'
+import NavBar from '@/components/NavBar.vue'
+import OfflineIndicator from '@/components/OfflineIndicator.vue'
+import UpdateNotification from '@/components/UpdateNotification.vue'
+import SettingsDialog from '@/components/SettingsDialog.vue'
+import BackToTop from '@/components/BackToTop.vue'
+import PipelineBackgroundToast from '@/components/PipelineBackgroundToast.vue'
+import PublishProgressPanel from '@/components/PublishProgressPanel.vue'
+import RouteLoadError from '@/components/RouteLoadError.vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useAccountActions } from '@/composables/useAccountActions'
+import { useNotify } from '@/composables/useNotify'
+import { useSpaNavHistory } from '@/composables/useSpaNavHistory'
+import { formatUserError } from '@/utils/user-facing-error'
+import { useRoute, useRouter } from 'vue-router'
+import { clearRouteLoadError, routeLoadError } from '@/router'
+import { useLicenseStore } from '@/stores/license'
+import { useIdentityStore } from '@/stores/identity'
+import { useTabStore } from '@/stores/tab'
+import { notifySettingsDialogClosed, settingsDialogRequest } from '@/stores/settings-dialog'
+import { isHomeShellSearch } from '@/utils/home-shell'
+import { suspendEmbeddedViewsForOverlay, releaseEmbeddedViewsForOverlay } from '@/composables/useEmbeddedViewSuspension'
+import { useTabDocumentTitle } from '@/composables/useTabDocumentTitle'
+import { storeToRefs } from 'pinia'
+
+const router = useRouter()
+const route = useRoute()
+const licenseStore = useLicenseStore()
+const identityStore = useIdentityStore()
+const tabStore = useTabStore()
+const { navigation, isHomeTab: isHomeTabFromStore, activeTabId } = storeToRefs(tabStore)
+// 内嵌主页壳态（+ 新标签中的独立 SPA 实例）：URL search 含 mp-home-shell=1。
+// 该实例本身就是 WebContentsView（浏览器标签），不是主窗口的 home 虚拟标签，
+// 因此按 home 壳渲染（隐藏 NavBar、显示模块导航），但不参与主窗口标签系统（见 S4）。
+const isHomeShell = isHomeShellSearch(typeof window !== 'undefined' ? window.location.search : '')
+const isHomeTab = computed(() => isHomeShell || isHomeTabFromStore.value)
+// home-shell 实例的页面标题同步（2026-10-03 Bug 修复）：路由变化 → document.title +
+// IPC 上报主进程，驱动 TabBar 标签标题与 NavBar 地址栏占位符实时跟随当前页面。
+const tabTitleReporter = isHomeShell ? useTabDocumentTitle() : null
+const accountActions = useAccountActions()
+const { t } = useI18n()
+const { notifyError } = useNotify()
+
+// ── 登录标签（参考产品式全屏登录视图）──
+// 「保存账号」按钮显示条件：认证登录标签（isLogin）或账号浏览器标签（accountId，
+// 首页批量登录打开的普通标签，同样需要手动保存凭证入口）
+const isLoginTab = computed(() => {
+  const tab = tabStore.activeTab
+  return tab?.isLogin === true || (tab?.accountId != null && !tab.isHome)
+})
+const savingAccount = ref(false)
+// 活动标签是否为「未保存」账号标签：驱动 NavBar 保存按钮脉冲动画（方案三）。
+const activeTabUnsaved = computed(() => tabStore.activeTab?.credentialSaveState === 'unsaved')
+
+// ── 壳态互斥上报（T0-6b，A1 决策）──
+// 工作台壳态（首页虚拟标签，SPA 渲染）下浏览器壳与工作台不同时展示：
+// 上报主进程隐藏全部内嵌 WebContentsView；切回浏览器壳时恢复。
+// 上报失败静默（非 Electron 环境/主进程未就绪时不影响渲染层）。
+watch(isHomeTab, (home) => {
+  // 内嵌主页实例是浏览器标签（WebContentsView），上报 workbench 壳态会让主进程
+  // 隐藏包括它自己在内的全部视图；壳态互斥仅由主窗口的 home 虚拟标签驱动。
+  if (isHomeShell) return
+  invokePageManager('setShellMode', home ? 'workbench' : 'browser')
+}, { immediate: true })
+
+// ── NavBar 左右箭头可用性（2026-09-15 修复）──
+// home 标签是虚拟标签（无 WebContentsView），主进程对其 canGoBack/canGoForward
+// 恒为 false，导致 NavBar 左右箭头在所有 SPA 页面（均运行于 home 标签）永久禁用。
+// 修复：home 标签下以 vue-router 历史栈（useSpaNavHistory）为准；
+// 浏览器标签下仍用主进程上报的 WebContentsView 历史状态。
+const spaNav = useSpaNavHistory(router)
+const navCanGoBack = computed(() =>
+  isHomeTab.value ? spaNav.canGoBack.value : navigation.value.canGoBack
+)
+const navCanGoForward = computed(() =>
+  isHomeTab.value ? spaNav.canGoForward.value : navigation.value.canGoForward
+)
+
+async function onSaveAccount () {
+  if (savingAccount.value) return
+  savingAccount.value = true
+  try {
+    const tab = tabStore.activeTab
+    let result
+    if (tab?.isLogin === true) {
+      // 认证登录标签：走 auth-view-manager completeLogin（提取隔离视图凭证）
+      result = await accountActions.completeLogin('browser')
+    } else if (tab?.accountId != null) {
+      // 账号浏览器标签：提取该标签 session 分区凭证并回写加密凭证库
+      const api = (await import('@/api/electron-bridge')).getApi()
+      const saveResult = api?.pageManager?.saveAccountTabCredentials
+        ? await api.pageManager.saveAccountTabCredentials(tab.tabId)
+        : null
+      if (saveResult?.code === 0) {
+        result = { code: 0 }
+      } else {
+        const reason = saveResult?.message || saveResult?.data?.reason || ''
+        result = {
+          code: saveResult?.code ?? -1,
+          message: reason.includes('未检测到') || reason.includes('No login credentials')
+            ? t('accountsPage.saveAccountTabNoCredential')
+            : t('accountsPage.saveAccountTabFailed')
+        }
+      }
+    } else {
+      return
+    }
+    if (result?.code !== 0) {
+      ElMessage.error(formatUserError(result, { fallback: t('accounts.saveFailed') }).message)
+    } else {
+      ElMessage.success(t('accounts.saved'))
+    }
+  } catch (error) {
+    ElMessage.error(formatUserError(error, { fallback: t('accounts.saveFailed') }).message)
+  } finally {
+    savingAccount.value = false
+  }
+}
+
+const showSettingsDialog = ref(false)
+// 「就地打开设置」请求的目标 Tab（由 requestSettingsDialog 写入，SettingsDialog 在打开时消费）
+const settingsDialogInitialTab = ref('')
+let unsubscribeNavigate = null
+// 内嵌主页实例订阅「共享左侧边栏」下发的导航指令（方案 B：点菜单驱动当前聚焦标签）
+let unsubscribeHomeShellNav = null
+// ── 定时派发失败的全局提示（2026-10-09，App 级监听提升）────────────────
+// 定时任务到点后入队失败时，主进程 scheduler.onDispatchFailed 会向主窗口广播
+// scheduler:dispatch-failed。此前渲染端只有「发布日历」页在监听：用户排完期去了
+// 别的页面，拒收发生时就收不到任何提示，失败只静静躺在发布历史里（hint 文案
+// 「失败原因会记录在发布记录中」本质是在承认这一点）。监听提升到壳层后，
+// 任何页面收到信号都立即弹错误 toast。
+// 双 toast 取舍（评审核验定案）：用户停留在日历页时会看到两条**不同文案**的
+// toast 并存（App 级兜底 vs 日历级重排指引）——useNotify 未开启 ElMessage
+// grouping、且两条文案刻意不同，**不存在合并去重**，属已接受取舍：日历页是
+// 排期管理语境，多一条含操作指引的提示反而准确。单实例前提：广播只发
+// getAllWindows()[0]（主窗口），home-shell（独立 WebContentsView）收不到，
+// 同一 renderer 内 App 只挂载一次（main.js createApp 单例），无双订阅。
+let unsubscribeDispatchFailed = null
+
+// 弹窗互斥（2026-09-23 Bug 修复）：浏览器/登录标签（外部网页 WebContentsView）活动时，
+// 原生图层永远压在渲染层 DOM 之上——设置弹窗打开后「屏幕闪一下但没出现」。
+// 弹窗打开即挂起全部内嵌视图，关闭后恢复；非 Electron 环境静默降级。
+watch(showSettingsDialog, (open) => {
+  if (open) suspendEmbeddedViewsForOverlay('settings-dialog')
+  else releaseEmbeddedViewsForOverlay('settings-dialog')
+})
+
+// 「就地打开设置」请求（2026-10-15）：页面（如采集页知乎区块）需要把用户直接送到
+// 某个具体 Tab——只说「去设置里配」而没有任何入口，是典型的死胡同文案。
+// 请求带 seq：同一个 Tab 被连续请求两次时对象身份仍会变化，watch 才会再次触发。
+watch(settingsDialogRequest, (req) => {
+  if (!req) return
+  settingsDialogInitialTab.value = req.tab
+  showSettingsDialog.value = true
+})
+
+// 关闭「设置」弹窗并通知依赖模型配置的视图刷新（如图片轮播的服务商/音色能力下拉），
+// 避免“新增模型后关闭弹窗仍看不到新模型”的陈旧状态（2026-08-12 Bug 修复）。
+function closeSettingsDialog () {
+  showSettingsDialog.value = false
+  notifySettingsDialogClosed()
+}
+
+// 全屏路由（脱离任何导航壳，独立整屏渲染）：首跑引导
+const isFullScreenRoute = computed(() => route.path === '/first-run')
+
+// ── 标签页操作 ──
+
+function onSwitchTab(tabId) {
+  tabStore.switchToTab(tabId)
+}
+
+async function onCloseTab(tabId) {
+  // 方案二（护栏）：关闭尚未保存凭证的账号标签前弹三选一确认，杜绝静默丢失登录态。
+  const state = await tabStore.getAccountTabSaveState(tabId)
+  if (state && state.isAccountTab && state.credentialSaveState === 'unsaved') {
+    let action
+    // 三选一确认框同为渲染层居中模态，打开前挂起内嵌视图，结束后释放（弹窗互斥，2026-09-23）
+    try {
+      await suspendEmbeddedViewsForOverlay('tab-close-confirm')
+      await ElMessageBox.confirm(
+        t('tabBar.closeUnsavedMessage'),
+        t('tabBar.closeUnsavedTitle'),
+        {
+          type: 'warning',
+          confirmButtonText: t('tabBar.closeUnsavedSaveAndClose'),
+          cancelButtonText: t('tabBar.closeUnsavedDiscard'),
+          closeButtonText: t('tabBar.closeUnsavedCancel'),
+          showClose: true,
+          distinguishCancelAndClose: true,
+        }
+      )
+      action = 'save'
+    } catch (err) {
+      // cancel → 直接关闭（cancelButtonText）；close/× → 取消，留在页面
+      if (err === 'cancel') action = 'discard'
+      else return
+    } finally {
+      await releaseEmbeddedViewsForOverlay('tab-close-confirm')
+    }
+    if (action === 'save') {
+      try {
+        const api = getApi()
+        const res = api?.pageManager?.saveAccountTabCredentials ? await api.pageManager.saveAccountTabCredentials(tabId) : null
+        if (!res || res.code !== 0) ElMessage.warning(t('tabBar.closeUnsavedDiscardedWarn'))
+      } catch (e) {
+        ElMessage.warning(t('tabBar.closeUnsavedDiscardedWarn'))
+      }
+      await tabStore.closeTab(tabId)
+    } else if (action === 'discard') {
+      await tabStore.closeTab(tabId)
+    }
+    return
+  }
+  tabStore.closeTab(tabId)
+}
+
+  async function onCreateTab() {
+    // 「+」新标签：内容为应用主页的独立 SPA 实例，与首页固化标签完全解耦（F1/F2）。
+    // 2026-10-03 Bug 修复：不再传 title——传 title 会置主进程 titleLocked=true，
+    // page-title-updated 从此被忽略，标签标题永远停在「新标签页」。
+    // 初始标题由主进程回退值（'新标签页'，与 tabs.newTabTitle 同语义）承担；
+    // 后续标题跟随 home-shell SPA 上报的 document.title（见 useTabDocumentTitle）。
+    await tabStore.createTab({ homeShell: true })
+  }
+
+  function onGoBack() {
+    if (isHomeTab.value) {
+      try { router.back() } catch (error) { console.warn('[tab] goBack failed', error) }
+      return
+    }
+    tabStore.goBack()
+  }
+
+  function onGoForward() {
+    if (isHomeTab.value) {
+      try { router.forward() } catch (error) { console.warn('[tab] goForward failed', error) }
+      return
+    }
+    tabStore.goForward()
+  }
+
+// 返回主页：切回首页标签 + 确保 SPA 路由回到首页。
+// 原实现仅 switchToTab('home')：当用户已在首页标签时为 no-op（点击无效）；
+// 且从浏览器标签返回时未恢复首页路由。现统一「切标签 + 路由归位」两步。
+async function goHome () {
+  const homeTab = tabStore.tabs.find(t => t.isHome)
+  if (homeTab && activeTabId.value !== homeTab.tabId) {
+    try { await tabStore.switchToTab(homeTab.tabId) } catch (error) { console.warn('[tab] switch home failed', error) }
+  }
+  if (route.path !== '/') {
+    try { router.push('/') } catch (error) { console.warn('[tab] goHome push failed', error) }
+  }
+}
+
+function onNavigate(query) {
+  tabStore.searchOrNavigate(query)
+}
+
+// ── 路由错误恢复 ──
+
+async function retryRouteLoad() {
+  const failedPath = routeLoadError.value?.path || router.currentRoute.value.fullPath
+  clearRouteLoadError()
+  try {
+    await router.replace(failedPath)
+  } catch (error) {
+    routeLoadError.value = {
+      title: t('common.pageLoadFailed'),
+      message: t('common.pageLoadFailedMessage'),
+      details: error?.stack || error?.message || '',
+      path: failedPath,
+    }
+  }
+}
+
+function refreshRouteLoad() {
+  window.location.reload()
+}
+
+// ── 生命周期 ──
+
+onMounted(() => {
+  licenseStore.load()
+  identityStore.load()
+  // home-shell 实例：启动页面标题同步（路由 → document.title → 主进程标签标题）
+  if (tabTitleReporter) tabTitleReporter.start()
+  // 内嵌主页实例跳过标签系统初始化与订阅（S4 广播风暴防护）：
+  // 它是被标签系统管理的对象，而非管理者，不订阅 tab 事件、不驱动壳态互斥。
+  if (!isHomeShell) {
+    tabStore.init()
+  }
+  spaNav.attach()
+
+  const api = getApi()
+  if (api && api.onNavigate && !isHomeShell) {
+    unsubscribeNavigate = api.onNavigate((route) => {
+      router.push(route)
+    })
+  }
+  // 内嵌主页实例：接收主进程定向投递的侧边栏导航指令，在本实例自身 router 内跳转。
+  // hash 路由导航走 did-navigate-in-page（search 含 mp-home-shell=1 不变），不会触发壳态自然结束。
+  if (isHomeShell && api && api.pageManager && typeof api.pageManager.on === 'function') {
+    unsubscribeHomeShellNav = api.pageManager.on('home-shell-navigate', (payload) => {
+      const path = payload && payload.path
+      if (typeof path === 'string' && path.charAt(0) === '/') {
+        try { router.push(path) } catch (error) { console.warn('[home-shell] navigate failed', error) }
+      }
+    })
+  }
+
+  // 定时派发失败 → 全局错误 toast（App 级监听提升，2026-10-09）。
+  // preload 未暴露该能力（老版本兼容）时静默跳过，绝不影响壳层挂载。
+  // fallback 边界（Gate 7 × 评审 MINOR 的交集定案）：渲染端 .vue 禁止新增
+  // 中文字面量（locale CJK 基线扫描），所以 fallback 不能用中文硬编码；而
+  // t(同 key) 死循环兜底零价值（缺 key 时返回 key 本身）。定案：fallback 用
+  // 「平台名 + 原因」拼接的跨语言安全串——两个字段都来自平台原始报文，任何
+  // locale 下都可读，且不含会被 CJK 基线拦截的新增字面量。
+  if (api && typeof api.onSchedulerDispatchFailed === 'function') {
+    unsubscribeDispatchFailed = api.onSchedulerDispatchFailed((failure) => {
+      const { platform = '', reason = '' } = failure || {}
+      notifyError('appShell.scheduleDispatchFailed', {
+        fallback: (platform + ' ' + reason).trim(),
+        params: { platform, reason },
+      })
+    })
+  }
+})
+
+onBeforeUnmount(() => {
+  if (tabTitleReporter) tabTitleReporter.stop()
+  spaNav.dispose()
+  if (typeof unsubscribeNavigate === 'function') unsubscribeNavigate()
+  unsubscribeNavigate = null
+  if (typeof unsubscribeHomeShellNav === 'function') unsubscribeHomeShellNav()
+  unsubscribeHomeShellNav = null
+  if (typeof unsubscribeDispatchFailed === 'function') unsubscribeDispatchFailed()
+  unsubscribeDispatchFailed = null
+  if (!isHomeShell) tabStore.dispose()
+  identityStore.dispose()
+})
+</script>
+
+<style>
+body { margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+#app { height: 100%; }
+.app-root { height: 100%; display: flex; flex-direction: column; }
+.mp-shell { min-height: 0; flex: 1; display: flex; min-width: 0; overflow: hidden; background: var(--color-bg-inset); }
+.mp-shell-main { min-width: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+/* 壳态收敛 6a 修订：首页标签现渲染只读 NavBar（40px），不再需要空白占位行；
+   TabBar(36px) + NavBar(40px) = 主进程 WebContentsView TOP=76px 契约不变。 */
+/* 内嵌主页壳态根容器：无外层 chrome，模块导航 + 内容区纵向铺满 */
+.mp-home-shell-root { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--color-bg-inset); }
+.mp-workspace { min-width: 0; min-height: 0; flex: 1; overflow: auto; }
+.fullscreen-main { min-height: 0; flex: 1; overflow: auto; }
+</style>

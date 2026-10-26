@@ -1,0 +1,206 @@
+// @ts-check
+/**
+ * zhihu-favlist IPC handlers 回归测试
+ *
+ * 覆盖：list/contents 通道、batch-collect/batch-rewrite 编排（频率控制器接线）、
+ * cancel 通道、参数校验、并发防护（同类型任务互斥）。
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const registerHandlers = require("./zhihu-favlist");
+
+// 传输层桩。`zhihu-favlist-service.js:33 _getAxios()` 是惰性 `require('axios')`，
+// 而 handler 内部 `new ZhihuFavlistService({ log })` 不接受 axios 注入（缺陷 H 登记），
+// 所以只能靠 test-setup 的 __registerMock('axios', ...) 在 Module._load 层拦下。
+// 未注册前，本文件的 list 用例会走真出站 —— 那正是缺陷 G 的确证案例。
+const axiosStub = { get: vi.fn(), post: vi.fn() };
+// 本文件全程零真出站：注册在模块作用域，早于任何 handler 调用；
+// test-setup 的 Module._load 拦截会在 `require('axios')` 处返回上面的桩。
+global.__registerMock("axios", axiosStub);
+
+function makeDeps (overrides = {}) {
+  const handlers = {};
+  const ipcMain = { handle: (ch, fn) => { handlers[ch] = fn } };
+  const store = { getSetting: vi.fn(() => "test-secret") };
+  const urlCollector = { collect: vi.fn(async () => ({ success: true, title: "T" })) };
+  const pythonBridge = { requestBackend: vi.fn(async () => ({ result_content: "改写结果" })) };
+  const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), notify: vi.fn() };
+  // 快速控制器：跳过真实延迟（否则 8s 条间延迟会让测试超时）
+  const BatchRateController = require("../services/batch-rate-controller");
+  const rateControllerFactory = (opts) => new BatchRateController({ sleepFn: async () => {}, baseIntervalMs: 1, jitterMs: 0, ...opts });
+  return { ipcMain, handlers, deps: { store, urlCollector, pythonBridge, log, rateControllerFactory, ...overrides } };
+}
+
+describe("zhihu-favlist IPC handlers", () => {
+  let handlers;
+  let deps;
+
+  beforeEach(() => {
+    axiosStub.get.mockReset();
+    axiosStub.post.mockReset();
+    const ctx = makeDeps();
+    handlers = ctx.handlers;
+    deps = ctx.deps;
+    registerHandlers(ctx.ipcMain, ctx.deps);
+  });
+
+  it("注册 5 个通道", () => {
+    expect(handlers["zhihu-favlist:list"]).toBeTypeOf("function");
+    expect(handlers["zhihu-favlist:contents"]).toBeTypeOf("function");
+    expect(handlers["zhihu-favlist:batch-collect"]).toBeTypeOf("function");
+    expect(handlers["zhihu-favlist:batch-rewrite"]).toBeTypeOf("function");
+    expect(handlers["zhihu-favlist:cancel"]).toBeTypeOf("function");
+  });
+
+  it("list 成功 → code 0 + favlists 字段映射", async () => {
+    axiosStub.get.mockResolvedValueOnce({
+      data: {
+        Code: 0,
+        Data: {
+          Items: [
+            { UrlToken: "abc", Title: "收藏A", Description: "d", IsPublic: true, Url: "https://www.zhihu.com/collection/abc" },
+            { UrlToken: null, Title: "无 token 应被过滤" },
+          ],
+        },
+      },
+    });
+    const r = await handlers["zhihu-favlist:list"](null, {});
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual([
+      { urlToken: "abc", title: "收藏A", description: "d", isPublic: true, url: "https://www.zhihu.com/collection/abc" },
+    ]);
+    // 请求确实经过桩（而不是又去真出网）：URL 与认证头都由服务层构造，这里核对端点与 Bearer
+    expect(axiosStub.get).toHaveBeenCalledTimes(1);
+    const [url, config] = axiosStub.get.mock.calls[0];
+    expect(url).toBe("https://developer.zhihu.com/api/v1/user/favlists");
+    expect(config.headers.Authorization).toBe("Bearer test-secret");
+  });
+
+  it("list 网络失败 → code -1 且文案为「网络连接失败」，不外泄堆栈", async () => {
+    axiosStub.get.mockRejectedValueOnce(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
+    const r = await handlers["zhihu-favlist:list"](null, {});
+    expect(r.code).toBe(-1);
+    expect(r.message).toContain("网络连接失败");
+    expect(r.message).toContain("socket hang up");
+  });
+
+  it("list 未配置 Secret → code -1，且一次都不出站", async () => {
+    deps.store.getSetting.mockReturnValueOnce("");
+    const r = await handlers["zhihu-favlist:list"](null, {});
+    expect(r.code).toBe(-1);
+    expect(r.message).toBe("未配置知乎 Access Secret");
+    expect(axiosStub.get).not.toHaveBeenCalled();
+  });
+
+  it("contents 缺参数 → code -2", async () => {
+    const r = await handlers["zhihu-favlist:contents"](null, null);
+    expect(r.code).toBe(-2);
+  });
+
+  it("batch-collect 缺 URL 列表 → code -2", async () => {
+    const r = await handlers["zhihu-favlist:batch-collect"](null, {});
+    expect(r.code).toBe(-2);
+  });
+
+  it("batch-collect 成功 → 逐条调 urlCollector.collect + 统计", async () => {
+    const r = await handlers["zhihu-favlist:batch-collect"](null, { urls: ["https://a.com/1", "https://a.com/2"] });
+    expect(r.code).toBe(0);
+    expect(r.data.completed).toBe(2);
+    expect(deps.urlCollector.collect).toHaveBeenCalledTimes(2);
+  });
+
+  it("batch-rewrite 缺内容列表 → code -2", async () => {
+    const r = await handlers["zhihu-favlist:batch-rewrite"](null, {});
+    expect(r.code).toBe(-2);
+  });
+
+  it("batch-rewrite 成功 → 逐条调 pythonBridge + 统计", async () => {
+    const r = await handlers["zhihu-favlist:batch-rewrite"](null, {
+      contents: [{ content: "内容一".repeat(20) }, { content: "内容二".repeat(20) }],
+    });
+    expect(r.code).toBe(0);
+    expect(r.data.completed).toBe(2);
+    expect(deps.pythonBridge.requestBackend).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancel 无进行中任务 → data: false", async () => {
+    const r = await handlers["zhihu-favlist:cancel"](null, { type: "collect" });
+    expect(r.code).toBe(0);
+    expect(r.data).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 密钥解析：从「全局明文」升级为「本用户 safeStorage 密文 + 旧版兼容」
+// 采集链读密钥必须与设置页写密钥走**同一个实现**（services/zhihu-credential），
+// 否则会出现「设置页说已配置、采集说未配置」的双口径争议。
+// ─────────────────────────────────────────────────────────────────────
+describe("zhihu-favlist 密钥解析（与设置页同一真源）", () => {
+  const credential = require("../services/zhihu-credential");
+  const cryptoMod = require("../services/crypto");
+
+  function createMockSafeStorage () {
+    const vault = new Map();
+    let n = 0;
+    return {
+      isEncryptionAvailable: () => true,
+      encryptString: (s) => { const k = `enc_${n++}`; vault.set(k, s); return Buffer.from(k, "utf-8"); },
+      decryptString: (buf) => vault.get(buf.toString("utf-8")) || "",
+    };
+  }
+
+  /** 用户域 + 全局域双作用域 store（对齐 settings-store.js 的两个作用域） */
+  function makeScopedStore () {
+    const user = {};
+    const global = {};
+    return {
+      getUserSetting: (k, def = null) => (k in user ? user[k] : def),
+      setUserSetting: (k, v) => { user[k] = v; },
+      getSetting: (k, def = null) => (k in global ? global[k] : def),
+      setSetting: (k, v) => { global[k] = v; },
+      _user: () => user,
+      _global: () => global,
+    };
+  }
+
+  function registerWith (store) {
+    const handlers = {};
+    const ipcMain = { handle: (ch, fn) => { handlers[ch] = fn; } };
+    registerHandlers(ipcMain, {
+      store,
+      urlCollector: { collect: vi.fn() },
+      pythonBridge: { requestBackend: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), notify: vi.fn() },
+    });
+    return handlers;
+  }
+
+  it("用户域加密配置 → 解密后出站（Bearer 为明文配置值）", async () => {
+    cryptoMod.setSafeStorage(createMockSafeStorage());
+    const store = makeScopedStore();
+    const saved = credential.saveConfig(store, "config-secret-abcdef", { crypto: cryptoMod });
+    expect(saved.ok).toBe(true);
+
+    axiosStub.get.mockReset();
+    axiosStub.get.mockResolvedValueOnce({ data: { Code: 0, Data: { Items: [] } } });
+    const handlers = registerWith(store);
+    const r = await handlers["zhihu-favlist:list"](null, {});
+    expect(r.code).toBe(0);
+    expect(axiosStub.get.mock.calls[0][1].headers.Authorization).toBe("Bearer config-secret-abcdef");
+    cryptoMod.setSafeStorage(null);
+  });
+
+  it("加密配置解不开但有旧版明文 → 回落旧明文（可用性优先，不把用户锁死）", async () => {
+    const store = makeScopedStore();
+    // 手工塞一条无法解密的密文行（模拟换机/系统凭据保护不可用）
+    store.setUserSetting("zhihu_api_config", { accessSecret: Buffer.from("garbage").toString("base64"), enabled: true });
+    store.setSetting("zhihu_access_secret", "legacy-fallback-secret");
+
+    axiosStub.get.mockReset();
+    axiosStub.get.mockResolvedValueOnce({ data: { Code: 0, Data: { Items: [] } } });
+    const handlers = registerWith(store);
+    const r = await handlers["zhihu-favlist:list"](null, {});
+    expect(r.code).toBe(0);
+    expect(axiosStub.get.mock.calls[0][1].headers.Authorization).toBe("Bearer legacy-fallback-secret");
+  });
+});

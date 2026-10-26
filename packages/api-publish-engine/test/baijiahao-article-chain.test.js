@@ -1,0 +1,241 @@
+/**
+ * baijiahao-article-chain.test.js — 百家号图文发布链契约（W1 §4.3 + §4.5，vitest 组）
+ *
+ * 仅对本机假 HTTP 服务器发请求（契约基建 §3.1），杜绝外发。
+ * 覆盖：baseToken→publishToken→(uploadproxy)→save/publish 逐字请求序列、
+ *       headers.token 传递白名单、私密优先走 save 端点、
+ *       §4.5 fail-closed：缺 cookie/UA、baseToken 提取失败 → 零请求。
+ */
+const { startFakeServer, methodPathList } = require("./helpers/fake-http");
+const { createHttpClient } = require("../src/publish/core/http-base");
+const { BaijiahaoArticleChain, BaijiahaoArticleError, truncateTitle, TITLE_MAX_BYTES } = require("../src/publish/platforms/baijiahao-article");
+
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+function makeChain (srv, extra) {
+  const http = createHttpClient({ baseURL: srv.url, timeout: 5000 });
+  return new BaijiahaoArticleChain(Object.assign({ http, baseUrl: srv.url, userAgent: UA, cookie: "BAIDUID=abc; BIDUP=1" }, extra || {}));
+}
+
+function draftRoutes () {
+  return [
+    { method: "GET", match: /source=inner/, raw: true, body: '<html><script>var BJH__INIT__AUTH__ = "BASE_TOK";</script></html>' },
+    { method: "GET", match: /\/pcui\/article\/edit/, headers: { token: "PUB_TOK" }, body: { status: 0 } },
+    { method: "POST", match: /\/pcui\/article\/save/, body: { errno: 0, ret: { id: "DRAFT_9" } } },
+    { method: "POST", match: /\/pcui\/article\/publish/, body: { errno: 0, ret: { id: "PUB_1" } } },
+  ];
+}
+
+describe("publish/platforms/baijiahao-article", function () {
+  test("私密优先：草稿链走 save?callback=bjhdraft，token 逐级传递", async function () {
+    const srv = await startFakeServer(draftRoutes());
+    try {
+      const chain = makeChain(srv);
+      const result = await chain.run({ title: "测试标题", content: "<p>正文内容</p>" }, { draft: true });
+      expect(result.success).toBe(true);
+      expect(result.draft).toBe(true);
+      expect(result.publishId).toBe("DRAFT_9");
+      expect(result.platform).toBe("baijiahao");
+      const seq = methodPathList(srv.requests);
+      expect(seq).toEqual(["GET /", "GET /pcui/article/edit", "POST /pcui/article/save"]);
+      // edit 请求带 baseToken，save 请求带 publishToken
+      const editReq = srv.requestsFor(/\/pcui\/article\/edit/)[0];
+      expect(editReq.headers.token).toBe("BASE_TOK");
+      const saveReq = srv.requestsFor(/\/pcui\/article\/save/)[0];
+      expect(saveReq.headers.token).toBe("PUB_TOK");
+      expect(saveReq.url).toContain("callback=bjhdraft");
+      const body = saveReq.rawBody.toString("utf8");
+      expect(body).toContain("title=");
+      expect(body).toContain("content=");
+      expect(body).toContain("type=news");
+    } finally { await srv.close(); }
+  });
+
+  test("正式发布链走 publish?type=news&callback=bjhpublish", async function () {
+    const srv = await startFakeServer(draftRoutes());
+    try {
+      const chain = makeChain(srv);
+      const result = await chain.run({ title: "T", content: "C" }, { draft: false });
+      expect(result.success).toBe(true);
+      expect(result.draft).toBe(false);
+      expect(result.publishId).toBe("PUB_1");
+      const pub = srv.requestsFor(/\/pcui\/article\/publish/)[0];
+      expect(pub).toBeTruthy();
+      expect(pub.url).toContain("type=news");
+      expect(pub.url).toContain("callback=bjhpublish");
+      expect(srv.requestsFor(/\/pcui\/article\/save/).length).toBe(0);
+    } finally { await srv.close(); }
+  });
+
+  test("headers 白名单：UA/Cookie 透传，无远程签名通道残留", async function () {
+    const srv = await startFakeServer(draftRoutes());
+    try {
+      const chain = makeChain(srv);
+      await chain.run({ title: "T", content: "C" }, { draft: true });
+      const saveReq = srv.requestsFor(/\/pcui\/article\/save/)[0];
+      expect(saveReq.headers["user-agent"]).toBe(UA);
+      expect(saveReq.headers.cookie).toContain("BAIDUID=abc");
+      // 逐字请求全部落在本机假服务器（无第三方域名外发）：仅预期的三段本地路径序列
+      expect(methodPathList(srv.requests)).toEqual(["GET /", "GET /pcui/article/edit", "POST /pcui/article/save"]);
+    } finally { await srv.close(); }
+  });
+
+  test("§4.5 fail-closed：缺 cookie → 抛错且零请求", async function () {
+    const srv = await startFakeServer(draftRoutes());
+    try {
+      const chain = makeChain(srv, { cookie: "" });
+      await expect(chain.run({ title: "T", content: "C" }, { draft: true })).rejects.toThrow(BaijiahaoArticleError);
+      expect(srv.requests.length).toBe(0);
+    } finally { await srv.close(); }
+  });
+
+  test("§4.5 fail-closed：缺 User-Agent → 抛错且零请求", async function () {
+    const srv = await startFakeServer(draftRoutes());
+    try {
+      const chain = makeChain(srv, { userAgent: "" });
+      await expect(chain.run({ title: "T", content: "C" }, { draft: true })).rejects.toThrow(BaijiahaoArticleError);
+      expect(srv.requests.length).toBe(0);
+    } finally { await srv.close(); }
+  });
+
+  test("§4.5 fail-closed：baseToken 提取失败 → 不发起任何写请求", async function () {
+    const srv = await startFakeServer([
+      { method: "GET", match: /source=inner/, raw: true, body: "<html>no token here</html>" },
+      { method: "GET", match: /\/pcui\/article\/edit/, headers: { token: "PUB_TOK" }, body: {} },
+      { method: "POST", match: /\/pcui\/article\/save/, body: { errno: 0 } },
+    ]);
+    try {
+      const chain = makeChain(srv);
+      await expect(chain.run({ title: "T", content: "C" }, { draft: true })).rejects.toThrow(/baseToken/);
+      // 仅发生一次读请求，绝不触达写端点
+      expect(methodPathList(srv.requests)).toEqual(["GET /"]);
+      expect(srv.requestsFor(/\/pcui\/article\/(save|publish)/).length).toBe(0);
+    } finally { await srv.close(); }
+  });
+
+  test("风控 10000015 返回可操作提示（不静默吞错）", async function () {
+    const srv = await startFakeServer([
+      { method: "GET", match: /source=inner/, raw: true, body: 'BJH__INIT__AUTH__ = "BASE_TOK"' },
+      { method: "GET", match: /\/pcui\/article\/edit/, headers: { token: "PUB_TOK" }, body: {} },
+      { method: "POST", match: /\/pcui\/article\/save/, body: { errno: 10000015, errmsg: "您所在网络环境异常，请完成验证", data: { hit_rule: "30天内注册的百家号作者弹码" } } },
+    ]);
+    try {
+      const chain = makeChain(srv);
+      const result = await chain.run({ title: "T", content: "C" }, { draft: true });
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(10000015);
+      expect(result.error).toContain("风控拦截");
+      expect(result.error).toContain("30天内注册的百家号作者弹码");
+      expect(result.error).toContain("请先在浏览器中登录百家号完成验证");
+    } finally { await srv.close(); }
+  });
+
+  test("truncateTitle 按 UTF-8 字节截断到 149 上限（不切多字节字符）", function () {
+    const t = truncateTitle("外".repeat(50));
+    expect(Array.from(t).length).toBe(49);
+    expect(Buffer.byteLength(t, "utf8")).toBeLessThanOrEqual(TITLE_MAX_BYTES);
+    expect(truncateTitle("短标题")).toBe("短标题");
+  });
+
+  test("AI 声明：buildArticleFormData 默认勾选 aigc_bjh_status is_checked=1", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const fd = chain.buildArticleFormData({ title: "T", content: "C" });
+    expect(fd).toContain("activity_list%5B0%5D%5Bid%5D=aigc_bjh_status");
+    expect(fd).toContain("activity_list%5B0%5D%5Bis_checked%5D=1");
+  });
+
+  test("AI 声明：aiGenerated=false → is_checked=0（人工创作如实取消）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const fd = chain.buildArticleFormData({ title: "T", content: "C", aiGenerated: false });
+    expect(fd).toContain("activity_list%5B0%5D%5Bid%5D=aigc_bjh_status");
+    expect(fd).toContain("activity_list%5B0%5D%5Bis_checked%5D=0");
+  });
+
+  // ---- 图文正文承载形态（publish-article-body-format，2026-10-12）----
+  // 事故：真机 11/11 篇百家号公开文章正文 0 个 <p>，且正文字节 == 源文去掉全部换行后
+  // 逐字节相等（`content` 是富文本编辑器的 HTML，传纯文本 ⇒ 换行被当可忽略空白，
+  // 整篇塌成一个文本节点）。下列用例把「表单 content 必须是 HTML 段落」钉死。
+  test("正文承载形态：多段纯文本 → 表单 content 为 HTML 段落（修「整篇一整段」）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const params = new URLSearchParams(chain.buildArticleFormData({
+      title: "T",
+      content: "凌晨两点，面包出炉。\n\n起初没人发现。\n\n后来评论区炸了。",
+      tags: [],
+    }));
+    expect(params.get("content")).toBe("<p>凌晨两点，面包出炉。</p><p>起初没人发现。</p><p>后来评论区炸了。</p>");
+  });
+
+  test("正文承载形态：单段纯文本同样包 <p>（与平台富文本编辑器同形态）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const params = new URLSearchParams(chain.buildArticleFormData({ title: "T", content: "只有一段" }));
+    expect(params.get("content")).toBe("<p>只有一段</p>");
+  });
+
+  test("正文承载形态：已是 HTML 的正文原样透传（幂等，不二次包装）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const params = new URLSearchParams(chain.buildArticleFormData({ title: "T", content: "<p>甲</p><p>乙</p>" }));
+    expect(params.get("content")).toBe("<p>甲</p><p>乙</p>");
+  });
+
+  test("正文承载形态：话题转换先于 HTML 包装（#话题# 不被段落标签影响边界判定）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const params = new URLSearchParams(chain.buildArticleFormData({
+      title: "T", content: "今天探店 #美食探店 太好吃了", tags: ["美食探店"],
+    }));
+    expect(params.get("content")).toBe("<p>今天探店 #美食探店# 太好吃了</p>");
+  });
+
+  // ---- P0-5 分类字段落位（PLAN-REUSE-ROLLOUT-2026-10-13）----
+  // 验收判据：分类 ID 出现在请求体的**正确字段位**。
+  // 改前 `params.set('category', String(taskData.category == null ? '未分类' : taskData.category))`
+  // 有洞：非 ID 的值（含中文分类名）会被**原样写进表单**，平台侧如何解释无从得知。
+  test("★ P0-5 分类落位：给平台侧 ID → 表单 category 就是该 ID（不是默认值）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    // 取一个**非默认**值，否则「采纳了传入值」与「用了兜底」不可区分
+    const params = new URLSearchParams(chain.buildArticleFormData({
+      title: "T", content: "C", category: "386",
+    }));
+    expect(params.get("category")).toBe("386");
+  });
+
+  test("★ P0-5 分类落位：数字型 ID 同样按字符串写入（表单字段恒为字符串）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const params = new URLSearchParams(chain.buildArticleFormData({
+      title: "T", content: "C", category: 386,
+    }));
+    expect(params.get("category")).toBe("386");
+  });
+
+  test("★ P0-5 分类落位：未提供 ⇒ 保留既有兜底「未分类」（行为与改前一致）", function () {
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    for (const v of [undefined, null, ""]) {
+      const params = new URLSearchParams(chain.buildArticleFormData({
+        title: "T", content: "C", category: v,
+      }));
+      expect(params.get("category")).toBe("未分类");
+    }
+  });
+
+  test("★ P0-5 分类守卫：给中文分类名 ⇒ **抛错**，绝不静默写成「未分类」", function () {
+    // 这是 P0-3 前半段守卫在**本平台链**上的契约锁：
+    // 静默兜底 = 用户以为按「教学」发了，实际发到「未分类」且不可察。
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    let caught = null;
+    try {
+      chain.buildArticleFormData({ title: "T", content: "C", category: "教学" });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught, "传中文分类名必须抛错").not.toBeNull();
+    expect(caught.code).toBe("CATEGORY_UNRESOLVED");
+  });
+
+  test("★ P0-5 分类守卫：数字 0 是合法 ID，不得被当成「未提供」", function () {
+    // `if (!raw)` 这类写法会把 0 误判成未提供 —— 与 res/category-resolver 的用例呼应
+    const chain = new BaijiahaoArticleChain({ userAgent: UA, cookie: "c" });
+    const params = new URLSearchParams(chain.buildArticleFormData({
+      title: "T", content: "C", category: 0,
+    }));
+    expect(params.get("category")).toBe("0");
+  });
+});

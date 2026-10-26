@@ -1,0 +1,627 @@
+// @ts-check
+/**
+ * useBatchPublish.js — 批量发布 composable（从 Publish.vue 拆分）
+ * 职责：batchMode/articles/batchProgress 状态 + 文章管理 + handleBatchPublish 流程
+ * （batchCreate + batchSchedule/batchExecute）+ Pro 权限检查；参数：article、licenseStore。
+ */
+import { ref, computed, watch, getCurrentScope, onScopeDispose } from 'vue'
+import { formatUserError } from '@/utils/user-facing-error'
+import { useLoginGate } from './useLoginGate'
+import { useNotify } from './useNotify'
+import { resolveNotifyText } from '@/utils/notifyCore'
+import {
+  batchCreate,
+  batchExecute,
+  batchSchedule,
+  batchCancel,
+  batchGet,
+  retryTask,
+  onBatchProgress,
+  offlineStatus,
+  offlineAddToCache,
+} from '@/api/publisher'
+import {
+  buildPublishTargets,
+  normalizeAccountIds,
+  normalizePublishFiles,
+  normalizePublishMentions,
+  normalizePublishStringList,
+  validatePlatformContent,
+  validatePublishMetadata,
+  validatePublishTargets,
+  validateScheduleEntries,
+} from '@/features/publish/publish-contract'
+import { convertBatchArticleItem } from '@/features/publish/platform-content-conversion'
+import { isMarkdownContent, normalizePlatformOverrides } from '@/features/publish/publish-overrides'
+import { resolveCoverFields } from '@/features/publish/publish-upload-file'
+import { attachRewriteLineage } from '@/utils/rewrite-lineage'
+import { usePublishProgressStore } from '@/stores/publishProgress'
+import { createBatchPublisher } from './runBatchPublish'
+
+let _keyCounter = 1
+
+function freshKey() {
+  return 'a_' + (_keyCounter++) + '_' + Date.now()
+}
+
+/**
+ * 计算「交接预置发布目标」应含哪些平台（纯函数，便于单测覆盖冷启动时序）。
+ *
+ * 真源是**账号目录**（`byPlatform`）而不是平台目录：账号决定「这个平台能不能发」，
+ * 平台目录只提供展示元数据（label/分组）。
+ *
+ * 为什么不能只读平台目录：渲染进程冷重载（URL 仍带 `?drafts=`、组件重新挂载）时
+ * 平台目录可能尚未就绪，只读目录会得到空集合 ⇒ 用户看到「内容已装载、但 0 个发布目标」
+ * 的批量区（不可用）；而账号目录在同一条 onMounted 路径上已被 `await loadAccounts()` 就绪。
+ *
+ * 目录就绪时与目录求交：账号数据里可能残留已下线平台的账号，预置不该把它带进来。
+ *
+ * @param {Record<string, unknown>|null|undefined} byPlatform 账号目录（platformId → 账号数组/账号）
+ * @param {Iterable<string>|null|undefined} catalogIds 平台目录里的平台 id（空集合 = 目录未就绪）
+ * @returns {string[]} 预置平台 id
+ */
+export function selectHandoffPresetPlatforms(byPlatform, catalogIds) {
+  const map = byPlatform && typeof byPlatform === 'object' ? byPlatform : {}
+  const withAccounts = Object.keys(map).filter(platformId => (
+    Array.isArray(map[platformId]) ? map[platformId].length > 0 : Boolean(map[platformId])
+  ))
+  const known = catalogIds ? new Set(Array.from(catalogIds).filter(id => typeof id === 'string' && id.trim())) : new Set()
+  // 目录未就绪（已知集合为空）时不做求交——否则冷重载会预置出空目标
+  return known.size > 0 ? withAccounts.filter(id => known.has(id)) : withAccounts
+}
+
+function toPlainJson(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+const DEFAULT_BATCH_STATUS_POLL_INTERVAL_MS = 5000
+const DEFAULT_BATCH_STATUS_POLL_MAX_ATTEMPTS = 180
+
+function positiveInteger(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback
+}
+
+/**
+ * 批量发布 composable
+ * @param {object} options
+ * @param {object} options.article - 单篇模式 reactive article
+ * @param {object} options.licenseStore - { isPro: boolean }
+ * @returns {object} 响应式状态 + 方法
+ */
+export function useBatchPublish(options) {
+  const article = options.article
+  const licenseStore = options.licenseStore
+  const isAccountAvailable = typeof options.isAccountAvailable === 'function'
+    ? options.isAccountAvailable
+    : null
+  const batchStatusPollIntervalMs = positiveInteger(
+    options.batchStatusPollIntervalMs,
+    DEFAULT_BATCH_STATUS_POLL_INTERVAL_MS,
+  )
+  const batchStatusPollMaxAttempts = positiveInteger(
+    options.batchStatusPollMaxAttempts,
+    DEFAULT_BATCH_STATUS_POLL_MAX_ATTEMPTS,
+  )
+  // publish-progress-ux：全局进度 store（会话登记；进度事件由 App 级订阅接收）
+  const publishProgressStore = usePublishProgressStore()
+  // 主动操作登录门：批量发布前未登录 → 弹登录引导，登录成功后继续
+  const { ensureLogin } = useLoginGate()
+  // 统一通知通道（D1 决策）：toast/确认框走 useNotify，进度条文案走 resolveNotifyText
+  const { notify, notifyError, notifySuccess, notifyWarning, notifyConfirm } = useNotify()
+
+  // 进度条文案解析（非 toast，组件内展示；M6 路径：文案统一进 locales）
+  function progressText (messageKey, params, fallback) {
+    const { text, resolved } = resolveNotifyText(messageKey, params)
+    return resolved ? text : (fallback || '')
+  }
+
+  const batchMode = ref(false)
+  const batchPublishing = ref(false)
+  const precheckEnabled = ref(false)
+  const articles = ref([])
+  const batchProgress = ref([])
+  const failedBatchTasks = ref([])
+  const retryingFailed = ref(false)
+  // 当前会话已排期成功的批次 id：非 null 时页面显示「取消排期」入口
+  // （与单篇的日历取消入口对齐——排期后必须能取消，否则用户只能干等到点）。
+  const scheduledBatchId = ref(null)
+  const templateTargetIdx = ref(-1)
+  const showTemplatePicker = ref(false)
+  // 进度订阅句柄与轮询定时器：提交编排（runBatchPublish.js）负责写入，
+  // 本文件的 clearBatchTracking / onScopeDispose 负责清理。
+  // 用**可变对象**而非两个闭包变量传递——拆文件后读写必须落在同一份状态上；
+  // 若各自声明 let，两边会各自为政，清理函数永远清不到编排侧留下的句柄。
+  const progressHandles = { stop: null, timer: null }
+
+  function clearBatchStatusPollTimer() {
+    if (progressHandles.timer !== null) {
+      clearTimeout(progressHandles.timer)
+      progressHandles.timer = null
+    }
+  }
+
+  function clearBatchProgressListener() {
+    if (typeof progressHandles.stop === 'function') {
+      const stop = progressHandles.stop
+      progressHandles.stop = null
+      stop()
+    }
+  }
+
+  function clearBatchTracking() {
+    clearBatchStatusPollTimer()
+    clearBatchProgressListener()
+  }
+
+  if (getCurrentScope()) {
+    onScopeDispose(clearBatchTracking)
+  }
+
+  const batchDone = computed(function () {
+    return batchProgress.value.filter(function (p) { return p.type === 'success' }).length
+  })
+
+  const batchFail = computed(function () {
+    return batchProgress.value.filter(function (p) { return p.type === 'danger' }).length
+  })
+
+  const totalPlatformTasks = computed(function () {
+    return articles.value.reduce(function (s, a) {
+      return s + buildPublishTargets(a.platforms || [], a.accounts || a.selectedAccounts || {}).length
+    }, 0)
+  })
+
+  function getArticleTargets (articleItem) {
+    const normalized = buildPublishTargets(
+      articleItem.platforms || [],
+      articleItem.accounts || articleItem.selectedAccounts || {},
+    )
+    const hasExplicitAccount = normalized.some(target => target.accountId)
+    // 新版发布路径始终发送结构化账号目标；旧调用未接入账号目录时保留兼容格式。
+    if (isAccountAvailable) return normalized
+    return hasExplicitAccount ? normalized : (articleItem.platforms || []).slice()
+  }
+
+  function checkBatchAccess() {
+    if (batchMode.value && licenseStore && !licenseStore.isPro) {
+      batchMode.value = false
+    }
+  }
+
+  /**
+   * 构造单篇文章的批量提交负载。
+   * **单一实现**：在线提交（batchCreate）与离线缓存（offlineAddToCache）必须共用同一份
+   * 构造——两份必然漂移，漂移表现为「离线缓存重放出去的文章字段与用户确认时看到的不一致」。
+   * **P2-7 与单篇同口径**：键集与条件挂载规则必须与 usePublishFlow.buildArticleData 一致
+   * （回归锁见 useBatchPublish.test.js「P2-7 与单篇键集 parity」；历史缺陷详录见该测试）。
+   */
+  function buildBatchArticlePayload (a) {
+    const imageFiles = normalizePublishFiles(a.image_files || a.images)
+    // 封面三键的互斥口径由共享实现持有（单篇同一条），本地封面不得被残留 URL 遮蔽
+    const cover = resolveCoverFields(a)
+    const tags = normalizePublishStringList(a.tagsText || a.tags)
+    const topics = normalizePublishStringList(a.topicsText || a.topics)
+    const mentions = normalizePublishMentions(a.mentionsText || a.mentions)
+    const data = {
+      title: a.title,
+      content: a.content,
+      // Markdown 判定复用单篇同一函数：两份判定必然漂移，漂移表现为平台侧按错误格式渲染
+      contentFormat: isMarkdownContent(a.content) ? 'markdown' : 'html',
+      platforms: getArticleTargets(a),
+      publishTime: a.publishTime || null,
+      precheck: precheckEnabled.value,
+      author: a.author || '',
+      cover_url: cover.cover_url,
+      video_path: a.video_path || '',
+      // P0-2：批量 payload 补 AI 声明，与单篇 buildArticleData 的 fail-safe 语义对齐
+      aiGenerated: a.aiGenerated !== false,
+      // P2-7：平台差异化内容经唯一归一实现（面板可编辑但发布不生效 = 装饰性字段）
+      platformOverrides: normalizePlatformOverrides(a.platformOverrides),
+    }
+    // P1-5 语义级可见性：只有非空档位才挂键，由主进程 resolver 按注册表映射
+    if (a.visibilitySemantic) data.visibilitySemantic = a.visibilitySemantic
+    attachRewriteLineage(data, a.rewriteHistoryId) // 归因链：与单篇同一条挂载规则（判据在 utils/rewrite-lineage）
+    if (imageFiles.length > 0) {
+      data.images = imageFiles.map(file => file.path)
+      data.image_files = imageFiles
+    }
+    if (cover.cover_path) data.cover_path = cover.cover_path
+    if (cover.cover_file) data.cover_file = cover.cover_file
+    if (tags.length > 0) data.tags = tags
+    if (topics.length > 0) data.topics = topics
+    if (mentions.length > 0) data.mentions = mentions
+    return data
+  }
+
+  /**
+   * 离线缓存的 targets 必须归一化为 `{ platform, accountId }` 对象数组。
+   * `getArticleTargets` 在未接入账号目录时返回**字符串数组**（`['wechat_mp']`），
+   * 而离线重放（offline-manager 的 expandCachedTask）只认带 platform 字段的对象——
+   * 直接复用会把缓存写成永远重放不了的畸形条目。
+   */
+  function buildCacheTargets (a) {
+    return buildPublishTargets(
+      a.platforms || [],
+      a.accounts || a.selectedAccounts || {},
+    ).map(function (target) {
+      return { platform: target.platform, accountId: target.accountId || null }
+    })
+  }
+
+  /**
+   * 条目级平台勾选切换（批量卡片 v-model 的替代：卡片是子组件，不得就地改 props）。
+   * 关闭平台时一并清掉该平台的账号选择，避免「平台未选、账号仍残留」在改回时静默生效。
+   */
+  function toggleBatchPlatform (articleItem, platformId) {
+    if (!Array.isArray(articleItem.platforms)) articleItem.platforms = []
+    const at = articleItem.platforms.indexOf(platformId)
+    if (at === -1) articleItem.platforms.push(platformId)
+    else {
+      articleItem.platforms.splice(at, 1)
+      if (articleItem.accounts && articleItem.accounts[platformId] !== undefined) delete articleItem.accounts[platformId]
+    }
+  }
+
+  function toggleBatchAccount (articleItem, platformId, accountId) {
+    if (!articleItem.accounts) articleItem.accounts = {}
+    const selected = Array.isArray(articleItem.accounts[platformId])
+      ? articleItem.accounts[platformId].slice()
+      : (articleItem.accounts[platformId] ? [articleItem.accounts[platformId]] : [])
+    const index = selected.indexOf(accountId)
+    if (index === -1) selected.push(accountId)
+    else selected.splice(index, 1)
+    articleItem.accounts[platformId] = selected
+  }
+
+  function isBatchAccountSelected (articleItem, platformId, accountId) {
+    const value = articleItem?.accounts?.[platformId]
+    return Array.isArray(value) ? value.includes(accountId) : value === accountId
+  }
+
+  function applyTemplate(data) {
+    if (batchMode.value && templateTargetIdx.value >= 0) {
+      const a = articles.value[templateTargetIdx.value]
+      if (a) {
+        a.title = data.title
+        a.content = data.content
+      }
+    } else {
+      article.title = data.title
+      article.content = data.content
+    }
+    showTemplatePicker.value = false
+  }
+
+  /**
+   * 批量条目工厂——**默认字段面的唯一真源**。
+   *
+   * `addArticle`（手动加一条）与 `seedArticlesFromDrafts`（热门选题批量交接）必须
+   * 共用同一份默认字段面：各写一份时，新增字段必然只改一处，表现为「装载进来的条目
+   * 少字段」，而缺字段要到 payload 构造期才暴露（P2-7 的 `cover_*` 正是这么漏的：
+   * 有读点、无写点，恒为空）。
+   */
+  function createArticleItem() {
+    return {
+      _key: freshKey(),
+      title: '',
+      content: '',
+      platforms: [],
+      accounts: {},
+      author: '',
+      cover_url: '',
+      cover_path: '',
+      cover_file: null,
+      video_path: '',
+      images: [],
+      image_files: [],
+      tags: [],
+      topics: [],
+      mentions: [],
+      // P0-2：批量模式补 AI 声明（与单篇默认勾选语义一致，仅显式 false 取消）
+      aiGenerated: true,
+      tagsText: '',
+      topicsText: '',
+      mentionsText: '',
+      publishTime: '',
+      // P2-7：条目级字段面。批量与单篇的语义差异在于「每篇内容各自不同」，
+      // 因此差异化内容与可见性档位必须逐条目持有，不得共享同一对象引用。
+      platformOverrides: {},
+      visibilitySemantic: '',
+    }
+  }
+
+  function addArticle() {
+    articles.value.push(createArticleItem())
+  }
+
+  /**
+   * 用草稿批量装载条目 —— 热门选题「改写完成 → 去发布」的批量交接。
+   *
+   * 只认「有 id 且是对象」的草稿：热门选题批量改写的产物就是 5 条这样的草稿，
+   * 缺 id 的条目无法回溯（用户要能回到草稿箱找到它），一律跳过而不是塞空条目——
+   * 塞空条目会让批量区出现「标题正文全空」的卡片，用户无法判断是装载失败还是内容为空。
+   *
+   * 就地替换 `articles`（多次交接以最后一次为准），返回实际装载条数：
+   * **0 表示一条都没装载**，调用方不得据此进入空批量态（必须如实提示并留在原地）。
+   *
+   * @param {unknown} draftList 草稿对象数组（来自 draftList IPC）
+   * @returns {number} 实际装载条数
+   */
+  function seedArticlesFromDrafts(draftList) {
+    const items = (Array.isArray(draftList) ? draftList : []).filter(draft => (
+      draft && typeof draft === 'object' && typeof draft.id === 'string' && draft.id.trim()
+    ))
+    if (items.length === 0) return 0
+    articles.value = items.map(draft => {
+      const item = createArticleItem()
+      item.title = typeof draft.title === 'string' ? draft.title : ''
+      item.content = typeof draft.content === 'string' ? draft.content : ''
+      // 标签/话题走共享归一（兼容逗号分隔字符串与 { name } 对象），与单篇同一口径
+      item.tags = normalizePublishStringList(draft.tags)
+      item.tagsText = item.tags.join(',')
+      item.topics = normalizePublishStringList(draft.topics)
+      item.topicsText = item.topics.join(',')
+      return item
+    })
+    return items.length
+  }
+
+  /**
+   * 把一组发布目标应用到**全部**条目（批量工具条「应用到全部条目」）。
+   *
+   * 为什么存在：批量模式下逐条目勾选是 O(条目 × 平台) 次点击——5 条选题 × 8 平台
+   * 就是 40 次勾选，而「多选题目的一次性分发」恰恰是热门选题批量改写的使用场景。
+   *
+   * 为什么账号必须一起写：`validatePublishTargets` 对「选了平台但没选账号」直接判
+   * 无效（`请为<平台>选择至少一个账号`），所以「只勾平台、不写账号」的批量应用等于
+   * 让整批提交必失败。无可用账号的平台由调用方过滤后再传入；这里对没有账号映射的
+   * 平台**刻意不写空数组**，保持 `accounts[platform]` 键缺失，让校验文案如实指向该平台。
+   *
+   * @param {{ platforms?: unknown, accounts?: Record<string, unknown> }} targets
+   * @returns {number} 被应用的条目数（0 = 未应用，调用方不得报「已应用」）
+   */
+  function applyTargetsToAll(targets) {
+    const platformIds = Array.isArray(targets && targets.platforms)
+      ? [...new Set(targets.platforms.filter(p => typeof p === 'string' && p.trim()))]
+      : []
+    if (platformIds.length === 0 || articles.value.length === 0) return 0
+    const accountMap = targets && targets.accounts && typeof targets.accounts === 'object'
+      ? targets.accounts
+      : {}
+    for (const item of articles.value) {
+      item.platforms = platformIds.slice()
+      item.accounts = {}
+      for (const platform of platformIds) {
+        const ids = normalizeAccountIds(accountMap[platform])
+        if (ids.length > 0) item.accounts[platform] = ids
+      }
+    }
+    return articles.value.length
+  }
+
+  /**
+   * P2-7 条目字段面 setter（逐条目作用域）。
+   *
+   * 为什么放在 composable 而不是组件里直接改 props 对象：字段写入点必须与 payload
+   * 构造点同侧，才能被同一条键集 parity 回归锁覆盖；组件侧写 props 会让「有 UI 写点」
+   * 与「进得了 payload」脱钩——那正是本切片修掉的原始形态（cover_* 有读点、无写点）。
+   */
+  function setBatchArticleCover (articleItem, descriptor) {
+    if (!articleItem) return false
+    if (!descriptor || !descriptor.path) return false
+    articleItem.cover_file = descriptor
+    articleItem.cover_path = descriptor.path
+    return true
+  }
+
+  /**
+   * 写「远程封面 URL」——与 setBatchArticleCover 成对存在的另一个封面写点。
+   *
+   * 只写 URL，不清本地封面：两者同时存在时 payload 侧由 resolveCoverFields 判「本地优先」，
+   * 用户若要改用 URL 必须显式点「清除封面」（那是个破坏性动作，不该由一次打字代做）。
+   * 界面靠 coverUrlOnlyHint 出声说明这一点，不靠静默覆盖。
+   */
+  function setBatchArticleCoverUrl (articleItem, value) {
+    if (!articleItem) return
+    articleItem.cover_url = typeof value === 'string' ? value : ''
+  }
+
+  function clearBatchArticleCover (articleItem) {
+    if (!articleItem) return
+    articleItem.cover_file = null
+    articleItem.cover_path = ''
+    articleItem.cover_url = ''
+  }
+
+  function setBatchArticleVisibility (articleItem, semantic) {
+    if (!articleItem) return
+    // 只接受注册表的三个语义档位与「清空」；非法值保持现状（不写脏值进 payload）
+    if (semantic === '' || semantic === null || ['public', 'friends', 'private'].includes(semantic)) {
+      articleItem.visibilitySemantic = semantic || ''
+    }
+  }
+
+  function setBatchArticleOverrides (articleItem, next) {
+    if (!articleItem) return
+    // 整体替换 + 脱壳：面板发出的是新对象，浅引用共享会让两条目互相污染
+    articleItem.platformOverrides = JSON.parse(JSON.stringify(next || {}))
+  }
+
+  function removeArticle(idx) {
+    if (idx >= 0 && idx < articles.value.length) {
+      articles.value.splice(idx, 1)
+    }
+  }
+
+  function duplicateArticle(idx) {
+    const orig = articles.value[idx]
+    if (!orig) return
+    articles.value.splice(idx + 1, 0, {
+      title: orig.title,
+      content: orig.content,
+      platforms: orig.platforms ? orig.platforms.slice() : [],
+      accounts: JSON.parse(JSON.stringify(orig.accounts || orig.selectedAccounts || {})),
+      author: orig.author || '',
+      cover_url: orig.cover_url || '',
+      cover_path: orig.cover_path || '',
+      cover_file: orig.cover_file || null,
+      video_path: orig.video_path || '',
+      images: orig.images ? orig.images.slice() : [],
+      image_files: orig.image_files ? JSON.parse(JSON.stringify(orig.image_files)) : [],
+      tags: orig.tags ? orig.tags.slice() : [],
+      topics: orig.topics ? orig.topics.slice() : [],
+      mentions: orig.mentions ? JSON.parse(JSON.stringify(orig.mentions)) : [],
+      aiGenerated: orig.aiGenerated !== false,
+      tagsText: orig.tagsText || '',
+      topicsText: orig.topicsText || '',
+      mentionsText: orig.mentionsText || '',
+      publishTime: '',
+      // P2-7：复制携带条目级字段面。platformOverrides 必须深拷贝——浅引用会让两条目
+      // 共享同一对象，改一条动两条（用户以为在调本篇的差异化内容）。
+      platformOverrides: JSON.parse(JSON.stringify(orig.platformOverrides || {})),
+      visibilitySemantic: orig.visibilitySemantic || '',
+      _key: freshKey(),
+    })
+    // 复制标题加后缀
+    articles.value[idx + 1].title = orig.title + progressText('publishPage.batchNotify.duplicateSuffix')
+  }
+
+  async function retryFailedBatch () {
+    if (retryingFailed.value || failedBatchTasks.value.length === 0) return
+    retryingFailed.value = true
+    const pending = failedBatchTasks.value.slice()
+    const remaining = []
+    let accepted = 0
+
+    try {
+      for (const task of pending) {
+        try {
+          const response = await retryTask(task.taskId)
+          if (!response || response.code !== 0) {
+            throw new Error(response?.message || '任务无法重试')
+          }
+          accepted += 1
+          batchProgress.value.push({
+            text: progressText('publishPage.batchNotify.progressRetrySubmitted', {
+              platform: task.platform,
+              title: task.title || task.taskId,
+            }),
+            time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            type: 'primary',
+          })
+        } catch (error) {
+          remaining.push(task)
+          batchProgress.value.push({
+            text: progressText('publishPage.batchNotify.progressRetryFailed', {
+              platform: task.platform,
+              title: task.title || task.taskId,
+              message: formatUserError(error, { fallback: progressText('publishPage.batchNotify.retryResubmitFailed') }).message,
+            }),
+            time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            type: 'danger',
+          })
+        }
+      }
+      failedBatchTasks.value = remaining
+      if (accepted > 0 && remaining.length === 0) {
+        notifySuccess('publishPage.batchNotify.retrySuccess', { params: { accepted } })
+      } else if (accepted > 0) {
+        notifyWarning('publishPage.batchNotify.retryPartial', { params: { accepted, remaining: remaining.length } })
+      } else {
+        notifyError('publishPage.batchNotify.retryFailed')
+      }
+    } finally {
+      retryingFailed.value = false
+    }
+  }
+
+  // 提交编排已移入 runBatchPublish.js（逐文件行数门禁拆分）；
+  // 依赖由本闭包注入同一批引用，行为与拆分前完全一致。
+  const handleBatchPublish = createBatchPublisher({
+    batchPublishing, articles, ensureLogin,
+    notifyWarning, notifyError, notifySuccess, notifyConfirm,
+    formatUserError, progressText,
+    isAccountAvailable, validatePublishTargets, validatePublishMetadata,
+    validatePlatformContent, validateScheduleEntries, buildPublishTargets,
+    convertBatchArticleItem,
+    offlineStatus, offlineAddToCache, buildCacheTargets, buildBatchArticlePayload,
+    toPlainJson, batchCreate, batchSchedule, batchExecute, batchGet, onBatchProgress,
+    clearBatchTracking, batchProgress, failedBatchTasks, scheduledBatchId,
+    publishProgressStore, totalPlatformTasks,
+    batchStatusPollMaxAttempts, batchStatusPollIntervalMs,
+    progressHandles,
+  })
+
+  // 批量模式切换时初始化
+  watch(batchMode, function (val) {
+    if (val && articles.value.length === 0) addArticle()
+  })
+
+  /**
+   * 取消当前会话已排期的批次（与单篇日历取消入口对齐）。
+   * 平台侧定时（2026-10-07）：排期已连同时间提交给平台，由平台到点发布；
+   * `batch:cancel` 只作废本地记录（平台无撤销接口，参考产品实测）。
+   * 结果以主进程返回为准，不由渲染层自标记；失败时**保留** scheduledBatchId 供重试。
+   */
+  async function cancelScheduledBatch () {
+    if (!scheduledBatchId.value) return
+    const batchId = scheduledBatchId.value
+    try {
+      const res = await batchCancel(batchId)
+      if (!res || res.code !== 0) {
+        const message = formatUserError(res, {
+          fallback: progressText('publishPage.batchNotify.cancelScheduleFailed'),
+        }).message
+        notifyError('publishPage.batchNotify.cancelScheduleFailed', { message })
+        return
+      }
+      scheduledBatchId.value = null
+      batchProgress.value.push({
+        text: progressText('publishPage.batchNotify.scheduleCancelled'),
+        time: new Date().toLocaleTimeString('zh-CN'),
+        type: 'warning',
+      })
+      notifySuccess('publishPage.batchNotify.scheduleCancelled')
+    } catch (error) {
+      const message = formatUserError(error, {
+        fallback: progressText('publishPage.batchNotify.cancelScheduleFailed'),
+      }).message
+      notifyError('publishPage.batchNotify.cancelScheduleFailed', { message })
+    }
+  }
+
+  return {
+    batchMode,
+    batchPublishing,
+    precheckEnabled,
+    articles,
+    batchProgress,
+    failedBatchTasks,
+    retryingFailed,
+    scheduledBatchId,
+    templateTargetIdx,
+    showTemplatePicker,
+    batchDone,
+    batchFail,
+    totalPlatformTasks,
+    addArticle,
+    seedArticlesFromDrafts,
+    applyTargetsToAll,
+    removeArticle,
+    duplicateArticle,
+    handleBatchPublish,
+    cancelScheduledBatch,
+    retryFailedBatch,
+    applyTemplate,
+    checkBatchAccess,
+    toggleBatchAccount,
+    toggleBatchPlatform,
+    isBatchAccountSelected,
+    // P2-7 批量条目字段面写入点
+    setBatchArticleCover,
+    setBatchArticleCoverUrl,
+    clearBatchArticleCover,
+    setBatchArticleVisibility,
+    setBatchArticleOverrides,
+  }
+}

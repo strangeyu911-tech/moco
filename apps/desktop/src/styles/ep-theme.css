@@ -1,0 +1,87 @@
+/*
+ * Element Plus 主题映射（T1-2，B1 决策：EP 主题化 + 业务按钮 UiButton 混合）
+ * 将 EP 组件变量桥接到 tokens.css 语义槽——EP 组件（el-button/el-tag/el-select 等）
+ * 的主色/圆角/字号与业务组件（cohere-* / UiButton）保持一致。
+ * 本文件必须在 element-plus/dist/index.css 与 tokens.css 之后导入。
+ */
+:root {
+  /* 主色桥接：EP 默认 #409eff → tokens --color-primary */
+  --el-color-primary: var(--color-primary);
+  /* --color-primary-dark-tint 只在 [data-theme="dark"] 定义，浅色必须兜底，
+   * 否则 var() 解析失败会让主按钮 hover/禁用态退化为透明底 + 白字（整体隐形）。 */
+  --el-color-primary-light-3: var(--color-primary-dark-tint, var(--color-primary-hover));
+  --el-color-primary-light-5: var(--color-primary-dark-tint, var(--color-primary-hover));
+  --el-color-primary-light-7: var(--color-primary-light);
+  --el-color-primary-light-8: var(--color-primary-light);
+  --el-color-primary-light-9: var(--color-primary-light);
+  --el-color-primary-dark-2: var(--color-primary-hover);
+
+  /* 语义色桥接 */
+  --el-color-success: var(--color-success);
+  --el-color-warning: var(--color-warning);
+  --el-color-danger: var(--color-danger);
+  --el-color-error: var(--color-danger);
+  --el-color-info: var(--color-text-secondary);
+  /* 语义色 light-9 浅底桥接（P4E 2026-10-09）：el-message/el-alert 的底色读
+   * --el-color-{error,danger,warning,success}-light-9，此前未映射 → 暗色下
+   * 弹层仍是 EP 默认亮奶油底（#fef0f0 系），配 tokens 提亮字 2.49:1。
+   * 亮色指向 --color-*-soft（值与 EP 默认一致，零亮色回归）；
+   * 暗色由 tokens.css [data-theme=dark] 的同槽覆盖接管（同色相深底）。 */
+  --el-color-error-light-9: var(--color-danger-soft);
+  --el-color-danger-light-9: var(--color-danger-soft);
+  --el-color-warning-light-9: var(--color-warning-soft);
+  --el-color-success-light-9: var(--color-success-soft);
+  --el-color-info-light-9: var(--color-info-soft);
+  /* 弹层（popper）底色桥接（P4E 2026-10-09）：el-select-dropdown 等弹层挂
+   * body，底色读 --el-popper-bg-color-light（EP 默认 #fff），此前未映射 →
+   * 暗色下 accounts/hot-topics 下拉仍是纯白面板（option 2.48:1 命中）。
+   * 亮色指向 --color-bg-card（= #fff 同值，零亮色回归）；暗色跟随深面板。 */
+  --el-popper-bg-color-light: var(--color-bg-card);
+  /* 表单控件底色桥接（P4E 2026-10-09）：--el-fill-color-blank 是 el-input/
+   * el-select 收起态等 55 个消费点的底色（EP 默认 #fff），此前未映射 →
+   * 暗色下 hot-topics 渠道选择器仍是纯白底（2.07:1 命中）。
+   * 亮色 = #fff 同值零回归；暗色跟随 bg-card 深面板。 */
+  --el-fill-color-blank: var(--color-bg-card);
+
+  /* 文本色桥接 */
+  --el-text-color-primary: var(--color-text-primary);
+  --el-text-color-regular: var(--color-text-secondary);
+  --el-text-color-secondary: var(--color-text-muted);
+  --el-text-color-placeholder: var(--color-text-muted);
+  --el-text-color-disabled: var(--color-text-muted);
+
+  /* 边框桥接 */
+  --el-border-color: var(--color-border);
+  --el-border-color-light: var(--color-border);
+  --el-border-color-lighter: var(--color-border);
+  --el-border-color-hover: var(--color-primary);
+
+  /* 填充/背景桥接（--color-bg-hover 全仓无定义，与 light/lighter 同档收编到 bg-inset） */
+  --el-fill-color: var(--color-bg-inset);
+  --el-fill-color-light: var(--color-bg-inset);
+  --el-fill-color-lighter: var(--color-bg-inset);
+  --el-bg-color: var(--color-bg-canvas);
+  --el-bg-color-overlay: var(--color-bg-canvas);
+  --el-disabled-bg-color: var(--color-bg-inset);
+
+  /* 圆角对齐（EP 默认 4px → 业务 6px 档） */
+  --el-border-radius-base: 6px;
+  --el-border-radius-small: var(--r-xs, 4px);
+  --el-border-radius-round: 999px;
+
+  /* 字号对齐（EP 默认 14px → 七档） */
+  --el-font-size-base: var(--font-size-sm);
+  --el-font-size-small: var(--font-size-xs);
+  --el-font-size-extra-small: var(--font-size-xs);
+}
+
+/* 主按钮禁用态：EP 把 --el-button-disabled-* 三档声明在 .el-button--primary 元素作用域上，
+ * 写在 :root 会被它压掉（元素自带声明优先于继承），所以这里必须用同名选择器、靠导入顺序覆盖。
+ * 不改则禁用态沿用 EP 默认的 -light-5，而该档在本桥接里是饱和主色 —— 禁用的按钮和可点/悬停
+ * 长得一模一样。禁用是「降格」不是「换色」：中性底 + 中性描边 + 次要文字（浅色实测 4.54:1，
+ * 不用 --color-text-muted，它对 --color-bg-inset 只有 2.65:1）。 */
+.el-button--primary {
+  --el-button-disabled-bg-color: var(--color-bg-inset);
+  --el-button-disabled-border-color: var(--color-border);
+  --el-button-disabled-text-color: var(--color-text-secondary);
+}

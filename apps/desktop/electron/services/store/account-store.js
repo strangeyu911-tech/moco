@@ -1,0 +1,335 @@
+// @ts-check
+/**
+ * account-store — 账号功能域 mixin
+ *
+ * 通过 Object.assign 注入 Store.prototype，方法内通过 this.db / this._ready
+ * 访问 BaseStore 提供的共享状态。
+ *
+ * 依赖：BaseStore._safeJson（基类提供）
+ *       store-schema.sanitizeUpdateFields / safeJsonParse
+ */
+const {
+  LEGACY_OWNER_SUBJECT,
+  sanitizeUpdateFields,
+  safeJsonParse,
+  safeJsonStringify,
+} = require('../store-schema')
+const log = require('../logger')
+
+function resolveOwnerSubject (store, explicitOwnerSubject) {
+  if (typeof store._resolveOwnerSubject === 'function') {
+    return store._resolveOwnerSubject(explicitOwnerSubject)
+  }
+  if (explicitOwnerSubject === undefined) return LEGACY_OWNER_SUBJECT
+  if (typeof explicitOwnerSubject !== 'string') return null
+  const owner = explicitOwnerSubject.trim()
+  return owner || null
+}
+
+function createAccountId () {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
+
+function assertWriteSucceeded (result, operation, requireChanges = false) {
+  if (!result || result.error || (requireChanges && result.changes === 0)) {
+    const detail = result && result.error ? `：${result.error}` : ''
+    throw new Error(`${operation}失败${detail}`)
+  }
+}
+
+function referencesAccountId (value, accountId, depth = 0) {
+  if (depth > 12 || value === null || value === undefined) return false
+  if (Array.isArray(value)) {
+    return value.some(item => referencesAccountId(item, accountId, depth + 1))
+  }
+  if (typeof value !== 'object') return false
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if ((key === 'accountId' || key === 'account_id') && String(nestedValue) === String(accountId)) {
+      return true
+    }
+    if (referencesAccountId(nestedValue, accountId, depth + 1)) return true
+  }
+  return false
+}
+
+function jsonReferencesAccountId (json, accountId) {
+  if (typeof json !== 'string') return false
+  const parsed = safeJsonParse(json, null)
+  return parsed && typeof parsed === 'object'
+    ? referencesAccountId(parsed, accountId)
+    : false
+}
+
+module.exports = {
+  addAccount (account, ownerSubject) {
+    if (!this._ready) return false
+    if (!account || typeof account !== 'object' || Array.isArray(account)) return false
+    if (typeof account.platform !== 'string' || !account.platform.trim()) return false
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return false
+    const id = String(account.id || createAccountId())
+    // Stage -1.1：凭证优先加密落盘（cookies_enc/localStorage_enc），明文列保留默认值。
+    // 主密钥不可用时渐进回退明文列并告警（与 credential-store 主密钥单一事实源一致）。
+    const cryptoApi = this._accountCrypto
+    const credentialEncryptionOn = Boolean(cryptoApi && cryptoApi.isEncryptionAvailable())
+    const cookieEnc = credentialEncryptionOn ? cryptoApi.encrypt(account.cookies || []) : null
+    const localStorageEnc = credentialEncryptionOn ? cryptoApi.encrypt(account.localStorage || {}) : null
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO accounts (
+        owner_subject, id, platform, account_name, name, avatar, cookies,
+        localStorage, cookies_enc, localStorage_enc, avatar_url, status, is_default, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    `)
+    const result = stmt.run(
+      owner,
+      id,
+      account.platform,
+      account.account_name || '',
+      account.name || '',
+      account.avatar || '',
+      credentialEncryptionOn ? '' : safeJsonStringify(account.cookies || []),
+      credentialEncryptionOn ? '' : safeJsonStringify(account.localStorage || {}),
+      cookieEnc,
+      localStorageEnc,
+      account.avatar_url || '',
+      account.status || 'active',
+      account.is_default ? 1 : 0,
+    )
+    return Boolean(result && !result.error && result.changes !== 0)
+  },
+
+  getAccount (id, ownerSubject) {
+    if (!this._ready) return null
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return null
+    const row = this.db.prepare('SELECT * FROM accounts WHERE owner_subject = ? AND id = ?')
+      .get(owner, String(id))
+    if (!row) return null
+    return this._parseAccount(row)
+  },
+
+  listAccounts (platform, ownerSubject) {
+    if (!this._ready) return []
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return []
+    const sql = platform
+      ? this.db.prepare('SELECT * FROM accounts WHERE owner_subject = ? AND platform = ? ORDER BY created_at DESC')
+      : this.db.prepare('SELECT * FROM accounts WHERE owner_subject = ? ORDER BY platform, created_at DESC')
+    const rows = platform ? sql.all(owner, platform) : sql.all(owner)
+    return rows.map(r => this._parseAccount(r))
+  },
+
+  deleteAccount (id, ownerSubject) {
+    if (!this._ready) return false
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return false
+    const normalizedId = String(id)
+    const row = this.db.prepare(
+      'SELECT platform FROM accounts WHERE owner_subject = ? AND id = ?',
+    ).get(owner, normalizedId)
+    if (!row) return false
+
+    try {
+      const tx = this.db.transaction(() => {
+        const accountResult = this.db.prepare(
+          'DELETE FROM accounts WHERE owner_subject = ? AND id = ?',
+        ).run(owner, normalizedId)
+        assertWriteSucceeded(accountResult, '删除账号', true)
+
+        // 旧版默认账号存于全局 settings。仅在删除的正是该平台默认账号时清理，
+        // 不能误删同平台其他账号仍在使用的默认设置。
+        if (owner === LEGACY_OWNER_SUBJECT) {
+          const defaultSettingKey = `default_account:${row.platform}`
+          const defaultSetting = this.db.prepare(
+            'SELECT value FROM settings WHERE key = ?',
+          ).get(defaultSettingKey)
+          const configuredAccountId = defaultSetting
+            ? safeJsonParse(defaultSetting.value, defaultSetting.value)
+            : null
+          if (String(configuredAccountId) === normalizedId) {
+            const result = this.db.prepare(
+              'DELETE FROM settings WHERE key = ?',
+            ).run(defaultSettingKey)
+            assertWriteSucceeded(result, '清理默认账号设置', true)
+          }
+        }
+
+        const scheduledTasks = this.db.prepare(
+          'SELECT id, article FROM scheduled_tasks WHERE owner_subject = ? AND platform = ?',
+        ).all(owner, row.platform)
+        for (const task of scheduledTasks) {
+          if (jsonReferencesAccountId(task.article, normalizedId)) {
+            const result = this.db.prepare(
+              'DELETE FROM scheduled_tasks WHERE owner_subject = ? AND id = ?',
+            ).run(owner, String(task.id))
+            assertWriteSucceeded(result, '清理账号定时任务', true)
+          }
+        }
+
+        const historyRows = this.db.prepare(
+          'SELECT id, result FROM publish_history WHERE owner_subject = ? AND platform = ?',
+        ).all(owner, row.platform)
+        for (const history of historyRows) {
+          if (jsonReferencesAccountId(history.result, normalizedId)) {
+            const result = this.db.prepare(
+              'DELETE FROM publish_history WHERE owner_subject = ? AND id = ?',
+            ).run(owner, String(history.id))
+            assertWriteSucceeded(result, '清理账号发布历史', true)
+          }
+        }
+      })
+      tx()
+    } catch (_) {
+      return false
+    }
+    // 触发持久化
+    if (this.db.persist) this.db.persist()
+    return true
+  },
+
+  updateAccount (id, fields, ownerSubject) {
+    if (!this._ready) return false
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return false
+    // 安全：字段名白名单过滤，防止 SQL 注入（字段名直接拼接进 SQL）
+    const safeFields = sanitizeUpdateFields('accounts', fields)
+    if (Object.keys(safeFields).length === 0) return false
+    const sets = []
+    const vals = []
+    for (const [k, v] of Object.entries(safeFields)) {
+      if (k === 'cookies' || k === 'localStorage') {
+        sets.push(`${k} = ?`)
+        vals.push(JSON.stringify(v))
+      } else {
+        sets.push(`${k} = ?`)
+        vals.push(v)
+      }
+    }
+    sets.push("updated_at = datetime('now')")
+    vals.push(owner, String(id))
+    const result = this.db.prepare(
+      `UPDATE accounts SET ${sets.join(', ')} WHERE owner_subject = ? AND id = ?`,
+    ).run(...vals)
+    return Boolean(result && result.changes > 0)
+  },
+
+  /**
+   * 设置平台的默认账号（事务包裹，保证原子性）
+   */
+  setDefaultAccount (platform, accountId, ownerSubject) {
+    if (!this._ready) return false
+    if (!platform || accountId === null || accountId === undefined || accountId === '') return false
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return false
+    const normalizedId = String(accountId)
+    const account = this.db.prepare(
+      'SELECT id FROM accounts WHERE owner_subject = ? AND platform = ? AND id = ?',
+    ).get(owner, platform, normalizedId)
+    if (!account) return false
+    // 安全：事务包裹两条 UPDATE，防止中间失败导致数据不一致
+    const tx = this.db.transaction(() => {
+      // 清除该平台所有账号的默认标记
+      this.db.prepare(
+        'UPDATE accounts SET is_default = 0 WHERE owner_subject = ? AND platform = ?',
+      ).run(owner, platform)
+      // 设置新的默认账号
+      this.db.prepare(
+        'UPDATE accounts SET is_default = 1 WHERE owner_subject = ? AND platform = ? AND id = ?',
+      ).run(owner, platform, normalizedId)
+    })
+    tx()
+    return true
+  },
+
+  _parseAccount (row) {
+    // Stage -1.1：优先解密加密列；解密失败或缺失（未迁移/顺迁）时回退明文列。
+    const cryptoApi = this._accountCrypto
+    const cookies = cryptoApi ? cryptoApi.decrypt(row.cookies_enc) : null
+    if (cookies !== null && cookies !== undefined) {
+      row.cookies = Array.isArray(cookies) ? cookies : []
+    } else {
+      // eslint-disable-next-line no-unused-vars
+      try { row.cookies = JSON.parse(row.cookies) } catch (e) { row.cookies = [] }
+    }
+    const localStorageDecrypted = cryptoApi ? cryptoApi.decrypt(row.localStorage_enc) : null
+    if (localStorageDecrypted !== null && localStorageDecrypted !== undefined) {
+      row.localStorage = localStorageDecrypted && typeof localStorageDecrypted === 'object' ? localStorageDecrypted : {}
+    } else {
+      row.localStorage = safeJsonParse(row.localStorage, {})
+    }
+    return row
+  },
+
+  /**
+   * 获取平台的默认账号
+   */
+  getDefaultAccount (platform, ownerSubject) {
+    if (!this._ready) return null
+    const owner = resolveOwnerSubject(this, ownerSubject)
+    if (!owner) return null
+    const row = this.db.prepare(
+      'SELECT * FROM accounts WHERE owner_subject = ? AND platform = ? AND is_default = 1 LIMIT 1',
+    ).get(owner, platform)
+    if (!row) {
+      // 没有默认账号，返回第一个
+      const first = this.db.prepare(
+        'SELECT * FROM accounts WHERE owner_subject = ? AND platform = ? ORDER BY created_at DESC LIMIT 1',
+      ).get(owner, platform)
+      return first ? this._parseAccount(first) : null
+    }
+    return this._parseAccount(row)
+  },
+
+  /**
+   * 注入账号凭证加密适配器（account-credential-crypto）。
+   * 注入后若数据库已就绪且存量明文尚未迁移，立即触发一次迁移。
+   */
+  setAccountCredentialCrypto (adapter) {
+    this._accountCrypto = adapter && typeof adapter === 'object' ? adapter : null
+    if (this._accountCrypto && this._ready && typeof this.migrateAccountCredentials === 'function') {
+      try { this.migrateAccountCredentials() } catch (e) { log.warn('Store', '账号加密集结后存量迁移失败: ' + e.message) }
+    }
+    return this
+  },
+
+  /**
+   * 存量迁移：把 accounts 表明文 cookies/localStorage 加密到 enc 列并清空明文列。
+   * 主密钥不可用时跳过（明文列保持不变）。事务包裹，中途失败整体回滚。
+   * @returns {{migrated: number, rows?: number, skipped?: boolean}}
+   */
+  migrateAccountCredentials () {
+    if (!this._ready) return { migrated: 0 }
+    const cryptoApi = this._accountCrypto
+    if (!cryptoApi || !cryptoApi.isEncryptionAvailable()) {
+      log.warn('Store', '账号凭证加密不可用，跳过存量明文迁移（明文列保持不变）')
+      return { migrated: 0, skipped: true }
+    }
+    const rows = this.db.prepare(
+      `SELECT owner_subject, id, cookies, localStorage FROM accounts
+       WHERE cookies_enc IS NULL AND localStorage_enc IS NULL
+         AND (cookies NOT IN ('', '[]') OR localStorage NOT IN ('', '{}'))`,
+    ).all()
+    if (rows.length === 0) return { migrated: 0, rows: 0 }
+
+    let migrated = 0
+    const tx = this.db.transaction(() => {
+      const update = this.db.prepare(
+        `UPDATE accounts SET cookies = '', localStorage = '', cookies_enc = ?, localStorage_enc = ?,
+         updated_at = datetime('now') WHERE owner_subject = ? AND id = ?`,
+      )
+      for (const row of rows) {
+        const hasCookies = row.cookies && row.cookies !== '[]'
+        const hasLocalStorage = row.localStorage && row.localStorage !== '{}'
+        const cookieEnc = hasCookies ? cryptoApi.encrypt(safeJsonParse(row.cookies, [])) : null
+        const localStorageEnc = hasLocalStorage ? cryptoApi.encrypt(safeJsonParse(row.localStorage, {})) : null
+        if (!cookieEnc && !localStorageEnc) continue
+        const result = update.run(cookieEnc, localStorageEnc, row.owner_subject, String(row.id))
+        if (result && !result.error && result.changes !== 0) migrated++
+      }
+    })
+    tx()
+    log.info('Store', `账号凭证存量迁移完成: ${migrated}/${rows.length} 条`)
+    return { migrated, rows: rows.length }
+  },
+}

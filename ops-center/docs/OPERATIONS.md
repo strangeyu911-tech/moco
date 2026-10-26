@@ -1,0 +1,345 @@
+# OpsCenter 运营手册 — 限流与调度验证（2026-08-13）
+
+> 本文档是运营后台「限流与调度验证」功能的使用手册，配套 `PRD.md` §12A.23（2026-08-13 新增）与 OpenSpec `ops-center/rate-limit-verifier`、`desktop/model-call-observability` 规格。适用对象：平台运营者、开发者。所有操作均在运营后台 Web 界面完成（桌面端自检除外，需在 Multi-Publish 桌面应用内操作）。
+
+## 0. 功能总览
+
+运营后台新增左侧菜单「**限流验证**」（路由 `/rate-limit-verifier`），包含三个页签：
+
+| 页签 | 做什么 | 适合谁 |
+|------|--------|--------|
+| 模拟验证 | 按参数模拟桌面端调度器（并发/排队/429 冷却/5h 限额），输出时间线、指标、6 条断言 | 配置限流前先试跑、复现问题 |
+| 契约校验 | 批量检查所有预设的限流配置是否合法（范围/default∈models/并发换算） | 定期巡检、排查脏数据 |
+| 验证记录 | 查看历史验证 run（模拟 + 桌面端真实自检上报），可看详情 | 审计、对拍核对 |
+
+另外两处配套能力：
+- **用量看板 → 按服务商**：新增「429率 / 排队次数 / 冷却次数 / 平均排队ms / 预算利用率」调度健康度列（数据来自桌面端 30 分钟用量上报）；
+- **桌面端模型设置页**：「运营后台同步」卡片旁「限流自检」按钮，可真实跑一次桌面端调度并上报运营后台。
+
+**重要边界**：模拟结果与自检结果都是「对调度机制的验证」，**不等于真实 provider 限流**。真实 provider 的限流/配额/封禁以实际调用结果为准（外部验收）。
+
+---
+
+## 1. 限流与调度验证页
+
+### 1.1 入口与权限
+
+- 登录运营后台 → 左侧菜单「**限流验证**」；
+- 本页所有接口均为 **admin-only**：普通用户访问返回 403「需要管理员权限」，未登录返回 401「未提供认证令牌」。
+
+### 1.2 页签一：模拟验证（最常用）
+
+#### 1.2.1 操作步骤
+
+1. 进入「模拟验证」页签；
+2. 选择「**模型预设**」下拉（可搜索、可清空）：选择后自动带出该预设的「每分钟连接次数 rpm」「5小时限额次数」，并把并发上限重置为空、请求数重置为 10、单请求耗时重置为 100ms——**想快速验证某个预设，只需选预设 → 点「运行验证」**；
+3. 按需修改参数（见下表）；
+4. 点击「**运行验证**」；
+5. 查看结果区：指标卡 → 断言表 → 请求时间线 → rateFactor 曲线；
+6. 每次运行自动落库，页面底部提示「验证记录 #N（simulated=true，已落库可审计）」，可在「验证记录」页签回查。
+
+#### 1.2.2 参数说明与数据校验
+
+| 参数 | 允许范围 | 默认值 | 说明 |
+|------|---------|--------|------|
+| 模型预设 | 预设 ID（可空） | 空 | 选择后带出 rpm/5h 限额；可手工改 |
+| 每分钟连接次数 rpm | 1 ~ 100000 整数 | 20 | 对应预设的 `rate_per_minute` |
+| 并发上限 maxConcurrent | 1 ~ 8 整数，或留空 | 留空 | 留空 = `clamp(round(rpm/10),1,4)` 自动换算（rpm=20→2、rpm=6→1） |
+| 5小时限额次数 | 1 ~ 10000000 整数，或留空 | 留空 | 留空 = 无 5h 额度窗口 |
+| 请求数 | 1 ~ 1000 整数 | 10 | 模拟的请求总量 |
+| 单请求耗时(ms) | 0 ~ 60000 整数 | 100 | 每个请求的执行耗时 |
+| 到达间隔(ms) | 0 ~ 60000 整数 | 0 | 0 = 所有请求同时到达 |
+| 注入 429（第 N 个） | 1 ~ 请求数 整数，或留空 | 留空 | 让第 N 个请求返回 429，验证冷却+自适应 |
+| 模拟 5h 额度超限 | 开关 | 关 | 开 = 模拟 5h 额度已被用完，验证预检拒绝 |
+
+参数非法时返回 400 + 中文字段提示（如「rpm 必须是 [1, 100000] 的整数」），**不会落库**。
+
+#### 1.2.3 推荐的验证场景（照抄即可）
+
+| 场景 | 参数 | 预期结果 |
+|------|------|---------|
+| 并发不超限 | rpm=20、并发留空、请求数=10、间隔=0 | 最大并发=2、无 429，断言 max_concurrent / no_rate_limited PASS |
+| RPM 排队 + FIFO | rpm=6、并发=1、请求数=8、间隔=0 | 吞吐 ≤6、最长排队 <180s，完成顺序 1..8（FIFO 断言 PASS） |
+| 429 冷却自适应 | rpm=20、请求数=10、注入 429=第 4 个 | 冷却次数 ≥1，rateFactor 曲线先 ×0.75 再 +0.05 恢复 |
+| 5h 额度超限 | rpm=20、5小时限额=5、请求数=8、开关开 | 第 6 个起全部「额度超限」拒绝，quota_at_limit_plus_1 PASS |
+
+#### 1.2.4 结果解读
+
+- **指标卡**（7 个）：
+  - 总耗时(ms)：全部请求从开始到完成的时长；
+  - 吞吐(60s 窗口)：任意 60 秒窗口内最大放行数（应 ≤ rpm 预算，含 effectiveRpm 下限 2）；
+  - 最大并发：实际同时执行中的请求峰值（口径 = 已开始未完成）；
+  - 最长排队(ms)：单请求最长的排队等待；
+  - 限流次数：被 30s/180s/45s 预算拒绝的请求数；
+  - 冷却次数：因 429 进入冷却等待的请求数；
+  - 额度拒绝：5h 预检拒绝的请求数。
+- **断言表**：6 条断言，绿 PASS / 红 FAIL，附实际值与期望值。任何 FAIL 都要结合时间线定位原因：
+  - `max_concurrent`：并发峰值超预算（说明并发设置或换算有误）；
+  - `no_rate_limited`：未注入 429 却限流（说明排队预算被击穿，通常是 rpm 过小/请求过多）；
+  - `throughput`：60s 放行数超预算（异常，需检查是否注入 429 后的自适应放大导致）；
+  - `max_queue_wait`：排队超过 180s（RPM 预算过低或请求过密）；
+  - `quota_at_limit_plus_1`：5h 第 limit+1 个未被预检拒绝（额度窗口配置异常）；
+  - `fifo`：并发=1 时完成顺序不是 1..N。
+- **请求时间线表**：每行一个请求，列 = # / 到达 / 排队完成 / 开始 / 完成 / 状态 / 排队ms / 冷却ms。状态颜色：已完成=绿、限流=红、额度超限=红、排队中/执行中=灰/黄（兼容映射）。
+- **rateFactor 曲线**：文本序列展示每次请求后的因子（1 → 0.75 → 0.8 → …），用于直观确认 429 自适应路径。
+
+### 1.3 页签二：契约校验（配置巡检）
+
+1. 进入「契约校验」页签 → 点击「**刷新校验**」（页面加载时已自动拉取一次）；
+2. 表格按预设展示：预设 ID / 类别 / rpm / 5h 限额 / 换算并发 / 校验规则；
+3. 每条规则独立 PASS/FAIL：
+   - `rate_per_minute 范围`：空 或 [1,100000]；
+   - `limit_per_5h 范围`：空 或 [1,10000000]；
+   - `default_model ∈ models`：空 或 ∈ 模型列表；
+   - `并发换算 clamp(round(rpm/10),1,4)`：rpm 有值时必可换算。
+4. FAIL 的规则红字显示「实际={值}（期望 {期望值}）」；
+5. 发现 FAIL → 到「预设模型」页修正对应预设（改完回来重新点「刷新校验」）。
+
+### 1.4 页签三：验证记录（审计回查）
+
+- 列表按时间倒序，每行：`#` / 来源（**模拟**=灰 / **真实自检**=黄，真实自检带 client_id）/ 预设 / rpm / maxConcurrent / 指标摘要（并发·限流·冷却·最长排队）/ 时间；
+- 点击任意行 → 详情抽屉：参数（预设/rpm/maxConcurrent/请求数/5h 限额/来源+engine）、指标 JSON、断言表、时间线表；
+- 顶部「刷新」可手动刷新；分页 20 条/页；
+- **来源区分**：模拟 = 运营后台页面操作（simulated=true，engine=python-simulator）；真实自检 = 桌面端上报（simulated=false，engine=real-governor，client_id=设备指纹前 16 位）。
+
+---
+
+## 2. 用量看板：调度健康度（P1）
+
+### 2.1 怎么看
+
+1. 运营后台 →「用量看板」→「按服务商」表；
+2. 每行服务商除原有列（调用/失败/限流/失败率/平均耗时/成本）外，新增：
+   - **429率**：`限流次数 ÷ 调用量 × 100%`；>10% 标黄 warning；
+   - **排队次数 / 冷却次数**：桌面端上报的聚合计数；
+   - **平均排队ms**：`排队总时长 ÷ 排队次数`；排队次数为 0 显示 `-`；
+   - **预算利用率**：`日均每分钟实测调用 ÷ rpm 预算 × 100%`；>90% 标黄 warning；该服务商 rpm 未配置时显示「**未配置**」。
+3. 顶部总览卡同步展示「限流(429)次数」等聚合。
+
+### 2.2 数据来源与口径注意
+
+- 数据来自桌面端每 30 分钟的用量上报（`POST /api/v1/usage/ingest`，X-Catalog-Key 鉴权，无需登录）；新字段 `queued_count / cooldown_count / queue_wait_ms / cooldown_wait_ms` 为可选非负整数；
+- 旧版本桌面端不上报新字段 → 看板按 0 呈现，**不报错**；
+- 预算利用率是「日均」估算（总调用 ÷ 天数 ÷ 1440 分钟 ÷ rpm），不是实时窗口，仅作趋势参考；rpm 未配置显示「未配置」属正常；
+- 429 率/利用率标黄只是提醒，不阻断任何功能。
+
+---
+
+## 3. 桌面端：限流自检与上报（P2）
+
+### 3.1 前置条件
+
+- 使用 **Multi-Publish 桌面应用**（浏览器打开 Vite 页面无 `window.electronAPI`，会提示「当前环境无 electronAPI，请使用桌面应用运行自检」）；
+- 已登录桌面端；
+- 如需「上报运营后台」：桌面端「模型设置 → 运营后台同步」卡片需已配置 **Ops Center 地址 + 目录同步 API Key**。
+
+### 3.2 操作步骤
+
+1. 打开桌面端「设置 → 模型设置」；
+2. 在「运营后台同步」卡片右上角操作区点击「**限流自检**」（鼠标悬停有提示：用真实调度网关（假 adapter，不消耗额度）验证并发/排队/限流机制）；
+3. 弹窗「限流自检」中填写参数（与运营后台模拟页一致：rpm / 并发上限 / 请求数 / 单请求耗时 / 注入 429 / 5小时限额），默认 rpm=20、请求数=10、耗时=100ms；
+4. 点击「**运行自检**」→ 顶部提示「自检运行中（真实调度排队，耗时取决于 rpm 预算）...」，完成后提示「自检完成：断言 X/Y 通过」；
+5. 结果区展示：最大并发 / 限流 / 额度拒绝 / 总耗时 + 断言列表（PASS/FAIL + 说明）；
+6. 确认无误后点击「**上报运营后台**」→ 成功提示「已上报，运营后台验证记录 #N」，此时运营后台「限流验证 → 验证记录」会出现一条来源=「真实自检」+client_id 的记录；
+7. 点「关闭」结束。
+
+### 3.3 自检做了什么（功能逻辑）
+
+- 使用**独立**的 `ApiUsageGovernor` 实例（与生产单例完全隔离，不污染线上 rateFactor/时间槽/5h 额度状态）；
+- 使用**本地假 adapter**：仅内存 sleep，可选注入一个真实 `ProviderError(429)`；**全程不发任何网络请求、不消耗任何额度**（断言含 `no_network`）；
+- 产出与运营后台模拟器同构的 metrics/assertions/timeline（engine=real-governor），用于两端对拍。
+
+### 3.4 上报失败排查
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 「未配置运营后台同步（地址/Key），无法上报自检结果」 | 桌面端没配 Ops Center 地址或 Key | 到「运营后台同步」卡片配置并保存 |
+| 「上报超时」 | 10 秒内未收到运营后台响应 | 检查网络与 Ops Center 服务；稍后重试 |
+| 「HTTP 401 / 403」 | 服务端鉴权拒绝 | 见下方「已知差异」 |
+
+- **上报通道**：桌面端「上报运营后台」通过 `X-Catalog-Key`（= `OPS_CATALOG_API_KEY`，与用量上报同一 Key）鉴权，**无需登录**；服务端需已配置 `OPS_CATALOG_API_KEY`（未配置 → 404 fail-closed，Key 错误 → 401「目录同步 Key 无效」）。
+- **上报数据保真**：服务端对 simulated=false 上报直接保存桌面端真实自检的 metrics/assertions/timeline（engine=real-governor），**不会用模拟器重算覆盖**；上报缺 metrics/timeline → 400。
+- **权限边界**：目录同步 Key 仅允许 simulated=false 上报；simulated=true（运营后台模拟验证）与列表/详情/契约查询仍为 admin JWT。
+
+---
+
+### 3.5 模拟器与真实 governor 对齐（2026-08-13 并发推进升级）
+
+对拍（`scripts/compare-scheduler-models.js`，Python 模拟器 vs 桌面端真实 governor）在官方四组固定输入下 **PARITY OK**，但用真实预设参数（慢调用 / 5h 额度）对拍发现两个**已知观测口径差异**，解读模拟结果时须注意：
+
+模拟器 `scheduler_simulator.py` 已从串行事件循环升级为**并发推进**（2026-08-13，离散事件仿真，与真实 governor 语义对齐），`scripts/compare-scheduler-models.js` 六组固定输入**全 PASS（PARITY OK）**：
+
+| 用例 | 验证点 | 两端结果 |
+|------|--------|---------|
+| 官方四组（rpm120/30 短请求、注入 429、5h=2） | 常规串行/RPM 节流/冷却/预检 | 一致 ✅ |
+| quota-5h-real（豆包 TTS limit=5、8 请求） | 5h 拒绝耗时口径（被拒请求仍占 RPM 槽） | total 21.0s vs 21.0s（差 <10ms）✅ |
+| concurrency-real（rpm=60、并发2、2.5s×8） | **并发推进：interval < duration 时请求重叠执行** | 两端 maxc=2 ✅ |
+
+**剩余已知差异（仅测量噪声）**：`slow-call-concurrency`（elevenlabs 3s×8、rpm=20，interval==duration 临界）——模拟器确定性 maxc=1；真实 governor 因定时器时钟误差产生 1ms 级短暂重叠显示 maxc=2。这是**测量噪声而非并发能力**（真实时间线 8 个请求严格 3s 间隔串行），已在 `KNOWN_DIFF_CASES` 记录，parity 测试做防漂移断言。
+
+**waiter deadline 精确模拟（2026-08-13 跟进修复）**：信号量排队超时判定已与真实 governor 一致——本请求**到达时刻 + 30s** 为 deadline，超时即 `rate_limited`（此前按处理时刻乐观放行）。429 长冷却 + 同批突发场景现可精确复现：注入 429 触发 30s 冷却，后续 3 个排队请求在 deadline 处被拒（模拟器 `rate_limited_count`=4 = 注入记账 1 + 排队超时 3，反映 governor 内部真实行为）。
+> 注：桌面端 `runSelfCheck` 对排队超时请求存在**观测盲区**（timeline 只记录 task 内开始执行的请求，排队被拒的不计数），其展示的 `rate_limited_count`=1 只是「可见限流」；模拟器数值更接近 governor 内部真实语义。对拍脚本的 must-pass 用例不受此影响（官方/并发/5h 用例无排队超时）。
+## 4. 配置调优建议（基于验证结果）
+
+| 观察 | 建议 |
+|------|------|
+| 契约校验 FAIL（如 rpm 越界、default_model 不在 models） | 到「预设模型」修正对应预设，改完重新刷新契约校验 |
+| 模拟中 max_concurrent 频繁打满、排队很长 | 提高 `rate_per_minute`（或并发上限）后再验证 |
+| 未注入 429 却出现限流（no_rate_limited FAIL） | rpm 预算远低于实际峰值需求；先评估真实调用量，再调整 rpm |
+| 429 冷却频繁、rateFactor 持续下调 | 说明真实 provider 在限流；降低 rpm 或错峰，观察用量看板 429 率 |
+| 5h 额度频繁触发（quota_exceeded 多） | 调高 `limit_per_5h`，或与运营确认额度使用策略 |
+| 用量看板预算利用率 >90% | 接近 rpm 预算上限，建议提前扩容/调参 |
+| 用量看板某服务商「未配置」 | 该预设 `rate_per_minute` 为空，桌面端走降级默认值（见 PRD §12A.10.4）；如需精确管控请填写 |
+
+**配置生效链路**：预设页修改 → 桌面端**启动时自动同步**拉取目录（`GET /api/v1/model-presets/catalog`，X-Catalog-Key）→ 本地写入并应用 governor 限流。桌面端界面**不提供手动同步入口**（原「立即同步」卡片已按产品决策对用户隐藏），因此运营端改动要到客户端**下次启动**才生效——验证前请确认目标机器是在本次改动之后启动过的。
+
+---
+
+## 5. 常见问题 FAQ
+
+**Q1：模拟结果能代表真实 provider 吗？**
+不能。模拟/自检只验证「配置下的调度机制」（并发、排队、冷却、5h 预检）。真实 provider 的 429/配额/封禁以实际调用为准，属于外部验收。
+
+**Q2：模拟和桌面端自检有什么区别？**
+模拟 = 运营后台 Python 确定性模拟器（事件驱动、纯计算）；自检 = 桌面端真实 `ApiUsageGovernor` 跑内存假请求。两者契约常量一致，固定参数下关键指标应一致（对拍脚本 `scripts/compare-scheduler-models.js` 保障）。
+
+**Q3：为什么我留空 rpm 会报错？**
+模拟验证里 rpm 是必填（[1,100000]）。运营后台预设的 `rate_per_minute` 留空表示「未配置」；要模拟未配置场景，请参考 PRD §12A.10.4 的降级链路（种子默认值 → 静态表 → 类别默认），或用预设实际生效值（预设选择器会自动带出）。
+
+**Q4：验证记录会一直增长吗？**
+会。每次模拟/上报自动落库 `scheduler_verification_runs`，用于审计与对拍；暂未提供清理入口（单条数据量小，含 timeline JSON）。
+
+**Q5：普通用户能看到这些功能吗？**
+不能。`/api/v1/scheduler/*` 全部 admin-only（403）；前端菜单对所有登录用户可见但接口会拒绝。
+
+---
+
+## 附：接口速查（供开发/联调）
+
+| 方法 | 路径 | 鉴权 | 用途 |
+|------|------|------|------|
+| POST | /api/v1/scheduler/verify | admin（桌面端上报按设计走 X-Catalog-Key，见已知差异） | 模拟验证 / 自检上报，落库并返回结果 |
+| GET | /api/v1/scheduler/verify | admin | 验证记录列表（preset_id/simulated 过滤，limit 1-200 默认 20，offset） |
+| GET | /api/v1/scheduler/verify/{run_id} | admin | 单条详情（含 timeline），404=不存在 |
+| GET | /api/v1/scheduler/contract | admin | 预设契约校验清单 |
+| POST | /api/v1/usage/ingest | X-Catalog-Key | 桌面端用量上报（含排队/冷却聚合字段） |
+| GET | /api/v1/usage/summary | admin | 用量汇总（含 429率/排队/冷却/预算利用率） |
+| GET | /api/v1/model-presets | admin | 预设列表（模拟验证页预设下拉数据源） |
+| POST | /api/auth/login | 无 | 登录，签发 HttpOnly 会话 Cookie |
+| POST | /api/auth/logout | 无（无副作用，过期会话也须可用） | 清除会话 Cookie |
+| GET | /api/auth/me 或 /api/auth/session | 会话/Bearer | 当前登录用户（前端水合登录态） |
+| POST | /api/auth/change-password | 会话（须 X-Ops-Session 头）或 Bearer | 改密；成功即作废当前会话 |
+
+**改密错误码速查**（前端/联调按此提示用户）：
+
+| 状态码 | 含义 | detail 文案 |
+|--------|------|-------------|
+| 200 | 成功 | 「密码已更新，请使用新密码重新登录」 |
+| 400 | 新密码不合规 | 「两次输入的新密码不一致」/「新密码不能与当前密码相同」/「新密码强度不足：至少 8 位，且不得使用 admin123、password、123456 等常见弱口令」 |
+| 401 | 原密码错误 / 未登录 / 旧凭据已失效 | 「原密码错误」/「未提供认证令牌」/「凭据已失效，请重新登录」 |
+| 403 | 缺 CSRF 头 | 「跨站请求伪造防护：基于 Cookie 会话的写操作必须携带自定义头 X-Ops-Session」 |
+| 422 | 字段超 128 或缺失 | Pydantic 默认 |
+| 429 | 改密尝试过多 | 「尝试次数过多，请稍后再试」 |
+
+
+
+
+
+## 11. 本地启动与「admin 登录不上」分诊（2026-09-29）
+
+### 11.1 启动口径
+
+- 后端：`cd ops-center/backend && uvicorn main:app --host 127.0.0.1 --port 8010`（开发入口 `python main.py` 同样只绑回环）。
+- 生产：`deploy/ops-center.service` 的 `ExecStart` 显式 `--host 127.0.0.1`，`deploy/nginx-ops.conf` 反代 `127.0.0.1:8010`。**不要**改成 `0.0.0.0` 来「让别的机器能访问」——登录由本服务自签发管理员会话，绑全网卡等于把 `/api/auth/login` 的爆破面交给局域网。
+- 确实需要局域网/其它设备访问时**显式传参**，不要改默认值：`uvicorn main:app --host 0.0.0.0 --port 8010`。这样做的代价要一起承担：`OPS_JWT_SECRET` 必须是强随机值、`OPS_ADMIN_PASSWORD` 必须过启动强度校验（弱口令表已内置）、且只在受信网络内临时开着——本服务自签发管理员会话，绑全网卡就是把 `/api/auth/login` 交给同网段任意机器。用 `python main.py` 这条路拿到的是回环，需要局域网请改用上面的显式命令。
+- 前端：`cd ops-center/frontend && npm run dev`（`strictPort` 固定 5173，`/api/auth`、`/api/v1`、`/api` 全部代理到 :8010）。
+
+### 11.2 分诊三步（症状相同、根因不同，别先动口令）
+
+| 观测 | 含义 | 下一步 |
+|------|------|--------|
+| `curl http://127.0.0.1:8010/health` → 连接被拒（`http_code=000`）；经 5173 打 `/api/auth/login` → **500 空 body**（本机 vite 实测值；不同 vite/http-proxy 版本可能返回 502 带 HTML 错误页——`500 空 body` 与 `502` 都同样指向「后端不在」，判据是「不是 401/503/429 这三种业务状态码」而不是具体数字） | 后端进程不在（最常见） | 先起后端，不要改口令 |
+| 登录返回 **401** | 用户名或密码不匹配（用户不存在也返回 401） | 核对 `.env` 与 `admins.password_hash`（见 11.3） |
+| 登录返回 **503**「未配置管理员账号」 | `admins` 表为空且未配 `OPS_ADMIN_USERNAME/PASSWORD` | 检查 `.env`；若库被清空过，重启会按 `.env` 重新 seed |
+| 登录返回 **429** | 内存限速命中（5 次/60 秒） | 等 60 秒或重启进程即清，无库表可查 |
+
+三个长得像 health 的端点归属不同，**只有第一个能当就绪探针**（2026-09-29 对运行中服务实测）：
+
+| 路径 | 实测 | 用途 |
+|------|------|------|
+| `GET /health` | 200 `{"status":"ok","service":"ops-center","version":"0.1.0"}` | 存活/就绪探针（`main.py` 裸路由，不鉴权） |
+| `GET /api/v1/health` | **404** | 不存在，别写进探针或文档 |
+| `GET /api/v1/system/health` | 401 | admin「一键巡检」业务接口（`routers/health.py`，需会话/Bearer），不是存活探针 |
+就绪判断请用**轮询**而不是单次固定超时：冷启动要先跑 DB 初始化（日志 `Initializing database...`）与一批 `CREATE INDEX IF NOT EXISTS`，耗时随机器负载变化；本会话没有量出可复现的稳定分布，因此**不给具体秒数**，拿不到 200 时先读启动日志定位卡在哪一阶段。另：**隔离 worktree 里起不来是预期行为**——worktree 不含被 gitignore 的 `ops-center/backend/.env`，启动安全门会 fail-closed 抛 `RuntimeError: 未配置安全的 OpsCenter JWT 密钥`（实测调用链 `main.py:37 → config.py:165 → config.py:131`）。要么从主工作区取 `.env`，要么显式注入 `OPS_JWT_SECRET` 等变量；不要为了让服务起来而关掉这道校验。
+
+### 11.3 凭据核对（只读、不打印口令）
+
+**改密码请走页面，不要改 `.env`（2026-10-12 起）**
+
+侧边栏「更改密码」（仅管理员可见）是改密的唯一正解。要点：
+
+- 必须输入**当前密码**才能改（防离开工位被改密接管）；
+- 新密码：≥8 位、不得命中弱口令表（admin123 / password / 123456 等）、不能与当前密码相同；
+- **改密成功后当前会话立即失效**，需用新密码重新登录 —— 不是 bug，是刻意设计（旧凭据在 TTL 内不再可用）；
+- 端点只改库中哈希，**不同步 `.env`**。正常情况下安全（`ensure_admin_seeded` 只在 `admins` 表为空时写入），但**改密后建议同步更新 `.env` 的 `OPS_ADMIN_PASSWORD`**：若哪天有人清空 `admins` 表后重启，服务会按 `.env` 重新 seed，页面上改过的密码会被 `.env` 的值悄悄取代；
+- 忘了密码且无法登录时，唯一恢复手段是清空 `admins` 表后重启（按 `.env` 重新 seed）或直接改库中哈希 ——**没有「找回密码」流程**。
+
+接口：`POST /api/auth/change-password`，body `{"old_password","new_password","confirm_password"}`。改密有独立限流（5 次失败锁 60s，与登录限速分开计数）。完整规格见 PRD §6.5。
+
+存储格式为 `pbkdf2_sha256$iterations$salt_hex$hash_hex`。用只读连接取出哈希，再按同样参数复算比对，**只输出布尔值**：
+
+```
+sqlite3.connect("file:data/config.db?mode=ro", uri=True)
+  → select password_hash from admins where username = ?
+hashlib.pbkdf2_hmac("sha256", <.env 口令>.encode(), bytes.fromhex(salt), int(iterations))
+  → hmac.compare_digest(digest, expected)
+```
+
+注意 `ensure_admin_seeded` 只在建表首启时写入，**不会**把 `.env` 的新口令同步进已有行；反之清空 `admins` 后重启会按 `.env` 重新 seed。
+
+### 11.4 数据库文件的可变性（清理磁盘前必读）
+
+- 运行库是 `data/config.db` + `config.db-wal`（WAL 模式）。WAL 未落盘时，主文件可以只有 4KB 而**全部数据都在 `-wal` 里**（实测 37 张表的数据压在 0.8MB WAL 内属正常状态）。
+- 因此**删除或移动 `-wal` 等于删库**。做「清理临时文件」这类操作时，`*-wal`/`*-shm` 一律不在可删清单内；要备份就**整组一起拷**（`config.db` + `config.db-wal` + `config.db-shm`）。或者先执行 `PRAGMA wal_checkpoint(TRUNCATE)` 把 WAL 收拢进主文件、确认 `-wal` 归零后只拷主文件——注意 checkpoint 本身**只是把日志写回主库并截断，不产生任何副本**，做完仍必须拷贝，不能把「已 checkpoint」当成「已备份」。
+- 该路径是**相对当前工作目录**解析的：在不同目录/ worktree 里启动服务，用的是各自独立的 `data/config.db`——排障时先确认进程的实际 cwd。
+
+## 12. 服务器部署（2026-10-12 修订）
+
+### 12.1 代码来源：只从 mulpub 取，不从 ops-center 取
+
+`Colinchiu007/ops-center` 是**已归档仓库**（2026-08-10 并入 mulpub，最后一条提交即「标注本仓库已并入 Multi-Publish（归档）」），其 `deploy/` 缺 `setup-service.sh`，内容是 2026-08 的快照。**从它 clone 会把归档版部署上线**。
+
+`deploy.sh` 现从 `Colinchiu007/mulpub` 稀疏检出 `ops-center/` 子目录，并在覆盖安装目录前校验 4 个必需文件（`backend/main.py`、`backend/requirements.txt`、`frontend/package.json`、`deploy/ops-center.service`），缺失即 `exit 1`——避免稀疏检出失败时拿半成品覆盖了线上代码。
+
+### 12.2 安装目录三处必须一致
+
+| 位置 | 值 |
+|------|-----|
+| `ops-center.service` 的 `WorkingDirectory` | `/opt/ops-center/backend`（唯一基准） |
+| `setup-service.sh` 的 `INSTALL_DIR` | `/opt/ops-center` |
+| `deploy.sh` 的 `INSTALL_DIR` | `/opt/ops-center` |
+
+曾因 `deploy.sh` 用 `/root/ops-center` 而另两处用 `/opt/ops-center`，后部署者把代码装到 systemd 不认的位置、服务起不来。三者均可用 `OPS_INSTALL_DIR` 覆盖，但**必须三处同时生效**。
+
+### 12.3 feature_gates 导入源必须显式配置
+
+`scripts/seed.py` 在 `source_path=None` 时只探测 `D:/Data/projects/platform-orchestrator/feature_gates.yaml` 与 `~/feature_gates.yaml`——**服务器上这两个都不存在**，功能开关会静默为空（功能开关页空列表/404）。
+
+`deploy.sh` 默认取 `/data/platform-orchestrator/feature_gates.yaml`，可用 `OPS_FEATURE_GATES_SOURCE` 覆盖；文件不存在时**显式告警**（不再静默跳过）。部署后请确认日志里 `Feature gates seeded: N added`，`N=0` 即为漏配。
+
+### 12.4 反馈图片目录必须可写
+
+`feedback_media_dir` 默认 `data/feedback-media` 相对 `WorkingDirectory` 解析，而 unit 开了 `ProtectSystem=strict`、`ReadWritePaths` 只放行 `/data/ops-center` 与 `/data/configs`，该路径不可写 → 反馈图片上传失败。
+
+unit 内已显式设 `OPS_FEEDBACK_MEDIA_DIR=/data/ops-center/feedback-media`。
+
+### 12.5 部署前必改项（否则启动 fail-closed）
+
+`setup-service.sh` 生成的 `/etc/ops-center/env` 含占位符，**不替换服务起不来**（不是「登录失败」，是 `config.run_startup_security_checks` 在启动期拒绝）：
+
+- `OPS_CORS_ORIGINS`：改为真实前端域名，禁止 `*`（带 credentials 会被 P0-6 判红）
+- `OPS_ADMIN_PASSWORD`：替换 `CHANGE_ME_BEFORE_START`（≥8 位且不在弱口令表内）
+
+### 12.6 部署脚本冒烟
+
+`deploy/smoke-deploy.sh` 离线验证三件事（不联网、不碰 systemd/nginx）：来源缺失时 fail-closed、`feature_gates` 缺失时告警并置空、`scripts.seed` 与 `database.init_db` 可导入。改动 `deploy/` 后应重跑。

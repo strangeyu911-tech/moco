@@ -1,0 +1,820 @@
+#!/usr/bin/env node
+/**
+ * 质量节拍 — CCG 外部模型审查模式判定器（§5.6.1 分层设计 · 提交时层）
+ *
+ * 纯确定性计算，不调用任何外部模型，因此在 pre-commit 里是毫秒级的。
+ * 它把 CCG 托管块里那三条「文字约定」变成可执行的判定：
+ *
+ *   变更 > 30 行                          → dual    双模型审查
+ *   变更 ≤ 30 行但涉及 auth/数据库/加密    → dual    双模型审查
+ *   变更 ≤ 30 行且低风险                   → single  只调一个模型
+ *   S 复杂度 + 低风险（≤10 行且无敏感命中）  → skip    不调
+ *
+ * 深度双模型审查本身不在这里跑（那是 PR/CI 层的事），本脚本只负责：
+ *   1. 算出模式与理由
+ *   2. 把结论落盘到 .ccg/reviews/<sha>.json，供 PR 层与事后审计读取
+ *
+ * 用法：
+ *   node scripts/ccg-review-decider.js              # 判定并落盘
+ *   node scripts/ccg-review-decider.js --print      # 只打印，不落盘
+ *   node scripts/ccg-review-decider.js --sha <sha>  # 指定 sha（PR 层用）
+ *
+ * 退出码恒为 0：判定结果不阻断提交（深度审查在 PR 层），阻断由那层负责。
+ */
+
+"use strict";
+
+/** 门禁脚本版本。分发到各项目后用 check-gate-drift.js 比对规范源，防止副本漂移。 */
+const CCG_GATE_VERSION = "1.1.0";
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync, spawnSync } = require("child_process");
+
+// ═══════════════════════════════════════════════════════════════════
+//  规则配置
+// ═══════════════════════════════════════════════════════════════════
+
+const RULES = {
+  // 跨家族对抗的触发阈值。
+  // ⚠️ 必须与 §12.6 Review Army 对齐：Red Team 的触发条件是「>200 行或有 CRITICAL」。
+  //    初版用 30 行会让大量中等改动无谓地起两个外部进程；而用「行数少」当 skip 理由
+  //    更严重——§12.6 明确 Testing / Maintainability 专家「总是触发」。
+  dualLineThreshold: 200,
+
+  // skip 只允许由 docs-only 快通道（§11.2b 文档白名单）触发，不因行数少而触发。
+  docsOnlyExtensions: new Set([".md", ".mdx", ".txt", ".rst", ".adoc"]),
+  docsOnlyDirs: ["docs/", "doc/", ".github/ISSUE_TEMPLATE/"],
+
+  // 只统计源码文件的变更行数（文档/资源不计入复杂度）
+  codeExtensions: new Set([
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".py", ".go", ".java", ".kt", ".rs", ".rb", ".php", ".cs", ".c", ".cpp", ".h",
+    ".sql", ".sh", ".bash", ".ps1", ".yaml", ".yml", ".toml", ".json", ".env",
+  ]),
+
+  // 敏感路径：命中即视为 auth / 数据库 / 加密相关
+  sensitivePaths: [
+    /(^|[\\/])auth([\\/]|\.|$)/i,
+    /(^|[\\/])(login|logout|signin|signup|session|jwt|oauth|sso|permission|acl|rbac)([\\/]|\.|$)/i,
+    /(^|[\\/])(crypto|cipher|encrypt|decrypt|hash|salt|password|passwd|secret|token|credential)([\\/]|\.|$)/i,
+    /(^|[\\/])(migrations?|schema|alembic|db|migrations)([\\/]|\.|$)/i,
+    /\.(sql|pem|key|p12|pfx|keystore)$/i,
+  ],
+
+  // 敏感内容：改动行里出现即视为敏感
+  // ⚠️ 标识符前缀必须容忍下划线与 camelCase：\b 在 DB_PASSWORD / apiSecret 里
+  //    都不成立（_ 和字母都算 \w），用 \b 会漏掉最常见的命名方式。
+  sensitiveContents: [
+    /[A-Za-z0-9_.-]*(password|passwd|pwd|secret|token|api[_-]?key|apikey|private[_-]?key|credential)s?\s*[:=]/i,
+    /(?:^|[^A-Za-z0-9_])(bcrypt|scrypt|argon2|pbkdf2|jwt|oauth|aes|des|rsa)\s*\(/i,
+    /[A-Za-z0-9_]*(md5|sha1|sha256)\s*\(/i,
+    /\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|DROP\s+TABLE|ALTER\s+TABLE)\b/i,
+    /(密钥|加密|解密|口令|密码|凭据|鉴权|授权)/,
+  ],
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  采集
+// ═══════════════════════════════════════════════════════════════════
+
+function git(args, opts = {}) {
+  try {
+    return execFileSync("git", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 32 * 1024 * 1024,
+      ...opts,
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 采集"已落地的改动"：从 git 暂存区读（验证层用）
+ */
+/**
+ * 采集「一批 diff」的变更集（暂存区 / 已提交区间 共用同一套解析）。
+ *
+ * ★ 2026-10-15 从 collectStaged 抽出（残余 2）：
+ *   解析逻辑一行未改，只把两条 git 命令变成参数 ——
+ *   这样「已提交区间」（`--base`，事后补跑用）能复用同一套
+ *   切段 / 重命名解析 / 读取缺口记账，不必抄第二份。
+ */
+function collectFromDiff(numstatArgs, diffArgs) {
+  const numstat = git(numstatArgs);
+  if (numstat === null) return null;
+
+  // ★ 2026-10-15 修（缺陷 A + B），并吸收 QM-6 评审 i5/i6：
+  //
+  //   A) 敏感内容判定原来跑在「全部暂存行」（含 .md 文档）上，与 pathHits 的
+  //      codeFiles 口径不一致 ⇒ 在文档里分析加密机制会被判成「改动涉及加密」。
+  //   B) 规模/敏感判定依赖整仓 `git diff --cached -U0` 的一次读取；实测某次
+  //      rebase 产生的提交在判定记录里被采成 `changedLines=0, fileCount=1`。
+  //      ⚠️ 该成因（GIT_INDEX_FILE 指向 rebase 临时 index）目前是**假设，未证实**
+  //      —— 我只有那一条观测，没做出可复现的最小实验。评审 i1 也正是指这一点。
+  //      故本函数只保证「不再把读取失败静默吞掉」（见 lineReadGaps），
+  //      **不宣称已修好 B**。
+  //
+  //   为什么用「单次全量 diff + 按文件切段」而不是「每文件一次 git diff」（i5）：
+  //     ① 大 PR（数百文件）会在 pre-commit 里派生数百个子进程；
+  //     ② 逐文件读取失败若被 catch 吞掉，与 B 同构的**静默失败**只是换了个触发点。
+  const diff = git(diffArgs) || "";
+
+  // numstat 对重命名输出 "old => new" 或 "src/{old => new}.js"（i6）。
+  // 直接拿它当路径会定位不到 ⇒ 该文件的变更行静默为空、敏感判定漏检。
+  // 旧实现用整仓 diff 由 git 自己处理 rename，没有这个问题；切段后必须自己解析。
+  const resolveRenamed = (raw) => {
+    if (!raw || !raw.includes("=>")) return raw;
+    const brace = raw.match(/^(.*)\{(.*?)\s*=>\s*(.*?)\}(.*)$/);
+    if (brace) return `${brace[1]}${brace[3]}${brace[4]}`;
+    const parts = raw.split("=>");
+    return parts[parts.length - 1].trim();
+  };
+
+  const files = numstat
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [add, del, ...rest] = line.split("\t");
+      const rawPath = rest.join("\t");
+      return {
+        file: resolveRenamed(rawPath),
+        rawFile: rawPath,
+        binary: add === "-" || del === "-",
+        added: add === "-" ? null : Number(add),
+        deleted: del === "-" ? null : Number(del),
+      };
+    });
+
+  // 把整仓 diff 按 `diff --git` 切段，用段内 `+++ b/<path>` 认领目标文件。
+  //
+  // ★ 2026-10-15 由新加的 collectStaged 真实覆盖测试当场抓出的 bug：
+  //   **删除文件**时 `+++` 是 `/dev/null`，路径只在 `--- a/<path>` 里。
+  //   只认 `+++` 会让每个被删除的文件都落进 lineReadGaps（误报），
+  //   而且它的删除行完全没被采集（敏感内容漏检）。
+  const linesByFile = new Map();
+  for (const seg of diff.split(/^diff --git /m).slice(1)) {
+    const strip = (s) => {
+      const t = String(s).trim();
+      return t.startsWith('"') && t.endsWith('"') ? t.slice(1, -1) : t;
+    };
+    const plusM = seg.match(/^\+\+\+ (?:b\/)?(.*)$/m);
+    let target = plusM ? strip(plusM[1]) : "";
+    if (!target || target === "/dev/null") {
+      const minusM = seg.match(/^--- (?:a\/)?(.*)$/m);
+      target = minusM ? strip(minusM[1]) : "";
+    }
+    if (!target || target === "/dev/null") continue;
+    const lines = seg
+      .split("\n")
+      .filter((l) => (l.startsWith("+") || l.startsWith("-")) && !l.startsWith("+++") && !l.startsWith("---"))
+      .map((l) => l.slice(1));
+    linesByFile.set(target, lines);
+  }
+
+  const codeFileSet = new Set(
+    files
+      .filter((f) => RULES.codeExtensions.has(path.extname(f.file).toLowerCase()))
+      .map((f) => f.file)
+  );
+  // i3：文档文件的变更行单列出来「只报告、不改判定」。
+  // 把文档纳入 mode 判定会造成原来的假阳性；完全丢掉又会让「真口令被贴进 .md」
+  // 失去唯一的观测点。折中：单独计数并在输出里点名，判据仍只看源码。
+  const docFileSet = new Set(
+    files
+      .filter((f) => RULES.docsOnlyExtensions.has(path.extname(f.file).toLowerCase()))
+      .map((f) => f.file)
+  );
+
+  const changedLines = [];
+  const codeChangedLines = [];
+  const docChangedLines = [];
+  const lineReadGaps = [];
+  for (const f of files) {
+    const lines = linesByFile.get(f.file) || [];
+    // 有规模却读不到行：明确记账，不再静默当「无敏感内容」（i5 后半条）
+    if (lines.length === 0 && !f.binary && ((f.added || 0) + (f.deleted || 0)) > 0) {
+      lineReadGaps.push(f.file);
+    }
+    for (const l of lines) changedLines.push(l);
+    if (codeFileSet.has(f.file)) {
+      for (const l of lines) codeChangedLines.push(l);
+    } else if (docFileSet.has(f.file)) {
+      for (const l of lines) docChangedLines.push(l);
+    }
+  }
+
+  return {
+    files,
+    changedLines,
+    codeChangedLines,
+    docChangedLines,
+    lineReadGaps,
+    codeFiles: files.filter((f) => codeFileSet.has(f.file)),
+  };
+}
+
+/** 验证层·暂存区：pre-commit 时用（那时改动只在 index 里） */
+// ★ 2026-10-16（QM-6 i2，实测口径分离）：`stagedDiffHash` 排除 `.ccg`，而行数统计原先
+// **不排除** ⇒ 同一份暂存 diff 会因「.ccg 是否参与」判出不同的 mode 与不同的记录名。
+// 纯 `.ccg/` 提交即该分叉的极端形态：stats 非空（把记录自身算进去）而 hash 为空
+// ⇒ 回落旧命名 ⇒ 恰恰回到本次要消灭的跨分支撞名。统一口径为「两者都排除 .ccg」：
+// 判定器自己的输出文件不该影响对它的判定。
+function collectStaged() {
+  return collectFromDiff(
+    ["diff", "--cached", "--numstat", "--", ".", ":(exclude).ccg"],
+    ["diff", "--cached", "-U0", "--", ".", ":(exclude).ccg"]
+  );
+}
+
+/**
+ * 验证层·已提交区间：事后补跑时用（那时改动已进 commit，index 通常是空的）。
+ *
+ * ★ 2026-10-15 增（残余 2 / 补完缺陷 C 的另一半）：
+ *   `ccg-gate.js` 支持带显式路径补跑后，**模式判定仍读暂存区**（因为调用 decider 时
+ *   一个参数都没传）⇒ 补跑时 index 为空 ⇒ decider 打印「暂存区无变更，跳过审查模式判定」
+ *   ⇒ **「需不需要 CCG 审查」这个判据从未真正执行**，而输出读起来像「无需审查」。
+ *   本函数提供正确输入：判「相对 base 的这批改动」。
+ *
+ * 为什么用三点 `base...HEAD`（merge-base）而不是两点：
+ *   两点的 `base..HEAD` 会把 base 之后主干上的改动也算进来（那些不是本次的改动），
+ *   判出的规模会虚高。三点与 PR 的 diff 语义一致。
+ */
+function collectRange(base) {
+  return collectFromDiff(
+    ["diff", `${base}...HEAD`, "--numstat"],
+    ["diff", `${base}...HEAD`, "-U0"]
+  );
+}
+
+/**
+ * 采集"尚未落地的方案"：从文档读（决策层用）
+ *
+ * 决策层跑在动手写码之前，那时没有 git diff，只有方案文档。
+ * 这里用文档的「预计改动规模」代替实际 diff 行数：
+ *   - 方案里显式写了"预计新增 N 行 / M 个文件"就采信
+ *   - 没写就按文档体量估算（非空行 + 代码块行）
+ * 敏感判定仍走同一套规则，所以两个层的判定口径一致。
+ */
+function collectProposal(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    return { error: `读不到方案文件: ${file} (${err.message})` };
+  }
+
+  // 显式声明的预计规模优先于估算
+  let declaredLines = null;
+  let declaredFiles = null;
+  const declLine = text.match(/预计(?:新增|改动|变更)[^\n]{0,12}?(\d+)\s*行/);
+  if (declLine) declaredLines = Number(declLine[1]);
+  const declFile = text.match(/(\d+)\s*个?(?:文件|模块|接口|函数)/);
+  if (declFile) declaredFiles = Number(declFile[1]);
+
+  const codeBlocks = (text.match(/```[\s\S]*?```/g) || []).join("\n");
+  const nonEmpty = text.split("\n").filter((l) => l.trim()).length;
+  const codeLines = codeBlocks
+    .split("\n")
+    .filter((l) => l.trim() && !/^\s*(#|\/\/|\*|<!--)/.test(l)).length;
+
+  const changedLines = declaredLines !== null ? declaredLines : Math.max(nonEmpty, codeLines);
+  const fileCount = declaredFiles !== null ? declaredFiles : 1;
+
+  // 抽正文里的路径样式 token —— 既用于敏感判定，也用于事后范围漂移比对
+  const allPaths = new Set();
+  for (const line of text.split("\n")) {
+    const tokens = line.match(/[\w./\\-]{3,}\.[A-Za-z]{1,5}\b/g) || [];
+    for (const tk of tokens) allPaths.add(tk);
+  }
+  // 过滤掉明显不是文件路径的（域名、版本号之类）
+  const plannedFiles = [...allPaths].filter(
+    (p) => !/^https?:/i.test(p) && !/^\d+(\.\d+)+/.test(p) && /[\\/]|\.[A-Za-z]{1,5}$/.test(p)
+  );
+
+  return {
+    proposal: true,
+    files: [{ file, added: changedLines, deleted: 0 }],
+    changedLines: text.split("\n"),
+    plannedFiles,
+    stats: {
+      changedLines,
+      fileCount,
+      declared: declaredLines !== null || declaredFiles !== null,
+      docLines: text.split("\n").length,
+      estimated: declaredLines === null,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  判定
+// ═══════════════════════════════════════════════════════════════════
+
+/** 是否全部改动都落在文档白名单内（§11.2b docs-only 快通道的唯一 skip 依据） */
+function isDocsOnly(staged) {
+  if (staged.proposal) return false; // 方案评审不走 docs-only
+  if (!staged.files.length) return false;
+  return staged.files.every((f) => {
+    const ext = path.extname(f.file).toLowerCase();
+    const p = f.file.replace(/\\/g, "/").toLowerCase();
+    if (RULES.docsOnlyDirs.some((d) => p.startsWith(d))) return true;
+    return RULES.docsOnlyExtensions.has(ext);
+  });
+}
+
+function judge(staged) {
+  // 决策层：方案本身通常是 .md，不能按源码扩展名过滤（否则规模会被算成 0）
+  const isProposal = !!staged.proposal;
+  const codeFiles = isProposal
+    ? staged.files
+    : staged.files.filter((f) =>
+        RULES.codeExtensions.has(path.extname(f.file).toLowerCase())
+      );
+  const changedLines = isProposal
+    ? (staged.stats ? staged.stats.changedLines : 0)
+    : codeFiles.reduce(
+        (sum, f) => sum + (f.added || 0) + (f.deleted || 0),
+        0
+      );
+
+  // 敏感命中：路径 或 内容，任一即可
+  const pathHits = codeFiles
+    .map((f) => f.file)
+    .filter((f) => RULES.sensitivePaths.some((re) => re.test(f)));
+
+  // 决策层：方案文件本身叫 plan.md，不含敏感信息，但正文里点名的待改文件含。
+  // 所以从正文抽出路径样式的 token 再跑一遍路径规则。
+  let plannedPathHits = [];
+  if (isProposal && staged.plannedFiles) {
+    plannedPathHits = staged.plannedFiles.filter((tk) =>
+      RULES.sensitivePaths.some((re) => re.test(tk))
+    );
+  }
+
+  // ★ 2026-10-15 修（缺陷 A）：contentHits 必须只跑**源码文件**的变更行。
+  //   原实现跑在 `staged.changedLines`（含 .md 文档行）上，与 pathHits 的
+  //   codeFiles 口径不一致 ⇒ 在文档里写「加密/口令」的分析文字会被判成
+  //   「改动涉及加密」，误置 deepReview.required。
+  //   现在用 collectStaged() 额外产出的 codeChangedLines（已按 codeExtensions 过滤）。
+  const contentHits = (staged.codeChangedLines || []).filter((l) =>
+    RULES.sensitiveContents.some((re) => re.test(l))
+  );
+  const sensitive =
+    pathHits.length > 0 || plannedPathHits.length > 0 || contentHits.length > 0;
+
+  let mode, reason;
+  if (changedLines > RULES.dualLineThreshold) {
+    mode = "dual";
+    reason = `变更 ${changedLines} 行 > ${RULES.dualLineThreshold} 行阈值（对齐 §12.6 Red Team）`;
+  } else if (sensitive) {
+    mode = "dual";
+    const parts = [];
+    if (pathHits.length) parts.push(`敏感路径 ${pathHits.slice(0, 3).join(", ")}`);
+    if (plannedPathHits.length) parts.push(`方案点名敏感文件 ${plannedPathHits.slice(0, 3).join(", ")}`);
+    if (contentHits.length) parts.push(`敏感内容 ${contentHits.length} 处`);
+    reason = `变更 ${changedLines} 行（≤ ${RULES.dualLineThreshold}）但命中 auth/数据库/加密：${parts.join("；")}`;
+  } else if (isDocsOnly(staged)) {
+    // 仅 docs-only 快通道允许完全跳过（§11.2b）
+    mode = "skip";
+    reason = "改动全部命中文档白名单 → 走 §11.2b docs-only 快通道";
+  } else {
+    mode = "single";
+    reason = `变更 ${changedLines} 行（≤ ${RULES.dualLineThreshold}）且无敏感命中 → 走 §12.6 常规专家分派`;
+  }
+
+  // i3：文档行里的敏感词**只报告、不改判定**。
+  // 纳入 mode 判定会造出原来的假阳性（在文档里分析加密机制被判成「改动涉及加密」）；
+  // 完全不看又会让「真口令被贴进 .md」失去观测点。折中：单独计数，由 CLI 点名。
+  const docContentHits = (staged.docChangedLines || []).filter((l) =>
+    RULES.sensitiveContents.some((re) => re.test(l))
+  );
+  const lineReadGaps = staged.lineReadGaps || [];
+
+  return {
+    mode,
+    reason,
+    stats: {
+      changedLines,
+      fileCount: staged.files.length,
+      codeFileCount: isProposal ? staged.files.length : codeFiles.length,
+      sensitivePathHits: pathHits,
+      plannedPathHits,
+      sensitiveContentHits: contentHits.length,
+      // 只报告、不参与 mode 判定的两栏（评审 i3 / i5）
+      docSensitiveContentHits: docContentHits.length,
+      docSensitiveContentSample: docContentHits.slice(0, 3),
+      lineReadGaps,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  落盘（可审计）
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 闭环白名单 —— 与 `check-pr-exec-record.js` 的 `CLOSED_DEEP_REVIEW_STATUSES` **必须一致**。
+ *
+ * 为什么在此重复定义而不是跨文件 require：decider 跑在 pre-commit 钩子里，被
+ * `ccg-review.ps1` / `deep-review.sh` 直接 spawn；跨文件 require 会把耦合伸进钩子启动路径。
+ * 重复定义的风险由回归锁兜底：`ccg-review-decider.test.js` 直接读
+ * `check-pr-exec-record.js` 的源码断言两处集合相等，改一处忘另一处当场红。
+ */
+const CLOSED_DEEP_REVIEW_STATUSES = new Set(["cleared", "needs_revision", "self_play_resolved"]);
+
+/**
+ * 「有实质内容、不该被覆盖」的状态集合 —— **不等于闭环白名单**。
+ *
+ * ★ 2026-10-16（QM-6 第二轮 i2）：\`cleared\`/\`needs_revision\`/\`self_play_resolved\` 是闭环态，
+ *   被覆盖会把有效结论抹掉。
+ *
+ * ★ 第三轮 i3 修正：\`self_play_blocked\`/\`self_play_pending\` **不无条件入集** ——
+ *   第二轮我把它们直接加进 PRESERVE，注释写「已产出 findings」，但实测本 PR 自带的
+ *   \`5e658b47….json\` 就是 \`self_play_pending\` + \`findings: null\`：
+ *   那种记录**没有任何实质内容**，保留它只会让同内容 amend 每次另存 alt、无限累积，
+ *   且与「保留 = 有实质内容」的判据自相矛盾。
+ *   故这两个态改为**由 findings 判据兜**（见 shouldPreserveClosedRecord 的第二条），
+ *   不再按状态名无条件保留。
+ */
+const PRESERVE_BY_STATUS = new Set(CLOSED_DEEP_REVIEW_STATUSES);
+
+/**
+ * 是否该**保留**已存在的同名记录（即本次不覆盖它）。
+ *
+ * ★ 2026-10-16（QM-6 i3 + 变异反证 M7 暴露的缺口）：
+ *   内容寻址让「同一变更反复提交/amend」落到同一个文件 —— 这是收敛性的来源，
+ *   但副作用是后写静默覆盖先写。若先写那份有实质内容，覆盖会把它丢掉。
+ *
+ *   首版把这段判定**内联**在 saveRecord 里，只用「grep 源码字面」的结构锁守着；
+ *   变异反证立即抓到缺口：把 `if (cond)` 改成 `if (false && cond)` 后所有字面仍在
+ *   ⇒ 结构锁全绿而**行为已失效**。故抽成纯函数，让行为锁能真正调用它。
+ *
+ *   ★ 判据是**两层**，且第二层才是主判据：
+ *     ① 状态在闭环白名单 ⇒ 保留（结论有效，不该被抹回 pending）
+ *     ② **`deepReview.findings` 是非空数组** ⇒ 保留
+ *     第二层让任何状态（含白名单外的未来态、含 blocked/pending）只要**真有内容**就保留；
+ *     没有内容的状态一律允许覆盖，不会冻结、不会累积 alt。
+ *
+ * @returns {boolean} true = 保留旧记录、本次另存（不覆盖）
+ */
+function shouldPreserveClosedRecord(prev) {
+  if (!prev || !prev.deepReview) return false;
+  const st = typeof prev.deepReview.status === "string" ? prev.deepReview.status : null;
+  if (st && PRESERVE_BY_STATUS.has(st)) return true;
+  // 主判据：已产出 findings ⇒ 有实质内容 ⇒ 保留（与状态名无关，未来态也受益）
+  const f = prev.deepReview.findings;
+  return Array.isArray(f) && f.length > 0;
+}
+
+/**
+ * 判定记录的文件名 —— **内容寻址**（ccg-record-content-addressing，2026-10-16）。
+ *
+ * 旧行为：`${sha}.json`，其中 sha 是 pre-commit 时的 HEAD，即**新提交的父提交**。
+ *
+ * 为什么必须改（实测三次 add/add 冲突）：
+ *   父 sha 被**同基线的所有分支共享**。两个从同一基线分叉的会话，各自提交**不同**的变更，
+ *   却会写到**同一个文件名**上 ⇒ rebase 时 add/add 冲突；而冲突的任何单侧取法都有损失
+ *   （取 ours 丢掉本 PR 的记录，取 theirs 覆盖他人产物 —— 仓规明令禁止「后推覆盖」）。
+ *   本轮在 2bcce6833 / 5c7b3c127 / 56e34b56b 三个基线上各撞一次。
+ *
+ * 顺带修掉两个同源症状：
+ *   - **孤儿**：名字指向父提交，`amend` 后该父提交可能不再是历史中的任何提交；
+ *   - **不收敛**：闭环需再提交、再提交又按新父 sha 生成新名字。改名后，同一变更
+ *     重提交/amend 得到**同一个名字**（覆盖同一文件），天然收敛。
+ *
+ * 判据：内容寻址键用 `stagedDiffHash`（排除 `.ccg` 的暂存 diff 的 sha256）——
+ * 它与引擎 `ccg-deep-review.js::readDecision()` 的内容寻址键**同源**，所以改名对引擎无影响
+ * （引擎按记录里的字段匹配、不关心文件名）。
+ *
+ * 回落：`stagedDiffHash` 为空（例如只改 `.ccg/` 的提交，diff 排除 `.ccg` 后为空）时，
+ * 回落到既有的 40 位父 sha 形态 —— 保持门禁 `AUDIT_ARTIFACT_RE` 可识别，且不产生空名。
+ * 这类提交多为 `mode: skip`，不参与跨分支的唯一性诉求。
+ */
+function recordFileName(stagedDiffHash, sha) {
+  const h = typeof stagedDiffHash === "string" ? stagedDiffHash.trim() : "";
+  if (/^[0-9a-f]{64}$/.test(h)) return `${h}.json`;
+  return `${sha}.json`;
+}
+
+function saveRecord(result, sha, layer, plannedFiles) {
+  const dir = path.join(process.cwd(), ".ccg", "reviews");
+  fs.mkdirSync(dir, { recursive: true });
+  // 内容寻址键：暂存区 diff 的哈希，且排除 .ccg 自身。
+  //
+  // 为什么排除 .ccg：判定器自己的输出文件也会被 git add 进同一个 commit，
+  // 用它做键会随自身输出移位。排除后，pre-commit 的「暂存 diff」与提交后的
+  // 「parent..HEAD diff」逐字节相同，可以稳定对上（实测踩过：不排除就一次都跑不起来）。
+  //
+  // ★ QM-6 第三轮 i4：配方必须**固定 diff 行为**，否则跨机器/换配置时同一个变更
+  //   会算出不同哈希（记录找不到）。`--no-textconv --no-ext-diff` 关掉用户配置的
+  //   外部差异与 textconv 驱动；`--no-renames` 关掉重命名检测（否则「重命名 + 小改」
+  //   与「删除 + 新增」可能给出不同 diff 文本）。
+  //   注意：`autocrlf` 不在此列 —— 它影响的是工作区文件而非 git diff 的输出文本，
+  //   且强行 --no-autocrlf 会与仓库 .gitattributes 冲突。此项记为残留风险。
+  //
+  // ★ QM-6 第三轮 i5：哈希算不出来时**绝不静默回落父 sha** —— 那恰好回到本次要消灭的
+  //   跨分支撞名，且无任何告警。改为：显式告警 + 记录里写 stagedDiffHash:null，
+  //   让「无键」这件事本身可见（门禁与事后审计都能看到）。
+  const hashResult = (() => {
+    // ★ 第四轮自查追加（实测踩到）：`git()` 失败时返回 **null**，
+    //   而 `String(null)` 是字符串 **"null"**（非空！）⇒ 旧版 `if (!d.trim())` 判不出空
+    //   ⇒ 把「git 调用失败」当成「有 diff 内容」⇒ 对 "null" 算 sha256 得到
+    //   74234e98…（sha256("null")）这个**稳定但无意义**的哈希 ⇒ 记录落在一个假名字下，
+    //   且永远找不到（因为它不对应任何真实 diff）。
+    //   症状：非 git 目录里 saveRecord 也「成功」写出 64 位记录。
+    //   修法：先判 null/undefined，再判空串。
+    let d;
+    try {
+      d = git([
+        "diff", "--cached", "--no-textconv", "--no-ext-diff", "--no-renames",
+        "--", ".", ":(exclude).ccg",
+      ]);
+    } catch (e) {
+      return { hash: undefined, empty: false, error: String(e && e.message ? e.message : e) };
+    }
+    if (d === null || d === undefined) {
+      return { hash: undefined, empty: false, error: "git diff --cached 返回 null（不在 git 仓库？）" };
+    }
+    if (!String(d).trim()) return { hash: undefined, empty: true };
+    return { hash: require("crypto").createHash("sha256").update(String(d)).digest("hex"), empty: false };
+  })();
+  const stagedDiffHash = hashResult.hash;
+  if (!stagedDiffHash) {
+    // 空 diff（纯 .ccg 提交）与算失败是两件事：前者回落父 sha 是既定设计，
+    // 后者是故障。必须分开报，否则「算失败」会被读成「本来就没有」。
+    // 注意：decider 是纯 node CLI，没有 shell 的 say()；告警走 stderr（console.error），
+    // 且**不得**污染 stdout —— 某些调用方会解析 stdout。
+    if (hashResult.empty) {
+      console.error("[ccg] 判定记录：暂存 diff（排除 .ccg）为空 ⇒ 回落父 sha 命名（纯 .ccg/ 提交）");
+    } else {
+      console.error("[ccg] ⚠ 无法计算 stagedDiffHash（" + (hashResult.error || "未知原因") + "）");
+      console.error("[ccg] ⇒ **不写判定记录**（写父 sha 名会撞名，比不写更糟）；本次跳过记录落盘。");
+      console.error("[ccg] 请检查 git diff 是否可用（git 是否在 PATH、仓库是否可读）。");
+      // ★ 第四轮 i6：error 分支不落盘 —— 首版仍写父 sha 名的记录，而那正是本轮要消灭的
+      //   跨分支撞名源，且没有任何去重处置。不写只会让门禁报「缺记录」（可见、可定位），
+      //   写则产生一个会与他人冲突的文件（不可见、难定位）。两者取其可见者。
+      return null;
+    }
+  }
+  const file = path.join(dir, recordFileName(stagedDiffHash, sha));
+  const record = {
+    sha,
+    layer: layer || "diff", // plan = 决策层(动手前) | diff = 验证层(动手后)
+    mode: result.mode,
+    reason: result.reason,
+    stats: result.stats,
+    stagedDiffHash,
+    // 决策层记录方案点名的待改文件，供事后范围漂移比对
+    plannedFiles: (layer === "plan" && plannedFiles) || undefined,
+    decidedAt: new Date().toISOString(),
+    decidedBy: "ccg-review-decider",
+    deepReview: {
+      required: result.mode !== "skip",
+      status: "pending",
+      performedBy: null,
+      findings: null,
+    },
+  };
+  // ★ 2026-10-16（QM-6 i3，成立并已修）：内容寻址让「同一变更反复提交/amend」落到**同一个文件**，
+  // 这正是收敛性的来源；但副作用是**后写会静默覆盖先写**。若先写那份的 deepReview 已经闭环
+  // （例如 amend 前已跑完双模型审查），覆盖就会把闭环状态抹回 pending ⇒ 欠账门禁重新变红，
+  // 且**已产出的审查结论丢失**。
+  //
+  // sha256 抗碰撞 ⇒ 「同名而内容不同」只可能来自回落路径或哈希碰撞，无需防；
+  // 真正要防的就是这一种：同名 + 已闭环。故写前检查，命中则拒写并保留原文件。
+  if (fs.existsSync(file)) {
+    let prev = null;
+    try { prev = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) { prev = null; }
+    if (shouldPreserveClosedRecord(prev)) {
+      // 不覆盖已有实质内容的记录；把本次判定另存，避免两份都丢失。
+      //
+      // ★ 第四轮 i1/i6（Critical）：alt 名不得无限累积。
+      //   同变更 amend 时 stagedDiffHash 相同 ⇒ 每次都会走到这里 ⇒ 每次都新时间戳 ⇒
+      //   反复 amend 会产生一堆 `<64hex>-again-<sha>-<ts>.json`。
+      //   修法：**同 sha 只保留一个 alt** —— 先把已存在的同前缀 alt 清掉再写新的。
+      //   （`<64hex>-again-` 这个前缀在同一份变更下是确定的，故可按前缀清理。）
+      const altPrefix = file.replace(/\.json$/, "-again-");
+      // ★ 必须用 path.basename 取前缀，不能 split("/")：Windows 路径分隔符是 `\`，
+      //   split("/") 在 Windows 上**不拆分** ⇒ pop() 返回整条路径 ⇒ startsWith(整条路径)
+      //   恒 false ⇒ 去重完全失效（实测：两次 amend 留下两份 alt）。
+      const altBase = path.basename(altPrefix);
+      try {
+        for (const n of fs.readdirSync(dir)) {
+          if (n.startsWith(altBase) && n.endsWith(".json")) {
+            fs.unlinkSync(path.join(dir, n));
+          }
+        }
+      } catch (_) { /* 列目录失败不阻塞主流程 */
+      }
+      // ★ 第二轮 i5：alt 名必须**全局唯一** —— 首版用 sha.slice(0,8)，同前缀会互相覆盖；
+      //   改为完整 sha + 时间戳（同一 sha 内毫秒级也唯一）。
+      const alt = file.replace(
+        /\.json$/,
+        `-again-${sha}-${new Date().toISOString().replace(/[:.]/g, "")}.json`
+      );
+      fs.writeFileSync(alt, JSON.stringify(record, null, 2), "utf8");
+      return alt;
+    }
+  }
+  fs.writeFileSync(file, JSON.stringify(record, null, 2), "utf8");
+  return file;
+}
+
+function currentSha() {
+  return (git(["rev-parse", "HEAD"]) || "").trim() || "unknown";
+}
+
+function detectBackends() {
+  const wrapper =
+    process.env.CODEAGENT_WRAPPER ||
+    path.join(process.env.USERPROFILE || process.env.HOME || "", ".claude", "bin", "codeagent-wrapper.exe");
+  const exists = fs.existsSync(wrapper);
+  return {
+    wrapper,
+    wrapperExists: exists,
+    // 是否装了对应 CLI（只判断可执行文件在不在，不做认证探测——那要联网）
+    claude: hasOnPath("claude"),
+    opencode: hasOnPath("opencode"),
+  };
+}
+
+function hasOnPath(cmd) {
+  const r = spawnSync(process.platform === "win32" ? "where" : "which", [cmd], {
+    encoding: "utf8",
+  });
+  return r.status === 0 && !!r.stdout.trim();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  main
+// ═══════════════════════════════════════════════════════════════════
+
+function main() {
+  const argv = process.argv.slice(2);
+  const printOnly = argv.includes("--print");
+  const shaIdx = argv.indexOf("--sha");
+  const sha = shaIdx >= 0 && argv[shaIdx + 1] ? argv[shaIdx + 1] : currentSha();
+  const inputIdx = argv.indexOf("--input");
+  // --base <rev> = 验证层·已提交区间：事后补跑时判 base...HEAD，而不是（通常为空的）暂存区
+  const baseIdx = argv.indexOf("--base");
+  const base = baseIdx >= 0 && argv[baseIdx + 1] ? argv[baseIdx + 1] : null;
+
+  // --input <方案文件> = 决策层：动手之前对方案判复杂度
+  // --base <rev>       = 验证层·已提交区间：事后补跑（残余 2）
+  // 两者都无            = 验证层·暂存区：pre-commit
+  //
+  // ★ 残余 2：三种「拿不到输入」的情形原来都打印**读起来像「无需审查」**的话
+  //   （「跳过」「暂存区无变更」），而实际是**判据从未执行**。现在统称「未判定」，
+  //   并给出补救命令。仍然 return 0（不阻断提交）—— pre-commit 阶段暂存区为空是常态，
+  //   把它变成红会误伤所有提交。
+  let staged;
+  if (inputIdx >= 0 && argv[inputIdx + 1]) {
+    const file = path.resolve(argv[inputIdx + 1]);
+    staged = collectProposal(file);
+    if (staged.error) {
+      console.log(`   [CCG] ${staged.error}`);
+      return 0;
+    }
+  } else if (base) {
+    staged = collectRange(base);
+    if (!staged) {
+      console.log(`   [CCG] ⚠ 未判定：读不到 ${base}...HEAD（base 不存在，或当前不是 git 仓库）`);
+      console.log("         这**不等于**「无需审查」。可用基准按序试：");
+      console.log("           origin/main / main / <本次改动之前的那个提交>；");
+      console.log("           或用 CCG_DECIDER_BASE=<rev> 指定后重跑。");
+      return 0;
+    }
+    if (staged.files.length === 0) {
+      // ★ 深度审查 i3 修正（2026-10-15）：原措辞只提示「若你期望有改动，说明 base 选错了」，
+      //   而补救示例仍是 `--base origin/main` —— 在**最常触发本分支的场景**
+      //   （改动已并入 base、HEAD 就在基准上）里，origin/main 恰恰是失效的那个基准，
+      //   用户照着做还是空的，等于把系统提示写成「是你选错了」。
+      //   现在把两个真实子情形与各自**可用**的基准写出来。
+      const head = (git(["rev-parse", "--short", "HEAD"]) || "?").trim();
+      const baseShort = (git(["rev-parse", "--short", base]) || "?").trim();
+      console.log(`   [CCG] ⚠ 未判定：${base}...HEAD 为空（HEAD=${head}，base=${baseShort}）`);
+      console.log("         这**不等于**「无需审查」。两种常见成因与各自的可执行补救：");
+      console.log("           ① 改动**还没提交**（在暂存区）⇒ 去掉 --base，直接判暂存区");
+      console.log(
+        `           ② 改动**已并入 ${base}**（HEAD 就在基准上）⇒ 换更早的基准，例如` +
+          ` \`--base ${base}~1\`，或用 \`git log\` 找到本次改动的父提交`
+      );
+      return 0;
+    }
+  } else {
+    staged = collectStaged();
+    if (!staged) {
+      console.log("   [CCG] ⚠ 未判定：读不到 git 暂存区（不影响提交）");
+      console.log("         这**不等于**「无需审查」。补跑请带 --base <rev>。");
+      return 0;
+    }
+    if (staged.files.length === 0) {
+      console.log("   [CCG] ⚠ 未判定：暂存区无变更，且未给 --base");
+      console.log("         这不是「无需审查」，是「没判」。补跑：--base origin/main");
+      return 0;
+    }
+  }
+
+  const result = judge(staged);
+  const backends = detectBackends();
+  const layer = staged.proposal ? "决策层(动手前·方案)" : "验证层(动手后·diff)";
+
+  console.log(`   [CCG] 审查模式判定 [${layer}]: ${result.mode.toUpperCase()}`);
+  console.log(`          ${result.reason}`);
+  if (staged.proposal) {
+    const s = staged.stats;
+    console.log(
+      `          方案规模估算 ${result.stats.changedLines} 行 / ${s.fileCount} 个文件` +
+        (s.estimated ? "（方案未声明预计规模，按文档体量估算）" : "（采信方案声明的预计规模）")
+    );
+  }
+  console.log(
+    `          变更 ${result.stats.changedLines} 行 / ${result.stats.codeFileCount} 个源文件` +
+      (result.stats.sensitivePathHits.length || result.stats.sensitiveContentHits
+        ? ` / 敏感命中 ${result.stats.sensitivePathHits.length} 路径 + ${result.stats.sensitiveContentHits} 内容`
+        : " / 无敏感命中")
+  );
+  // i3：文档里的敏感词只报告，不改 mode。点名是为保住这个观测点 ——
+  // 「真口令被贴进 .md」原来靠 contentHits 的假阳性顺带被看见，现在必须显式报。
+  if (result.stats.docSensitiveContentHits > 0) {
+    console.log(
+      `          ⚠ 文档行命中敏感词 ${result.stats.docSensitiveContentHits} 处（**不计入模式判定**，请人工确认是否真凭证）：` +
+        result.stats.docSensitiveContentSample.map((s) => `「${String(s).slice(0, 40)}」`).join(" ")
+    );
+  }
+  // i5：有规模却读不到变更行 —— 显式报出，不让它退化成「无敏感内容」
+  if (result.stats.lineReadGaps && result.stats.lineReadGaps.length > 0) {
+    console.log(
+      `          ⚠ ${result.stats.lineReadGaps.length} 个文件的变更行读不到（规模取自 numstat）⇒ 敏感内容判定对其失效：` +
+        result.stats.lineReadGaps.slice(0, 5).join(", ")
+    );
+  }
+
+  if (result.mode === "skip") {
+    console.log("          S 复杂度低风险，按 CCG 决策矩阵不调外部模型");
+  } else {
+    const available = ["claude", "opencode"].filter((b) => backends[b]);
+    const target = result.mode === "dual" ? "双模型(claude + opencode)" : "单模型(claude)";
+    if (available.length === 0) {
+      console.log(`          ⚠ 要求 ${target} 深度审查，但两个后端 CLI 都不可用`);
+      console.log("            → 降级为 SELF-REVIEW：必须由 agent 自行完成评审并记录结论");
+    } else if (result.mode === "dual" && available.length < 2) {
+      console.log(`          ⚠ 要求 ${target}，但仅 ${available.join("+")} 可用`);
+      console.log("            → 降级为单后端 + 补一次 agent 自评");
+    } else {
+      console.log(`          要求 ${target} 深度审查，后端就绪（${available.join(" + ")}）`);
+    }
+    console.log(
+      staged.proposal
+        ? "          → 决策层：动手之前跑 sh scripts/plan-review.sh，收敛后才可开始写码"
+        : "          → 验证层：动手之后跑 sh scripts/deep-review.sh"
+    );
+  }
+
+  if (!printOnly) {
+    const f = saveRecord(
+      result,
+      sha,
+      staged.proposal ? "plan" : "diff",
+      staged.plannedFiles
+    );
+    console.log(`          判定已落盘: ${path.relative(process.cwd(), f)}`);
+    if (staged.proposal && staged.plannedFiles && staged.plannedFiles.length) {
+      console.log(`          方案点名待改文件 ${staged.plannedFiles.length} 个（供事后范围比对）`);
+    }
+  }
+  return 0;
+}
+
+// ★ 残余 3（2026-10-15 顺带修）：加 require.main 守卫并导出。
+//
+// 原来本文件以无条件的 `process.exit(main());` 结尾、且不导出任何东西，
+// 于是测试只能「读源码 → 剥掉最后那行 process.exit → 注入 module.exports → _compile」。
+// 那种做法**依赖源码文本**：只要结尾那行的形态变了（例如被缩进进 if 块），
+// 剥离就静默失效。本 PR 正好要改这个结尾，所以改成正路：
+//   - 测试直接 require 本模块（require 时不执行 main，因为 require.main !== module）
+//   - CLI 行为不变（作为入口运行时才 process.exit）
+if (require.main === module) {
+  process.exit(main());
+}
+
+module.exports = {
+  RULES,
+  judge,
+  collectStaged,
+  collectFromDiff,
+  collectRange,
+  collectProposal,
+  isDocsOnly,
+  recordFileName,
+  CLOSED_DEEP_REVIEW_STATUSES,
+  PRESERVE_BY_STATUS,
+  shouldPreserveClosedRecord,
+  // 导出 saveRecord 仅为**行为锁**服务（真调它对「同变更反复 amend 不累积 alt」取证）；
+  // 它依赖 process.cwd() 与真实 git，故只在测试里用，不在生产路径上被别处调用。
+  saveRecord,
+};
+

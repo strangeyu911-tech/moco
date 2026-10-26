@@ -1,0 +1,197 @@
+# Logto 生产部署、灰度与回滚 Runbook
+
+> 日期：2026-07-21  
+> 适用范围：Logto、业务 PostgreSQL、`@multi-publish/api-publish-engine`
+
+## 1. 发布前
+
+1. 在 Secret Store 配置 `deploy/logto/.env.example` 和 `api.env.example` 对应变量，不创建带真实值的仓库文件。必须先在 Logto Admin Console 创建供业务 API 使用的 M2M Application，并把 `LOGTO_CLIENT_ID`、`LOGTO_CLIENT_SECRET` 同时写入 Secret Store；任一缺失都禁止启动生产 API。
+2. 确认 Logto DB 与业务 DB 的主机/数据库组合不同。
+3. 生成 2048 位以上 RSA entitlement 私钥，私钥仅进入业务 API Secret Store。
+4. 将 `API_KEYS_PATH` 指向 UID `1001` 可写的持久卷（Compose 默认 `/app/packages/api-publish-engine/config/api-keys.json`），并确认该持久卷只有一个 `publish-api` writer。第二 writer 返回 `API_KEY_WRITER_LOCKED` 时必须停止扩容或重复启动，不能删除锁目录或放宽门禁；横向扩容前迁移到具备事务或 CAS 的共享存储。
+5. 在 ECS 部署宿主机先检查根盘；可用空间少于 `5 GiB` 或少于总容量的 `10%` 时停止发布、镜像拉取、备份和迁移，先由运维人员确认可再生日志的保留期后清理。禁止把 `docker system prune`、Docker 卷删除或项目目录删除当作自动恢复手段：
+
+```text
+df -Pk / | awk 'NR == 2 {
+  if ($4 < 5242880 || $4 * 100 < $2 * 10) {
+    print "根盘可用空间不足：至少需要 5 GiB 且 10%" > "/dev/stderr"
+    exit 1
+  }
+}'
+```
+
+6. shadow 阶段运行：
+
+```text
+node packages/api-publish-engine/scripts/validate-production-config.js --phase shadow
+node packages/api-publish-engine/scripts/migrate-postgres.js --dry-run
+node packages/api-publish-engine/scripts/migrate-postgres.js
+```
+
+任一命令非零退出即停止发布。
+
+migration CLI 只使用构建产物内的固定目录，不接受任意 `--directory`。独立制品必须由受控 Secret Store 提供只读的 `BUSINESS_DATABASE_MIGRATIONS_DIR`。
+
+## 2. 备份
+
+运行主机必须安装与 PostgreSQL 主版本兼容的 `psql`、`pg_dump` 和 `pg_restore`。双库无法共享同一个 PostgreSQL snapshot；生成生产恢复点前，必须先把业务 API 从负载均衡摘除、暂停排期任务，并冻结 Logto 登录注册和管理员写操作。等待在途写请求结束后再执行：
+
+备份输出目录必须是本地或支持同目录硬链接的文件系统。Unix 先创建权限为 `0700` 的新目录；Windows 使用 NTFS，并通过 ACL 只授予备份运行账号写权限。网络盘、FAT 或不支持硬链接的卷会返回 `BACKUP_ATOMIC_PUBLISH_UNSUPPORTED`，不得绕过或改用非原子复制。
+
+```text
+set LOGTO_DATABASE_URL=postgresql://...
+set BUSINESS_DATABASE_URL=postgresql://...
+set BACKUP_OUTPUT_DIRECTORY=D:\secure-backups\2026-07-21
+node deploy/logto/scripts/postgres-backup.js --confirm-writes-paused
+```
+
+未提供 `--confirm-writes-paused` 时命令以退出码 `2` 拒绝执行。成功结果包含 `logto.dump`、`business.dump` 和 `manifest.json`，manifest 会记录 `quiesced` 一致性模式。输出目录必须是新的空目录，失败不会留下可用 manifest；把三者作为同一个不可变备份集保存，不要单独移动 dump。
+
+脚本先用 `O_EXCL` 打开随机私有临时文件，再把 `pg_dump` stdout 直接连接到该 descriptor；外部进程不会收到输出路径。两个 dump 完整写入、`fsync` 和 SHA-256 完成后以硬链接原子发布，manifest 最后在 `.backup.lock` 仍持有时发布并同步目录。Unix dump、manifest 和锁为 `0600`；Windows 的 `chmod` 不等价于 ACL，必须依赖前述受限 NTFS 目录。
+
+若进程被强制终止而遗留 `.backup.lock` 或 `.partial`，即使三个最终文件看似齐全，`--verify-only` 也会返回 `BACKUP_IN_PROGRESS`。自动重试和恢复必须停止。确认没有备份进程、检查作业日志并隔离整个输出目录后，再创建一个全新的空目录重跑；不要自动删除未知锁或复用残留 dump。备份成功后才能恢复流量。备份任务至少每日一次，保留 30 天；调度平台必须把“停写、备份、恢复流量”作为同一作业。每月至少在隔离数据库执行一次恢复演练。
+
+## 3. 启动和 smoke
+
+以下命令均从仓库根目录执行：
+
+```text
+docker compose -f deploy/logto/docker-compose.yml --env-file deploy/logto/.env up -d
+docker compose -f deploy/logto/docker-compose.yml --env-file deploy/logto/.env ps
+```
+
+基础 Compose 固定官方 `svhd/logto:1.41.0`，也是 Webhook 补丁的回滚路径。启用哈希绑定的 Webhook POST 重试派生镜像时，先通过第 1 节磁盘门禁，再执行：
+
+```text
+docker compose -f deploy/logto/docker-compose.yml -f deploy/logto/docker-compose.webhook-retry.yml --env-file deploy/logto/.env build --no-cache logto
+docker compose -f deploy/logto/docker-compose.yml -f deploy/logto/docker-compose.webhook-retry.yml --env-file deploy/logto/.env up -d --no-deps --force-recreate logto
+docker compose -f deploy/logto/docker-compose.yml -f deploy/logto/docker-compose.webhook-retry.yml --env-file deploy/logto/.env ps
+```
+
+派生 Dockerfile 必须绑定 ECS 已验收的基础镜像 manifest digest，白名单式 `.dockerignore` 必须确保生产 `.env` 和其他运维文件不进入 build context。补丁脚本只允许由 Dockerfile 的单个 `RUN` 在隔离构建层中执行，不是在线热补丁工具；禁止通过 `docker exec` 修改运行中容器或并发修改同一运行时目录。补丁或恢复失败必须让 build 非零退出并丢弃该层。构建日志还必须记录运行时文件的补丁前后 SHA-256；目标文件缺失、重复、哈希漂移或上游已包含修复时构建必须失败。切换后检查 OIDC discovery、Logto health、业务 API `/ready` 和 production smoke。随后创建独立 signing key 的临时 Hook 与精确 Nginx 探针路径：接收端前两次返回 503、第三次返回 204，三次请求均须通过 HMAC 校验；只记录 UTC 时间、次数和签名有效性，不记录 payload 或用户资料。Ky 1.2.3 的 `TimeoutError` 不会重试，不能用超时场景替代该探针。验收后立即删除临时 Hook、测试用户、Nginx location、接收进程和日志，主业务 Hook 不变。
+
+本机裸进程诊断与生产 Compose 是两条互斥路径，不要同时启动。选择裸进程诊断时，API 默认监听 `3000`：
+
+```text
+node packages/api-publish-engine/bin/publish-api --port 3000
+node packages/api-publish-engine/scripts/production-smoke.js --logto https://id.example.com --api http://127.0.0.1:3000
+```
+
+需要容器化运行时，从仓库根目录执行。Compose 将容器内的 `3000` 固定映射到宿主机回环 `3030`，因此该路径的 smoke 必须访问 `3030`：
+
+```text
+sudo install -d -m 0750 -o 1001 -g 1001 \
+  packages/api-publish-engine/config \
+  packages/api-publish-engine/data \
+  packages/api-publish-engine/data/plugins
+docker compose -f packages/api-publish-engine/docker-compose.yml --env-file deploy/logto/api.env up -d
+node packages/api-publish-engine/scripts/production-smoke.js --logto https://id.example.com --api http://127.0.0.1:3030
+```
+
+该 Compose 的 `./config`、`./data` 和 `./data/plugins` 必须由上面的命令预先创建，并授权给容器 UID/GID `1001`。Compose 使用 `create_host_path: false`，目录缺失时会 fail closed，而不是让 Docker 自动创建 root-owned bind source。`config` 挂载到 `/app/packages/api-publish-engine/config`，与 `ApiKeyManager` 和默认配置文件路径一致；不要改回 `/app/config`。业务 API 同时加入 `LOGTO_COMPOSE_NETWORK` 指定的外部网络；基础 `deploy/logto/docker-compose.yml` 的项目名固定为 `multi-publish-logto`，因此默认网络名是 `multi-publish-logto_default`。当 `BUSINESS_DATABASE_URL` 使用 `postgres` 服务名时，这个网络连接不可省略；自定义基础项目名时必须同步覆盖该变量。监控 overlay 也不能单独启动，必须和基础 Logto Compose 一起传给 `docker compose -f`。
+
+`/api/v1/health` 只表示进程存活；只有 `/api/v1/ready` 返回 200，且响应中的 `checks.introspection.status` 为 `ready`，才能把实例加入负载均衡。该检查会向 discovery 声明的同源 HTTPS introspection endpoint 发送随机无效 token；只有 M2M 凭据有效且响应为 `active:false` 才通过。`production-smoke.js` 会拒绝缺少该检查的旧镜像。
+
+### 桌面端发行配置
+
+桌面包使用 `config/identity-public.json` 作为公开身份配置，并在打包后从 `resources/config/identity-public.json` 加载。该文件只能包含 Logto endpoint、Native Application ID、resource、业务 API URL、回环 callback、scope、entitlement key id 和 RSA 公钥；加载器拒绝未知字段、任何私钥字段和无效 RSA 公钥。构建前执行 `node apps/desktop/check-integrity.js`，它会解析并校验源配置；随后在 Windows 目录包中确认同一文件位于 `resources/config/` 且内容一致。
+
+发行配置存在时，`identityAuthEnabled` 只能由 `identity-public.json` 声明，`IDENTITY_AUTH_ENABLED` 不会覆盖它；`IDENTITY_AUTH_REQUIRED` 和其余公开字段才允许由受控进程环境覆盖，合并后仍会拒绝 `enabled=false`、`required=true` 等矛盾开关。没有发行配置的旧式开发环境继续兼容环境变量启用开关。Shadow 阶段桌面端保持 `IDENTITY_AUTH_ENABLED=true`、`IDENTITY_AUTH_REQUIRED=false`，业务 API 也保持 `IDENTITY_AUTH_REQUIRED=false`；这只允许观测真实身份链路，不放松服务端 Bearer 验证。配置读取或校验失败一律阻止桌面端启动，Shadow 仅允许临时非配置初始化失败降级。`BUSINESS_API_URL=https://auth.iart.work` 是业务 API 的公开反代基址（`/api/`），而 `LOGTO_API_RESOURCE=https://api.multi-publish.com` 是 Token audience。进入 Required 前必须先完成真实登录、refresh token 轮换、退出、真正 A→B 账号切换和带 Bearer Token 的 `/api/v1/me` 验收；同账号重新认证不能替代 A→B 主体隔离。entitlement key 轮换需要先验证服务端私钥，再更新公开 JSON 的 key id/公钥并重发桌面安装包。
+
+## 4. 灰度
+
+### Shadow
+
+```text
+IDENTITY_AUTH_ENABLED=true
+IDENTITY_AUTH_REQUIRED=false
+BUSINESS_DATABASE_AUTO_MIGRATE=false
+API_KEYS_PATH=/app/packages/api-publish-engine/config/api-keys.json
+LOGTO_CLIENT_ID=<Logto M2M application id>
+LOGTO_CLIENT_SECRET=<Logto M2M application secret>
+```
+
+确认真实登录、refresh token 轮换、退出、真正 A→B 账号切换、Webhook 和云端发布后，观察至少一个完整业务高峰。API ready、OIDC discovery、introspection readiness、401/403/503、Webhook 失败和额度拒绝均在预期范围内才进入 required；身份依赖故障不得通过 API Key 回退掩盖。
+
+### Required
+
+```text
+IDENTITY_AUTH_ENABLED=true
+IDENTITY_AUTH_REQUIRED=true
+BUSINESS_DATABASE_AUTO_MIGRATE=false
+API_KEYS_PATH=/app/packages/api-publish-engine/config/api-keys.json
+```
+
+切换前运行 `validate-production-config.js --phase required`。旧 API Key 立即撤销；已排期任务会在执行前重新验证 owner。
+
+## 5. 回滚
+
+身份灰度回滚只改变认证流量，不回滚或删除 schema：
+
+1. 设置 `IDENTITY_AUTH_REQUIRED=false`，保持 `IDENTITY_AUTH_ENABLED=true`。
+2. 运行 `validate-production-config.js --phase rollback`。
+3. 如业务必须继续，仅在受限内部网络临时恢复单独 API Key，并设置撤销时间。
+4. 回退桌面客户端。
+5. 重新运行 `/health`、`/ready` 和 production smoke。
+
+禁止重新启用共享 `JWT_SECRET`，禁止删除 `auth_subject`、Webhook 事件或 `identity_schema_migrations`。
+
+Webhook 派生镜像异常时，从仓库根目录只加载基础 Compose，强制重建 Logto 服务即可回到官方镜像；不要停止 PostgreSQL、不要使用 `down -v`：
+
+```text
+docker compose -f deploy/logto/docker-compose.yml --env-file deploy/logto/.env up -d --no-deps --force-recreate logto
+```
+
+回滚后重新验证 OIDC discovery、容器 health、业务 API `/ready` 与 production smoke，并保留派生镜像和失败日志到审查完成；不得先删除证据。
+
+## 6. 恢复演练
+
+默认只验证 manifest，不连接数据库，也不会执行 `pg_restore`：
+
+```text
+set BACKUP_MANIFEST=D:\secure-backups\2026-07-21\manifest.json
+node deploy/logto/scripts/postgres-restore.js --verify-only
+```
+
+命令退出码为 `0` 才表示 `.backup.lock` 不存在、两个 dump 文件存在、checksum 与 manifest 一致，并且备份是在停写确认后生成。真正恢复属于破坏性操作，必须使用两个新建且未接入任何流量的隔离目标数据库，并逐一确认目标数据库名。从空库预检开始，直到两个数据库恢复、状态变为 `complete` 且 smoke 结束，部署平台必须通过网络策略、连接权限或维护模式确保只有恢复账号能够连接；脚本无法阻止不遵守维护协议的外部客户端在 `psql` 预检与 `pg_restore` 之间写入。`RESTORE_STATE_FILE` 必须位于备份目录之外的受限运维目录；Windows 主机同样需要为该目录设置仅运行账号可写的 NTFS ACL：
+
+```text
+set BACKUP_MANIFEST=D:\secure-backups\2026-07-21\manifest.json
+set RESTORE_STATE_FILE=D:\secure-restore-state\2026-07-21.json
+set LOGTO_DATABASE_URL=postgresql://.../isolated_logto
+set BUSINESS_DATABASE_URL=postgresql://.../isolated_business
+node deploy/logto/scripts/postgres-restore.js --state-file "%RESTORE_STATE_FILE%" --confirm-logto-database isolated_logto --confirm-business-database isolated_business
+```
+
+脚本先使用 `psql` 验证两个隔离目标都没有用户 schema 中的业务对象；任一非空或无法检查时，在执行任何 `pg_restore` 前失败。随后从重新校验 checksum 的只读文件描述符执行 `pg_restore --single-transaction --exit-on-error`，避免校验后路径被替换。
+
+运行期间会独占创建 `%RESTORE_STATE_FILE%.in-progress`。Unix 会在创建进行中状态、发布成功/失败终态和移除进行中状态后同步状态目录；Windows 的目录项耐久性依赖受限 NTFS 卷。任意一个数据库恢复失败时，只生成 `%RESTORE_STATE_FILE%.failed`，整个恢复集均视为失败：立即销毁两个隔离目标数据库，重新创建后使用新的状态文件从头恢复，禁止复用已部分恢复的目标。`.in-progress`、`.failed`、缺失或不可解析状态一律禁止切换；状态文件不是数据库回滚机制。
+
+两个数据库都成功后，再运行 migration dry-run、真实登录/Webhook 一致性检查和 production smoke。所有检查通过后，切换自动化还必须执行以下机器门禁；只有退出码为 `0` 才能由数据库平台原子切换连接配置：
+
+```text
+node deploy/logto/scripts/postgres-restore.js --verify-state --state-file "%RESTORE_STATE_FILE%"
+```
+
+`--verify-state` 会重新校验 manifest/dump、状态文件中的 manifest SHA-256、两个完成库和冲突工件，不需要数据库 URL 或密码。不得直接对生产主库试验恢复。
+
+## 7. 监控
+
+先将 `monitoring/alertmanager.example.yml` 复制到受控路径并替换 webhook 地址，再设置：
+
+```text
+set ALERTMANAGER_CONFIG_FILE=D:\secure-config\alertmanager.yml
+docker compose -f deploy/logto/docker-compose.yml -f deploy/logto/docker-compose.monitoring.yml --env-file deploy/logto/.env up -d
+```
+
+Prometheus 仅绑定 `127.0.0.1:9090`。生产环境通过受控运维通道访问，不直接暴露公网。默认探测业务 API 的宿主机回环 `3030` 端口和 Compose 内 Logto；变更部署拓扑时必须同步修改 Compose 和 `monitoring/prometheus.yml`。
+
+不要直接使用示例通知地址。备份超时告警由生产调度平台接入，未接入前保持 `PENDING_EXTERNAL`。
+
+当前 monitoring overlay 不采集宿主机或 Docker 卷的文件系统指标，不能把它视为磁盘容量告警。进入 Required 前，云监控或受控运维调度必须对根盘和备份卷配置可用空间告警；阈值不得低于发布前的 `5 GiB` 与 `10%` 门槛，并保留至少 30 天备份容量的增长余量。
+
+## 8. 外部验收状态
+
+2026-07-28 已使用真实 Logto、PostgreSQL 与最终 Windows 包证明登录、`free` entitlement、同 profile 恢复、同账号重新认证和退出；专用测试主体已安全回收。2026-07-29 已部署哈希绑定的 Logto 派生镜像，真实临时 Hook 收到三次 HMAC 有效 POST 并依次返回 `503 -> 503 -> 204`，主业务 Hook 同时完成 `User.Created` 与 `User.Deleted` 投递，验收后临时 Hook、用户、权限关系、Nginx 路径、监听进程和脚本均已清理。2026-07-31 已以无写入方式复核业务 API：镜像标签可解析为 `e19a36b588a78a69ef4f5cf27ea79ccbba16783e`，它是对照 `main@feac9e91aac038c5359e62867ca27ce59c0f1db8` 的祖先且目标 entitlement 文件无差异；容器与 Windows checkout 的该文件 SHA-256 一致。该结论只覆盖时钟容差目标文件，migration dry-run 无 pending，`/api/v1/ready` 和公网 production smoke 均通过；未重建镜像、重启容器或切换 Required。
+
+以下状态仍保持 `PENDING_EXTERNAL`：Ky `TimeoutError` 重试或替代补偿、refresh token 轮换、真正 A→B 主体隔离、主 Hook 更新/暂停与生产真实乱序、恢复演练、并发压力及云端发布撤销。`IDENTITY_AUTH_REQUIRED=false` 保持不变；仓库测试、同账号 UAT 或本次 HTTP 503 探针都不能替代这些证据。任何后续 API 镜像变更必须重新取得 migration/readiness/smoke 证据。

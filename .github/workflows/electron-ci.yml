@@ -1,0 +1,194 @@
+# Electron CI — Windows 自托管 runner 确定性回归（windows-latest）
+# 职责边界（2026-08-09 迁移 A/B/C）：
+# 1. 本 job 现运行于 Windows 自托管 runner（windows-latest）：依赖 GitHub 托管 windows-latest（公开仓无限免费额度）；原先常
+#    queued 30-40 分钟）与生产隔离问题（ECS 同时承载 Logto + 业务 API，20 分钟全量测试抢资源）。
+# 2. 本 job = Electron headless 冒烟 + Electron checksum pin 校验 + deps/circular 检查；
+#    Electron GUI 深度门禁由 gui-test.yml（同 windows-latest）承担。
+#    2026-09-17 CI 提速：桌面 vitest 步已收敛为「仅 main push / workflow_dispatch」执行，
+#    PR 上由 Quality Gate 的 desktop-shards 承担 —— 避免同一批桌面测试在单次 PR 中重复执行。
+# 3. Windows 无需虚拟显示器（Electron headless 直接运行）；better-sqlite3 不在依赖图（sqlite-wrapper.js 为 sql.js 兼容层），无需 @electron/rebuild。
+# 4. ECS 自托管 runner 保留配置但不再必需；如需移除，见仓库 Settings → Actions → Runners。
+name: Electron CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      # 文档/流程改动不触发 CI（清单与 .github/scripts/workflow-contract.test.js 的 CI_IGNORED_PATHS 保持同步）
+      - '01-docs/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.ccg/**'
+      - '.claude/**'
+      - '.hermes/**'
+      - '.agents/**'
+      - '.quality-rhythm/**'
+      - 'openspec/**'
+      - '.adversarial/**'
+      - 'scripts/gate-record-debt-ledger.json'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # push（main）按 run_id 唯一分组：GitHub 在同一并发组里只允许一个排队者，
+  # 新 push 一到就把还在排队的旧 push 置为 cancelled，而那条 sha 此后再没有 run ⇒ 主侧证据永久丢失。
+  # 实测（近 1000 条 main push run 按 (sha, workflow) 归集）：被取消过又有后续 run 补回的 = 0 格。
+  # 由 .github/scripts/workflow-contract.test.js 的「2b) main push 的并发组」锁住，详见 #2642。
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # --- docs-only 短路判定（change: docs-only-ci-shortcircuit；与 quality-gate.yml 同模式）---
+  # 红线不变：pull_request 触发级 paths-ignore 仍被 workflow-contract.test.js 禁止（PR #2151 死锁）。
+  # PR 上本 workflow 剩余开销是 install + Electron 下载 + 冒烟 + build Vue + deps/circular
+  # （桌面 vitest 已收敛为仅 main push），对纯文档 PR 全部无意义 => job 级短路。
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # merge-base diff 需要完整历史
+
+      - name: Detect docs-only changes
+        id: classify
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs-only=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only=false (non-PR event: full run)"
+            exit 0
+          fi
+          BASE="${{ github.event.pull_request.base.sha }}"
+          node scripts/classify-docs-only.js --base="$BASE" --repo="$PWD"
+
+  electron-tests:
+    runs-on: windows-latest
+    needs: [changes]
+    # docs-only 短路：纯文档 PR 跳过（skipped 满足 required check；混合 PR 全量不变）
+    if: needs.changes.outputs.docs-only != 'true'
+    # 预算不得倒挂（#2458）：本 job 的显式上限之和 = Install dependencies 10 +
+    # Install Electron runtime 10 + 串行单测步骤内层 timeout 35 = 55 分钟，
+    # 再加 checkout/setup/媒体工具 restore/冒烟/构建等无上限步骤。
+    # 旧值 45 已经贴着这个上界 —— 只把内层 20m 抬到 35m 而不抬 job 级，
+    # 结果是「不可归因的 job 级超时」取代「不可归因的步骤级 exit 124」，
+    # 失败模式没修，只是换了个掐掉它的层。70 = 55 + 约 15 分钟其它步骤余量。
+    timeout-minutes: 70
+    defaults:
+      run:
+        shell: bash
+    env:
+      NODE_ENV: test
+      SKIP_NATIVE_MEDIA_TOOL_TESTS: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Restore required JavaScript runtimes
+        run: |
+          node scripts/run-package-install.js esbuild
+          node scripts/run-package-install.js --script scripts/postinstall.js vue-demi
+
+      - name: Verify Electron checksum pin (win32, windows-latest)
+        run: |
+          node -e "const checksums = require('./node_modules/electron/checksums.json'); const artifact = 'electron-v43.7.7-win32-x64.zip'; const pinned = checksums[artifact]; if (typeof pinned !== 'string' || pinned.length === 0) throw new Error('Electron checksum pin missing for ' + artifact); console.log('Electron ' + artifact + ' checksum verified present in manifest');"
+
+      - name: Install Electron runtime
+        timeout-minutes: 10
+        env:
+          ELECTRON_MIRROR: https://cdn.npmmirror.com/binaries/electron/
+        run: |
+          unset electron_use_remote_checksums npm_config_electron_use_remote_checksums
+          node node_modules/electron/install.js
+
+      # 2026-09-17：PR 上跳过本步（同一批桌面测试已由 QG desktop-shards 分片执行），
+      # 仅在 main push / workflow_dispatch 运行，保留「单 worker 串行确定性模式」的 CI 覆盖与第二次独立运行的 flake 检出。
+      - name: Unit tests (Vitest, non-Electron, single-worker deterministic)
+        if: github.event_name != 'pull_request'
+        run: |
+          # 预算必须挂**步骤级**实测，不能挂魔数，也不能拿 job 级总时长当步骤基线（#2458）。
+          # 步骤健康耗时实测 794s（run 36380533567 / main push bef5fb72 的自证行
+          # `elapsed=794s budget=2100s rc=0`），被替换掉的旧墙是 1200s。真实红因是 runner
+          # 负载把步骤耗时放大到越过旧墙（main 近 14 次运行里 8 次 exit 124），而不是
+          # "自然耗时已贴着墙" —— 794s 对 1200s 本来还有约 33% 余量。
+          # 层级混淆的完整依据与两个数字的出处：docs/electron-ci-step-budget-baseline.md。
+          # 2100s ≈ 健康步骤耗时 ×2.6 ≈ 旧墙 ×1.75，属**单调放宽**（不会让任何原本通过的运行
+          # 变红），但仍不是「修好了根因」：根因修法是按 --shard 把这一轮切开（issue 档 2）。
+          # 同一 job 级 timeout-minutes 必须一起抬，否则只是把「不可归因的超时」从
+          # timeout(1) 换成 Actions 的 job killer —— 那正是本 issue 的失效模式。
+          BUDGET_SECONDS=2100
+          LOG=electron-ci-unit-tests.log
+          START=$(date +%s)
+          timeout --signal=TERM --kill-after=30s ${BUDGET_SECONDS}s \
+            pnpm --filter @multi-publish/desktop test -- \
+            --maxWorkers=1 --no-file-parallelism --reporter=verbose \
+            --testTimeout=10000 --hookTimeout=10000 --teardownTimeout=10000 2>&1 | tee "$LOG"
+          # 必须读 PIPESTATUS：`cmd | tee` 的 $? 是 tee 的退出码（恒 0），
+          # 直接判 $? 会把超时和断言失败一起吞成成功。
+          RC=${PIPESTATUS[0]}
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "[electron-ci-timeout-budget] elapsed=${ELAPSED}s budget=${BUDGET_SECONDS}s rc=${RC}"
+          if [ "${RC}" -eq 124 ]; then
+            echo "TIMEOUT_BUDGET_EXCEEDED：本轮被步骤级 timeout 掐断，不是断言失败。"
+            echo "自证判据：日志里没有 vitest 摘要行（Test Files ... / Tests ...），说明整轮没跑完。"
+            grep -cE '^[[:space:]]+[✓×↓-]' "$LOG" | sed 's/^/已完成测试行数: /' || true
+            grep -cE '^ *(Test Files|Tests) ' "$LOG" | sed 's/^/摘要行数(应为 2): /' || true
+            tail -n 8 "$LOG" | sed 's/^/末段输出: /' || true
+            echo "下一步应该是把这一轮按 --shard 切开，而不是继续加大预算。"
+          fi
+          exit "${RC}"
+
+      - name: Vitest failure diagnostics
+        if: failure()
+        run: |
+          echo "Vitest 或前置步骤失败，输出 runner 进程列表"
+          tasklist.exe 2>/dev/null | head -40 || true
+
+      - name: Electron smoke test (headless, windows-latest)
+        run: |
+          cd apps/desktop
+          set +e
+          timeout 30 pnpm exec electron . --no-sandbox --disable-gpu 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 124 ]; then
+            echo "Electron remained alive for the smoke window"
+          elif [ "$status" -eq 0 ]; then
+            echo "Electron exited before the smoke window completed"
+            exit 1
+          else
+            exit "$status"
+          fi
+
+      - name: Build Vue frontend
+        run: |
+          pnpm --filter @multi-publish/desktop build:vue
+
+      - name: Dependency check
+        run: pnpm run check:deps
+
+      - name: Circular dependency check
+        run: pnpm run check:circular

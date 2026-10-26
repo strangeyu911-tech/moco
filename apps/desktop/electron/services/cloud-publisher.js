@@ -1,0 +1,188 @@
+// @ts-check
+/**
+ * CloudPublisher — Orchestrator HTTP client for cloud-based publishing (F13)
+ *
+ * Communicates with platform-orchestrator's publish endpoints to submit
+ * and track video publish tasks running on the ECS server.
+ *
+ * IPC handlers (registered via registerIpcHandlers):
+ *   cloud-publisher:submit     → submitTask
+ *   cloud-publisher:list-tasks → listTasks
+ *   cloud-publisher:get-task   → getTask
+ *   cloud-publisher:platforms  → getSupportedPlatforms
+ */
+
+const logger = require('./logger')
+const log = logger.log || logger
+const EC = require('../core/error-codes').ERROR
+const { withSenderCheck } = require('../ipc-handlers/helpers')
+
+function assertSecureOrchestratorUrl(rawUrl, authService) {
+  if (!rawUrl || !authService) return
+  let url
+  try {
+    url = new URL(rawUrl)
+  } catch (error) {
+    throw new Error('ORCHESTRATOR_URL 必须是有效的 HTTPS 地址', { cause: error })
+  }
+  const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopback)) {
+    throw new Error('启用身份认证后 ORCHESTRATOR_URL 必须使用 HTTPS（本机开发可使用回环 HTTP）')
+  }
+}
+
+class CloudPublisher {
+
+  /**
+   * @param {Object} opts
+   * @param {string} opts.orchestratorUrl - Orchestrator base URL (必填，通过环境变量 ORCHESTRATOR_URL 或显式传入)
+   * @param {Object} opts.store - Electron store instance (reserved for future use)
+   */
+  constructor (opts) {
+    const Axios = opts.axios || require("axios")
+    // R28/R37：为 orchestrator HTTP 调用配置默认超时，避免 orchestrator 挂起时请求永久 pending
+    this._axios = Axios.create ? Axios.create({ timeout: 30000 }) : Axios
+    // 安全：不再硬编码生产 IP，必须通过 opts 或环境变量提供
+    this._orchestratorUrl = opts.orchestratorUrl || process.env.ORCHESTRATOR_URL || ''
+    if (!this._orchestratorUrl) {
+      log.warn('CloudPublisher', 'orchestratorUrl 未配置（set opts.orchestratorUrl 或 ORCHESTRATOR_URL env）')
+    }
+    this._store = opts.store || null
+    this._authService = opts.authService || null
+    assertSecureOrchestratorUrl(this._orchestratorUrl, this._authService)
+  }
+
+  async _requestConfig (forceRefresh = false) {
+    if (!this._authService) return null
+    const token = await this._authService.getAccessToken({ forceRefresh })
+    return { headers: { Authorization: 'Bearer ' + token } }
+  }
+
+  async _request (method, url, data) {
+    const call = async (forceRefresh) => {
+      const config = await this._requestConfig(forceRefresh)
+      if (config) return data === undefined ? this._axios[method](url, config) : this._axios[method](url, data, config)
+      return data === undefined ? this._axios[method](url) : this._axios[method](url, data)
+    }
+    try {
+      return await call(false)
+    } catch (error) {
+      if (!this._authService || !error || !error.response || error.response.status !== 401) throw error
+      return call(true)
+    }
+  }
+
+  /**
+   * 提交云端发布任务
+   *
+   * POST /api/jobs/publish-video  { mode: "cloud", video_url, platform, title, desc, tags, cover_url }
+   *
+   * @param {Object} params
+   * @param {string} params.videoUrl
+   * @param {string} params.platform
+   * @param {string} params.title
+   * @param {string} [params.desc]
+   * @param {string[]} [params.tags]
+   * @param {string} [params.coverUrl]
+   * @returns {Promise<Object>} orchestrator response: { task_id, status, platform }
+   */
+  async submitTask ({ videoUrl, platform, title, desc, tags, coverUrl }) {
+    if (this._authService && typeof this._authService.requireEntitlement === 'function') {
+      await this._authService.requireEntitlement('cloud_publish', { onlineOnly: true })
+    }
+    const resp = await this._request('post', this._orchestratorUrl + '/api/jobs/publish-video', {
+      video_url: videoUrl,
+      platform: platform,
+      title: title,
+      desc: desc || '',
+      tags: tags || [],
+      cover_url: coverUrl || '',
+      mode: 'cloud',
+    })
+    return resp.data
+  }
+
+  /**
+   * 获取云端发布任务列表
+   *
+   * GET /api/jobs/publish
+   *
+   * @returns {Promise<{items: Array}>}
+   */
+  async listTasks () {
+    const resp = await this._request('get', this._orchestratorUrl + '/api/jobs/publish')
+    return resp.data
+  }
+
+  /**
+   * 获取单个云端发布任务详情
+   *
+   * GET /api/jobs/publish/{taskId}
+   *
+   * @param {string} taskId
+   * @returns {Promise<Object>}
+   */
+  async getTask (taskId) {
+    const resp = await this._request('get', this._orchestratorUrl + '/api/jobs/publish/' + encodeURIComponent(taskId))
+    return resp.data
+  }
+
+  /**
+   * 获取支持云端发布的平台列表
+   *
+   * @returns {Array<{id: string, name: string}>}
+   */
+  getSupportedPlatforms () {
+    return [
+      { id: 'bilibili', name: 'Bilibili' },
+      { id: 'douyin', name: '抖音' },
+    ]
+  }
+
+  /**
+   * 注册 IPC handlers
+   */
+  registerIpcHandlers (injectedIpcMain) {
+    // MAJOR-3：必须注入 access-controlled ipcMain，禁止回退全局 ipcMain（绕过权限层）
+    if (!injectedIpcMain) {
+      throw new Error("cloud-publisher registerIpcHandlers requires an injected ipcMain");
+    }
+    const ipcMain = injectedIpcMain
+    ipcMain.handle('cloud-publisher:submit', withSenderCheck(async (_event, params) => {
+      try {
+        const result = await this.submitTask(params)
+        // M-7 修复：统一为标准 { code, data, message } 格式
+        return { code: 0, data: result }
+      } catch (err) {
+        log.error('CloudPublisher', 'submit failed: ' + err.message)
+        return { code: EC.REQUEST_ERROR, message: err.message }
+      }
+    }))
+
+    ipcMain.handle('cloud-publisher:list-tasks', withSenderCheck(async () => {
+      try {
+        const result = await this.listTasks()
+        return { code: 0, data: result }
+      } catch (err) {
+        log.error('CloudPublisher', 'list-tasks failed: ' + err.message)
+        return { code: EC.REQUEST_ERROR, message: err.message }
+      }
+    }))
+
+    ipcMain.handle('cloud-publisher:get-task', withSenderCheck(async (_event, taskId) => {
+      try {
+        const result = await this.getTask(taskId)
+        return { code: 0, data: result }
+      } catch (err) {
+        log.error('CloudPublisher', 'get-task failed: ' + err.message)
+        return { code: EC.REQUEST_ERROR, message: err.message }
+      }
+    }))
+
+    ipcMain.handle('cloud-publisher:platforms', withSenderCheck(async () => {
+      return { code: 0, data: this.getSupportedPlatforms() }
+    }))
+  }
+}
+
+module.exports = CloudPublisher

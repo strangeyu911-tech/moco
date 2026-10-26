@@ -1,0 +1,528 @@
+/**
+ * ModelProviderManager unit tests
+ *
+ * 测试 5 类模型服务商的 CRUD + 默认设置 + 边界场景
+ */
+__enableElectronMock()
+
+__registerMock("./logger", {
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+})
+
+// P2: mock crypto 模块（safeStorage 加密）
+// 注意：encrypt("") 必须返回 null（与真实 crypto.js 行为一致），
+// 否则 _migrateApiKeyEncryption 会给空 api_key 的预设设置非 null 的 api_key_enc
+__registerMock("./crypto", {
+  isAvailable: () => true,
+  encrypt: (key) => {
+    if (!key) return null
+    return Buffer.from("enc_" + key, "utf-8")
+  },
+  decrypt: (buf) => {
+    if (!buf) return ""
+    const s = Buffer.isBuffer(buf) ? buf.toString("utf-8") : Buffer.from(buf, "base64").toString("utf-8")
+    return s.startsWith("enc_") ? s.slice(4) : ""
+  },
+  mask: (key) => {
+    if (!key || key.length < 8) return "****"
+    return key.substring(0, 4) + "****" + key.substring(key.length - 4)
+  },
+  setSafeStorage: () => {},
+})
+
+describe("ModelProviderManager", function () {
+  let ModelProviderManager
+  let manager
+  let mockStore
+
+  // 模拟 store
+  function createMockStore() {
+    const data = new Map()
+    return {
+      _ready: true,
+      db: {
+        prepare(sql) {
+          return {
+            run(...args) {
+              // 模拟 INSERT OR IGNORE（种子数据：5 个参数 id,name,category,base_url,models）
+              if (sql.includes("INSERT OR IGNORE")) {
+                const id = args[0]
+                if (!data.has(id)) {
+                  data.set(id, {
+                    id: args[0], name: args[1], category: args[2],
+                    base_url: args[3], api_key: "", api_key_enc: null,
+                    models: args[4], enabled: 0,
+                    is_default: 0, is_preset: 1,
+                    config: "{}",
+                  })
+                }
+                return { changes: data.has(id) ? 1 : 0 }
+              }
+              // 模拟 INSERT
+              if (sql.includes("INSERT INTO")) {
+                // P2: api_key 加密到 api_key_enc，api_key 清空
+                // INSERT 参数: id, name, category, base_url, '', apiKeyEnc, models, enabled, config
+                // 注意：manager.js 的 INSERT 用字面量 '' 和 0，mock store 按位置取参数
+                const cryptoMod = require("./crypto")
+                const apiKeyEnc = args[4] // 第 5 个参数是 apiKeyEnc（在 '' 之后）
+                data.set(args[0], {
+                  id: args[0], name: args[1], category: args[2],
+                  base_url: args[3], api_key: "", api_key_enc: apiKeyEnc || null,
+                  models: args[5], enabled: args[6] || 0,
+                  is_default: args[7] || 0, is_preset: args[8] || 0,
+                  config: args[9] || "{}",
+                })
+                return { changes: 1 }
+              }
+              // 模拟 UPDATE（支持多列 SET）
+              if (sql.includes("UPDATE")) {
+                // 解析 WHERE id = ?
+                const whereMatch = sql.match(/WHERE\s+id\s*=\s*\?/i)
+                if (whereMatch) {
+                  const id = args[args.length - 1]
+                  const row = data.get(id)
+                  if (row) {
+                    // 解析 SET 子句：col1 = ?, col2 = ?, ...
+                    const setMatch = sql.match(/SET\s+(.+?)\s+WHERE/i)
+                    if (setMatch) {
+                      const setParts = setMatch[1].split(",").map(s => s.trim())
+                      let argIdx = 0
+                      for (const part of setParts) {
+                        const colM = part.match(/^(\w+)\s*=\s*\?$/)
+                        if (colM) {
+                          row[colM[1]] = args[argIdx++]
+                        }
+                      }
+                    }
+                    return { changes: 1 }
+                  }
+                }
+                return { changes: 0 }
+              }
+              // 模拟 DELETE
+              if (sql.includes("DELETE")) {
+                data.delete(args[0])
+                return { changes: 1 }
+              }
+              return { changes: 0 }
+            },
+            get(...args) {
+              if (sql.includes("SELECT id FROM")) {
+                // 检查是否存在
+                const id = args[0]
+                return data.has(id) ? { id } : null
+              }
+              if (sql.includes("SELECT COUNT")) {
+                let count = 0
+                for (const [, v] of data) {
+                  if (sql.includes("category = ?")) {
+                    // P2: 检查 api_key_enc 而非 api_key
+                    if (v.category === args[0] && v.api_key_enc && v.enabled) count++
+                  }
+                }
+                return { cnt: count }
+              }
+              if (sql.includes("is_default = 1")) {
+                for (const [, v] of data) {
+                  if (v.category === args[0] && v.is_default) return v
+                }
+                return null
+              }
+              if (sql.includes("api_key_enc IS NOT NULL")) {
+                for (const [, v] of data) {
+                  if (v.category === args[0] && v.api_key_enc) return v
+                }
+                return null
+              }
+              if (sql.includes("WHERE id = ?")) {
+                return data.get(args[0]) || null
+              }
+              return null
+            },
+            all(...args) {
+              const results = []
+              for (const [, v] of data) {
+                if (args.length > 0 && sql.includes("category = ?")) {
+                  if (v.category === args[0] && (!sql.includes("enabled = 1") || v.enabled)) results.push(v)
+                } else {
+                  results.push(v)
+                }
+              }
+              return results
+            },
+          }
+        },
+        transaction(fn) {
+          return fn
+        },
+      },
+      getSetting: vi.fn(),
+      setSetting: vi.fn(),
+    }
+  }
+
+  beforeAll(function () {
+    ModelProviderManager = require("../electron/services/model-provider-manager").ModelProviderManager
+  })
+
+  beforeEach(function () {
+    mockStore = createMockStore()
+    manager = new ModelProviderManager(mockStore)
+  })
+
+  describe("初始化", function () {
+    it("应成功初始化并写入种子数据", function () {
+      manager.init()
+      expect(manager._ready).toBe(true)
+      const providers = manager.listProviders()
+      expect(providers.length).toBeGreaterThan(0)
+    })
+
+    it("Store 未就绪时不应初始化", function () {
+      manager._store = { _ready: false }
+      manager.init()
+      expect(manager._ready).toBe(false)
+    })
+  })
+
+  describe("listProviders", function () {
+    beforeEach(function () { manager.init() })
+
+    it("应返回所有服务商", function () {
+      const all = manager.listProviders()
+      expect(all.length).toBeGreaterThan(30) // 预设约 38 个
+    })
+
+    it("应按类别过滤 LLM", function () {
+      const llm = manager.listProviders("llm")
+      expect(llm.length).toBeGreaterThan(0)
+      llm.forEach(p => expect(p.category).toBe("llm"))
+    })
+
+    it("应按类别过滤 video", function () {
+      const video = manager.listProviders("video")
+      expect(video.length).toBeGreaterThan(0)
+      video.forEach(p => expect(p.category).toBe("video"))
+    })
+
+    it("应按类别过滤 tts", function () {
+      const tts = manager.listProviders("tts")
+      expect(tts.length).toBeGreaterThan(0)
+    })
+
+    it("应按类别过滤 speech_recognition", function () {
+      const stt = manager.listProviders("speech_recognition")
+      expect(stt.length).toBeGreaterThan(0)
+    })
+
+    it("应按类别过滤 image", function () {
+      const image = manager.listProviders("image")
+      expect(image.length).toBeGreaterThan(0)
+    })
+
+    it("MiniMax Image 的存量多模型配置也应规范为固定 image-01", function () {
+      manager.updateProvider("minimax-image", { models: ["image-01-live", "image-01"] })
+
+      const minimax = manager.listProviders("image").find(p => p.id === "minimax-image")
+      expect(minimax.models).toEqual(["image-01"])
+    })
+
+    it("返回结果不应包含 api_key", function () {
+      const all = manager.listProviders()
+      all.forEach(p => expect(p.api_key).toBeUndefined())
+    })
+
+    it("空 API Key 的预设不应被序列化为已配置", function () {
+      const all = manager.listProviders()
+      expect(all).not.toHaveLength(0)
+      all.forEach(p => expect(p.api_key_masked).toBe(""))
+    })
+
+    it("无法解密的密钥不应伪装为已配置", function () {
+      const crypto = require("./crypto")
+      const decrypt = crypto.decrypt
+      crypto.decrypt = () => { throw new Error("decrypt failed") }
+
+      expect(manager._safeRow({ id: 'broken', api_key_enc: Buffer.from('bad') }).api_key_masked).toBe("")
+
+      crypto.decrypt = decrypt
+    })
+
+    it("解密为空的密钥不应伪装为已配置", function () {
+      const crypto = require("./crypto")
+      const decrypt = crypto.decrypt
+      try {
+        crypto.decrypt = () => ''
+
+        expect(manager._safeRow({ id: 'empty', api_key_enc: Buffer.from('enc_') }).api_key_masked).toBe("")
+      } finally {
+        crypto.decrypt = decrypt
+      }
+    })
+
+    it("解密为空的已启用服务商不应被计为已配置或通过测试", async function () {
+      const crypto = require("./crypto")
+      const decrypt = crypto.decrypt
+      manager.updateProvider('openai', { api_key: 'sk-valid-before-decrypt', enabled: true })
+
+      try {
+        crypto.decrypt = () => ''
+
+        expect(manager.isConfigured('llm')).toBe(false)
+        await expect(manager.testConnection('openai')).resolves.toMatchObject({
+          code: -1,
+          message: expect.stringContaining('API Key'),
+        })
+        expect(manager.getDefault('llm')).toBeNull()
+      } finally {
+        crypto.decrypt = decrypt
+      }
+    })
+
+    it("纯空白 API Key 不应被计为已配置或进入适配器调用", async function () {
+      manager.updateProvider('openai', { api_key: '   ', enabled: true })
+
+      expect(manager.isConfigured('llm')).toBe(false)
+      await expect(manager.testConnection('openai')).resolves.toMatchObject({
+        code: -1,
+        message: expect.stringContaining('API Key'),
+      })
+      expect(manager.getDefault('llm')).toBeNull()
+    })
+  })
+
+  describe("createProvider", function () {
+    beforeEach(function () { manager.init() })
+
+    it("应成功创建自定义服务商", function () {
+      const res = manager.createProvider({
+        id: "custom-llm",
+        name: "Custom LLM",
+        category: "llm",
+        base_url: "https://custom.api.com",
+        api_key: "sk-test",
+        models: ["custom-model"],
+      })
+      expect(res.code).toBe(0)
+      expect(res.data.id).toBe("custom-llm")
+    })
+
+    it("远程服务商缺少 API Key 时应拒绝创建", function () {
+      const res = manager.createProvider({
+        id: "no-key", name: "No Key", category: "image", base_url: "https://api.example.com/v1",
+      })
+
+      expect(res).toMatchObject({ code: -1, message: expect.stringContaining("API Key") })
+      expect(manager.listProviders("image").some(p => p.id === "no-key")).toBe(false)
+    })
+
+    it("应拒绝重复 ID", function () {
+      manager.createProvider({ id: "dup", name: "Dup", category: "llm", api_key: "sk-test" })
+      const res = manager.createProvider({ id: "dup", name: "Dup2", category: "llm", api_key: "sk-test" })
+      expect(res.code).toBe(-1)
+      expect(res.errorCode).toBe("PROVIDER_EXISTS")
+      expect(res.message).toContain("已存在")
+    })
+
+    it("应拒绝无效类别", function () {
+      const res = manager.createProvider({ id: "bad", name: "Bad", category: "invalid" })
+      expect(res.code).toBe(-1)
+      expect(res.errorCode).toBe("INVALID_CATEGORY")
+    })
+
+    it("缺少必填字段应返回错误", function () {
+      const res = manager.createProvider({ id: "no-name" })
+      expect(res.code).toBe(-1)
+    })
+  })
+
+  describe("updateProvider", function () {
+    beforeEach(function () { manager.init() })
+
+    it("应成功更新服务商", function () {
+      manager.createProvider({ id: "test-update", name: "Test", category: "llm", api_key: "sk-test" })
+      const res = manager.updateProvider("test-update", { name: "Updated" })
+      expect(res.code).toBe(0)
+    })
+
+    it("更新不存在的服务商应返回错误", function () {
+      const res = manager.updateProvider("nonexistent", { name: "X" })
+      expect(res.code).toBe(-1)
+    })
+  })
+
+  describe("deleteProvider", function () {
+    beforeEach(function () { manager.init() })
+
+    it("预设服务商删除 = 软删除（成功且从列表隐藏）", function () {
+      // 先配置预设使其出现在已配置列表
+      manager.updateProvider("openai", { api_key: "sk-preset", enabled: true })
+      const res = manager.deleteProvider("openai")
+      expect(res.code).toBe(0)
+      expect(res.message).toContain("已删除")
+      // 从列表隐藏
+      const list = manager.listProviders("llm")
+      expect(list.find(p => p.id === "openai")).toBeUndefined()
+      // 行仍在（隐藏标记），可重新添加
+      const row = manager.getProvider("openai")
+      expect(row.hidden).toBe(true)
+      expect(row.enabled).toBe(false)
+      // 预设目录仍返回全部（R85）
+      expect(manager.getAvailablePresets("llm").some(p => p.id === "openai")).toBe(true)
+    })
+
+    it("应成功删除自定义服务商", function () {
+      manager.createProvider({ id: "to-delete", name: "Delete Me", category: "llm", api_key: "sk-test" })
+      const res = manager.deleteProvider("to-delete")
+      expect(res.code).toBe(0)
+    })
+
+    it("删除不存在的服务商应返回错误", function () {
+      const res = manager.deleteProvider("nonexistent")
+      expect(res.code).toBe(-1)
+    })
+  })
+
+  describe("setDefault", function () {
+    beforeEach(function () { manager.init() })
+
+    it("未配置 API Key 不能设为默认", function () {
+      const res = manager.setDefault("llm", "openai")
+      expect(res.code).toBe(-1)
+      expect(res.message).toContain("API Key")
+    })
+
+    it("不存在的服务商不能设为默认", function () {
+      const res = manager.setDefault("llm", "nonexistent")
+      expect(res.code).toBe(-1)
+    })
+  })
+
+  describe("getDefault", function () {
+    beforeEach(function () { manager.init() })
+
+    it("无默认时应返回 null 或第一个有 API Key 的", function () {
+      const def = manager.getDefault("llm")
+      // 预设都没有 API Key，所以应该返回 null
+      expect(def).toBeNull()
+    })
+  })
+
+  describe("testConnection", function () {
+    beforeEach(function () { manager.init() })
+
+    it("未配置 API Key 应返回错误", async function () {
+      const res = await manager.testConnection("openai")
+      expect(res.code).toBe(-1)
+      expect(res.message).toContain("API Key")
+    })
+
+    it("不存在的服务商应返回错误", async function () {
+      const res = await manager.testConnection("nonexistent")
+      expect(res.code).toBe(-1)
+    })
+  })
+
+  describe("getAvailablePresets", function () {
+    beforeEach(function () { manager.init() })
+
+    it("应返回该类别可配置的预设，即使种子行已经初始化", function () {
+      const presets = manager.getAvailablePresets("image")
+
+      expect(presets.map(p => p.id)).toEqual(expect.arrayContaining([
+        "flux",
+        "dall-e",
+      ]))
+      presets.forEach(p => expect(p.category).toBe("image"))
+    })
+
+    it("自定义服务商删除后应出现在预设列表中", function () {
+      // 先手动添加一个预设中有的
+      manager.createProvider({ id: "custom-new", name: "New", category: "llm", api_key: "sk-test" })
+      const presets = manager.getAvailablePresets("llm")
+      // custom-new 不在预设中，所以预设列表不变
+      expect(presets.every(p => p.id !== "custom-new")).toBe(true)
+    })
+
+    it("种子预设仍可选择并通过更新补填 API Key", function () {
+      const createRes = manager.createProvider({
+        id: "flux", name: "Flux", category: "image", base_url: "https://api.bfl.ml/v1",
+        api_key: "sk-flux-key", models: ["flux-pro"],
+      })
+      expect(createRes.code).toBe(-1)
+      expect(createRes.errorCode).toBe("PROVIDER_EXISTS")
+      expect(createRes.message).toContain("已存在")
+
+      const updateRes = manager.updateProvider("flux", { api_key: "sk-flux-key", enabled: true })
+      expect(updateRes.code).toBe(0)
+      const provider = manager.getProvider("flux")
+      expect(provider.is_preset).toBe(true)
+      expect(provider.api_key_masked).toBeTruthy()
+      expect(provider.enabled).toBe(true)
+    })
+
+    it("预设包含表单所需的 base_url 和 models", function () {
+      const flux = manager.getAvailablePresets("image").find(p => p.id === "flux")
+      expect(flux).toBeDefined()
+      expect(flux.base_url).toBeTruthy()
+      expect(Array.isArray(flux.models)).toBe(true)
+      expect(flux.models.length).toBeGreaterThan(0)
+    })
+
+    it("MiniMax Image 预设只暴露固定 image-01，表单无需填写模型 ID", function () {
+      const minimax = manager.getAvailablePresets("image").find(p => p.id === "minimax-image")
+      expect(minimax.models).toEqual(["image-01"])
+    })
+  })
+
+  describe("isConfigured", function () {
+    beforeEach(function () { manager.init() })
+
+    it("预设都未配置 API Key 应返回 false", function () {
+      expect(manager.isConfigured("llm")).toBe(false)
+    })
+
+    it("配置 API Key 后应返回 true", function () {
+      manager.createProvider({
+        id: "configured-llm", name: "Configured", category: "llm",
+        api_key: "sk-test",
+      })
+      manager.updateProvider("configured-llm", { enabled: true })
+      expect(manager.isConfigured("llm")).toBe(true)
+    })
+  })
+  describe("supportsAdapterMethod（能力查询）", function () {
+    beforeEach(function () { manager.init() })
+
+    it("MiniMax TTS 支持 cloneVoice 但不支持 deleteVoice（官方 clone API 无删除端点）", async function () {
+      manager.updateProvider("minimax-tts", { api_key: "sk-minimax", enabled: true })
+      await expect(manager.supportsAdapterMethod("minimax-tts", "cloneVoice")).resolves.toBe(true)
+      await expect(manager.supportsAdapterMethod("minimax-tts", "deleteVoice")).resolves.toBe(false)
+    })
+
+    it("ElevenLabs 支持 deleteVoice", async function () {
+      manager.updateProvider("elevenlabs", { api_key: "sk-eleven", enabled: true })
+      await expect(manager.supportsAdapterMethod("elevenlabs", "deleteVoice")).resolves.toBe(true)
+    })
+
+    it("能力查询不要求 API Key 有效（静态契约）", async function () {
+      // 未配置 Key 也返回真实能力（deleteVoice 仍为 false，cloneVoice 仍为 true）
+      await expect(manager.supportsAdapterMethod("minimax-tts", "deleteVoice")).resolves.toBe(false)
+      await expect(manager.supportsAdapterMethod("minimax-tts", "cloneVoice")).resolves.toBe(true)
+    })
+
+    it("三态契约：明确不支持=false / 无法判定=null / 非法参数=false，均不抛异常", async function () {
+      // adapter 明确不支持（supports 返回 false）→ false
+      await expect(manager.supportsAdapterMethod("minimax-tts", "notAMethod")).resolves.toBe(false)
+      // 非法参数 → false
+      await expect(manager.supportsAdapterMethod("", "deleteVoice")).resolves.toBe(false)
+      // provider 不存在 / factory 缺失 / store 未就绪 → null（无法判定，调用方应回退保守行为）
+      await expect(manager.supportsAdapterMethod("nonexistent", "deleteVoice")).resolves.toBeNull()
+      await expect(manager.supportsAdapterMethod("never-registered-factory", "deleteVoice")).resolves.toBeNull()
+      manager._ready = false
+      await expect(manager.supportsAdapterMethod("minimax-tts", "deleteVoice")).resolves.toBeNull()
+    })
+  })
+})

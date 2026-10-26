@@ -1,0 +1,68 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { describe, expect, it } from 'vitest'
+import { JSDOM } from 'jsdom'
+
+const currentDir = path.dirname(fileURLToPath(import.meta.url))
+const html = fs.readFileSync(path.join(currentDir, 'index.html'), 'utf8')
+const windowSource = fs.readFileSync(path.join(currentDir, '../electron/window.js'), 'utf8')
+
+function getCspDirectives() {
+  const document = new JSDOM(html).window.document
+  const policies = document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]')
+  expect(policies).toHaveLength(1)
+
+  return new Map(
+    policies[0].content
+      .split(';')
+      .map((directive) => directive.trim())
+      .filter(Boolean)
+      .map((directive) => {
+        const [name, ...values] = directive.split(/\s+/)
+        return [name, values]
+      }),
+  )
+}
+
+describe('index.html Content Security Policy', () => {
+  it('只由页面声明策略，主进程不使用 session 级响应头覆盖', () => {
+    expect(windowSource).not.toContain('onHeadersReceived')
+    expect(windowSource).not.toContain("'Content-Security-Policy'")
+  })
+
+  it('允许应用所需的本机服务、本地字体和媒体资源', () => {
+    const directives = getCspDirectives()
+
+    expect(directives.get('connect-src')).toEqual(expect.arrayContaining([
+      "'self'",
+      'ws:',
+      'wss:',
+      'https:',
+      'http://localhost:*',
+      'http://127.0.0.1:*',
+    ]))
+    expect(directives.get('style-src')).toEqual(["'self'", "'unsafe-inline'"])
+    expect(directives.get('font-src')).toEqual(["'self'", 'data:'])
+    expect(directives.get('img-src')).toContain('blob:')
+    // 分段编辑/预览图片来自本机媒体服务（http://127.0.0.1:*），必须与 media-src 同样放行，
+    // 否则 <img> 被 CSP 拦截而 <video>（media-src 已放行）正常，表现为「图片不显示」。
+    expect(directives.get('img-src')).toContain('http://127.0.0.1:*')
+    expect(directives.get('img-src')).toContain('http://localhost:*')
+    expect(directives.get('media-src')).toContain('blob:')
+    expect(directives.get('media-src')).toContain('http://127.0.0.1:*')
+    expect(directives.get('media-src')).not.toContain('http:')
+  })
+
+  it('不在生产入口中加载第三方字体', () => {
+    expect(html).not.toMatch(/fonts\.googleapis\.com|fonts\.gstatic\.com|api\.fontshare\.com/)
+  })
+
+  it('阻止插件对象、外部基址和跨来源表单提交', () => {
+    const directives = getCspDirectives()
+
+    expect(directives.get('object-src')).toEqual(["'none'"])
+    expect(directives.get('base-uri')).toEqual(["'self'"])
+    expect(directives.get('form-action')).toEqual(["'self'"])
+  })
+})

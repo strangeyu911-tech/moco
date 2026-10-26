@@ -1,0 +1,2062 @@
+name: quality-gate
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '01-docs/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.ccg/**'
+      - '.claude/**'
+      - '.hermes/**'
+      - '.agents/**'
+      - '.quality-rhythm/**'
+      - 'openspec/**'
+      - '.adversarial/**'
+      - 'scripts/gate-record-debt-ledger.json'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:  # 必需保留，用于手动触发质量节拍检查
+
+# 并发控制：同一 PR 多次推送只保留最新一次（避免旧 run 继续占用并发额度）；
+# main push 不取消（保发布链路完整性）。
+# 注：不取消还不够 —— group 也必须让 push 唯一，否则旧 push 会在"还没排队成功"时被顶掉（见下方 concurrency 注释与 #2642）。
+concurrency:
+  # push（main）按 run_id 唯一分组：GitHub 在同一并发组里只允许一个排队者，
+  # 新 push 一到就把还在排队的旧 push 置为 cancelled，而那条 sha 此后再没有 run ⇒ 主侧证据永久丢失。
+  # 实测（近 1000 条 main push run 按 (sha, workflow) 归集）：被取消过又有后续 run 补回的 = 0 格。
+  # 由 .github/scripts/workflow-contract.test.js 的「2b) main push 的并发组」锁住，详见 #2642。
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # --- docs-only 短路判定（change: docs-only-ci-shortcircuit）---
+  # 红线不变：pull_request 触发级 paths-ignore 仍被 workflow-contract.test.js 禁止
+  # （PR #2151 死锁：触发级过滤会让 required check 永不产生）。本 job 是 job 级短路：
+  # workflow 照常触发 => 所有 required check context 都出现；被 if 跳过的 job 显示
+  # skipped => required check 视为满足；gate-result 的 $allowed 含 'skipped' 即为此口径。
+  # 判定真源是 scripts/classify-docs-only.js（fail-closed：空 diff / git 失败 / 混合
+  # 变更一律 false=全量）。git 失败时本 job 红，gate-result 会拦（不静默放行）。
+  changes:
+    name: QG Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # merge-base diff 需要完整历史（与 build.yml package-relevant 同模式）
+
+      - name: Detect docs-only changes
+        id: classify
+        shell: bash
+        env:
+          EVT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # 账本 JSON 在 docs-only 白名单里 ⇒ 校验它的门禁不能只待在会被短路的 static-gates。
+          # 放在非 PR 早退之前，所以 main push 那一档同样覆盖。
+          node --test scripts/check-gate-record-debt.test.js
+          # 冻结判据按档拦：PR 档收口成"可见"。动因是 2026-10-16 实测 run 38781654774 ——
+          # pull_request 检出的是 main⊕本分支的合并预览，主干每几分钟长一块，PR 档"等于基线"必红。
+          # main push 那一档照旧拦，所以锁没被拆松，只是装回它真能成立的位置。
+          CARRIER_MODE=block
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then CARRIER_MODE=visible; fi
+          echo "[gate-record-debt] carrier_mode=$CARRIER_MODE event=${GITHUB_EVENT_NAME:-<unset>}"
+          node scripts/check-gate-record-debt.js --carrier-mode="$CARRIER_MODE"
+          # 主干上真实存在过 6 个带着 git 冲突标记的文件（4 篇 stash pop 冲突被整块提交、
+          # 2 篇 rebase 只删了左侧七个尖括号那一侧），而此前没有任何判据在看这件事：
+          # check-text-encoding-integrity 管控制字节、numstat 管行尾，都对标记免疫。
+          # 落在本 job（不被 docs-only 短路）且在非 PR 早退之前 ⇒ PR 档全覆盖（pull_request 触发无 paths 过滤）。
+          # main push 档只覆盖"真的触发了本 workflow 的 push"：push 侧有 paths-ignore（含 openspec/**、*.md），
+          # 纯文档 push 不生成 run。它当前不构成漏洞，因为进 main 的唯一通路是 PR（直推被 GH011 拒、
+          # ruleset main-ci-gate 的 bypass_actors 实测为空）；若将来给 ruleset 加了旁路主体，须补 schedule 档。
+          node --test scripts/check-no-conflict-markers.test.js
+          node scripts/check-no-conflict-markers.js
+          # CCG 安全扫描器自身的回归保护：扫描器一旦回退成「静默 0 文件绿灯」
+          # 或把 fixtures 当真实高危，verify-security 的结论就不可信了。
+          node --test .ccg/skills/tools/verify-security/scripts/security_scanner.test.js
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs-only=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only=false (non-PR event: full run)"
+            exit 0
+          fi
+          # 「该用哪一对 base/head」的决策住在 scripts/ci-pr-changeset.js 里，由真 git 夹具逐形态单测。
+          # 原因（本轮实测）：这段判断原先写在 bash，把 `if git rev-parse -q --verify HEAD^2` 改成
+          # `if false` 之后三条 workflow 结构锁全绿 —— 文本锁锁得住形状，锁不住"支路还走不走"。
+          # 脚本同时把 pr-base/pr-head 写进 GITHUB_OUTPUT，Gate 2c2 只读产出，不自己再算第二遍。
+          node --test scripts/ci-pr-changeset.test.js
+          CHANGESET="$(node scripts/ci-pr-changeset.js --repo="$PWD" --evt-name="${{ github.event_name }}" --evt-base="${EVT_BASE_SHA:-}" --evt-head="${EVT_HEAD_SHA:-}")" || exit 1
+          echo "[classify] $CHANGESET"
+          BASE="$(printf '%s\n' "$CHANGESET" | sed -n 's/^base=//p')"
+          HEAD_SHA="$(printf '%s\n' "$CHANGESET" | sed -n 's/^head=//p')"
+          if [ -z "$BASE" ] || [ -z "$HEAD_SHA" ]; then
+            echo "::error::取不到本 PR 的 base/head（[${BASE}]/[${HEAD_SHA}]）；宁可乐红也不得静默退回 HEAD=合并提交——那会把期间 main 的他人提交算进本 PR"
+            exit 1
+          fi
+          node scripts/classify-docs-only.js --base="$BASE" --head="$HEAD_SHA" --repo="$PWD"
+
+      # tasks 5.2：PRD 的「提示文字逐字表」必须等于 locale。生成器住在 scripts/、输入是 01-docs/**
+      # （docs-only 白名单内），所以这条判据必须住在本 changes job（无条件执行）——住 static-gates
+      # 就会被 `docs-only != 'true'` 门控，而**纯文档 PR 恰是最容易让表旧的那一类**（#2718/#2745 同形教训）。
+      # 两条命令同块 ⇒ 必须 shell: bash（PowerShell 不在中间命令非零时中止，见 AGENTS 该条）。
+      - name: "Gate 2c-copy - PRD copy table equals locales (changes job, tasks 5.2)"
+        shell: bash
+        run: |
+          node --test scripts/gen-prd-copy-table.test.js
+          node scripts/gen-prd-copy-table.js --check
+
+      # --- Gate 2c2（#2745 从 static-gates 搬入本 job）: 执行记录存在性判据 ---
+      # 它校验的输入 openspec/records/** 命中 docs-only 白名单（`openspec/**`），而 static-gates
+      # 整个 job 被 `if: needs.changes.outputs.docs-only != 'true'` 门控 ⇒ 「整篇没写执行记录」
+      # 最高发的纯文档 PR，恰好是这条判据一次都不会执行的那一类（短路真实发生过：PR #2732
+      # 判 docs-only=true，rollup 里 QG Static = SKIPPED 且照样合并）。
+      # 与 #2718 同形修法：吃白名单输入的门禁必须住在无条件执行的 changes job。
+      # **必须在 classify 之后**：step 内的 `exit 0` 只结束该 step 的 shell，后续 step 照跑，
+      # 所以"早于早退"不换来 push 覆盖差异；而把它摆在 classify 之前，这一步一红就会让本 job
+      # 在写出 docs-only 输出之前中止 —— docs-only 判定整条消失、下游重型 job 全部跑满。
+      # head 分支名必须由 env 注入：PR 事件下 checkout 是 detached HEAD，脚本自读只能得到字面量
+      # "HEAD"，"修订自己那篇记录"这条出路会在 CI 上静默失效（外部评审两路独立命中）。
+      # advisory 标记必须留在下面那行上：转阻断 = 删掉它，且必须另 PR 并带实测影响面
+      # （origin/main first-parent 120 个提交里 59 个纯文档 PR，其中 14 个在任何记录源里都没有记录）。
+      - name: "Gate 2c2 - Execution-record presence (changes job, #2745)"
+        shell: bash
+        env:
+          # 取源必须复用 classify step 的产物（合并提交双亲 > 事件 payload），不在这里再算一遍：
+          # 两份独立取源一旦漂移，就会出现"同一 PR 在 A 判 docs-only、在 B 判缺记录"这种不可归因的红。
+          EXEC_BASE: ${{ steps.classify.outputs.pr-base }}
+          EXEC_HEAD_SHA: ${{ steps.classify.outputs.pr-head }}
+          EXEC_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          # 非 PR 事件下 classify 已早退、两个产出都是空串 ⇒ 交给脚本按 advisory 留痕退出 0（既有行为）。
+          # 但"base 有值而 head 没值"只能意味着取源被破坏，此时 --head 退回 HEAD=合并提交会量错集合，
+          # 而错的方向是**假通过**（别人的记录文件被算进本 PR），所以必须乐红。
+          if [ -n "${EXEC_BASE:-}" ] && [ -z "${EXEC_HEAD_SHA:-}" ]; then
+            echo "::error::classify 未产出 pr-head（取源步骤异常？），不得退回 HEAD=合并提交"
+            exit 1
+          fi
+          node --test scripts/check-pr-exec-record.test.js
+          node scripts/check-pr-exec-record.js --base="${EXEC_BASE:-}" --head-branch="${EXEC_HEAD_REF:-}" --head="${EXEC_HEAD_SHA:-HEAD}" --mode=advisory
+
+      # --- Gate 2c5：CCG 门禁「存量命中过滤」的判据回归锁 ---
+      # 动因（2026-10-16，第十轮 CCG 外部评审遗留项）：这段决定「本次提交是否被安全门禁拦下」
+      # 的策略原先内联在 `scripts/ccg-gate.js` 里，而该文件末尾是顶层 `process.exit(main())`
+      # ⇒ **不可 require** ⇒ 一直没有测试缝，只能临时抽源码 eval 验证，CI 永远跑不到它。
+      # 本步之前已把它抽成 `scripts/lib/ccg-gate-security-filter.js`，这里把常驻锁接上
+      # —— 不接就等于「写了测试但永不执行」（check-unwired-tests 拦的就是这种）。
+      # 落点必须在 changes 作业：docs-only PR 会把 static-gates 整个短路
+      # （与 Gate 2c2 / 2c3 / 2c4 同一先例）。
+      # 被测模块与本测试只 require node 内置（该作业无 Install deps），符合 changes 作业的接线约束。
+      - name: "Gate 2c5 - CCG security pre-existing filter regression lock (changes job)"
+        shell: bash
+        run: node --test scripts/lib/ccg-gate-security-filter.test.js
+
+      # --- Gate 2c4：CCG 判定器（ccg-review-decider）的判据回归锁 ---
+      # 动因（2026-10-15）：该脚本此前**零测试覆盖**（grep 只命中一条注释），
+      # 于是两个判据缺陷长期无人发现：
+      #   ① contentHits 跑在「全部暂存行」（含 .md 文档）上，与 pathHits 的 codeFiles
+      #      口径不一致 ⇒ 在文档里分析加密机制会被判成「改动涉及加密」，误置 deepReview；
+      #   ② 整仓 git diff 在 rebase 路径下读空 ⇒ 规模与模式判定系统性采成 0。
+      # 落点必须在 changes 作业：docs-only PR 会把 static-gates 整个短路，
+      # 放在那里等于给判据自己关掉校验（与 Gate 2c2 / 2c3 同一先例）。
+      # 本测试只 require node 内置模块（该作业无 Install deps），符合 changes 作业的接线约束。
+      - name: "Gate 2c4 - CCG decider regression lock (changes job)"
+        shell: bash
+        run: node --test scripts/ccg-review-decider.test.js
+
+      # --- Gate 2c3：执行记录的 QM-5 行集棘轮 ---
+      # 动因（本会话实测）：PR #3477 的记录在多次改写中把「防止再次发生（QM-5 ⑤）」的**行标题吞掉**、
+      # 正文并入上一行末尾 ⇒ 五步只剩四步有名有姓，而 Gate 2c2 只判"记录存在与否"、不校验行集，全程全绿。
+      # 落点必须在 changes 作业：本门禁审的是记录，而 docs-only PR 会把 static-gates 整个短路
+      # —— 放在 static-gates 等于给它自己关掉校验（与 gate-record-debt-ledger.json 同一先例）。
+      # 必需步骤集**从 openspec/records/_TEMPLATE.md 派生**，不在 workflow 或脚本里手抄五个
+      # （实测模板只声明 ①②④⑤，手抄五个会让模板自身当场红）。
+      - name: "Gate 2c3 - Execution-record QM-5 row ratchet (changes job)"
+        shell: bash
+        env:
+          # 与 Gate 2c2 同源：复用 classify 的产出，不在这里第二次算 base/head，
+          # 否则两份取源一漂就会出现"同一 PR 在 2c2 判有记录、在 2c3 判错改动集"的不可归因红。
+          QM5_BASE: ${{ steps.classify.outputs.pr-base }}
+          QM5_HEAD: ${{ steps.classify.outputs.pr-head }}
+        run: |
+          if [ -n "${QM5_BASE:-}" ] && [ -z "${QM5_HEAD:-}" ]; then
+            echo "::error::classify 未产出 pr-head（取源步骤异常？），不得退回 HEAD=合并提交"
+            exit 1
+          fi
+          node --test scripts/check-record-qm5-rows.test.js
+          node scripts/check-record-qm5-rows.js --base="${QM5_BASE:-}" --head="${QM5_HEAD:-HEAD}"
+
+      # --- Gate 12（同族第三处，本次一并搬入）: 品牌残留门禁 ---
+      # AGENTS.md 的 docs-only 快速通道把「品牌残留」列为文档 PR 的**保留门禁**（一条不省），
+      # 但它原先住在被 docs-only 短路的 static-gates，而 *.md / 01-docs/** / docs/** 全在白名单里
+      # ⇒ 那句承诺在 CI 上不成立。本条由 (白名单路径 → 门禁命令) 对账表逼出，不是顺手重构。
+      - name: "Gate 12 - Brand residue (changes job, #2745 同族)"
+        shell: bash
+        run: |
+          node --test scripts/check-no-brand-residue.test.js
+          node scripts/check-no-brand-residue.js
+
+      # --- Gate 12c：平台分类转换器回归锁（与 Gate 12 同族接线到 changes job）---
+      # 为什么必须住 changes 而不是 static-gates：
+      #   本锁的**输入**是 01-docs/research/competitor-reverse-2026-10-13/platform-data/，
+      #   而 01-docs/** 在 docs-only 白名单内 ⇒ 只改数据集的 PR 会被判 docs-only、
+      #   短路整个 static-gates，于是「数据变了」这件事**没有任何锁会跑**。
+      #   这与 Gate 12 当年从 static-gates 搬进 changes 是同一个原因（见上 L123-125）。
+      # 锁什么：转换器的形态无关遍历、逐文件编码判定、fail-loud、确定性与去重/歧义处置。
+      # 另有 scripts/check-unwired-tests.js 的棘轮兜底 —— 本文件若没被任何 workflow 正文
+      # 点名，那条棘轮会直接判红（本仓不自动收集 scripts/ 下的测试）。
+      - name: "Gate 12c - Platform taxonomy converter (changes job, #2745 同族)"
+        shell: bash
+        run: |
+          node --test scripts/import-platform-taxonomy.test.js
+
+      # --- Gate 12b：文本编码完整性门禁（与 Gate 12 同族接线到 changes job）---
+      # 动因（2026-10-07 事故复盘）：01-docs/learnings.md 在 main 上有 7212 个字面 U+FFFD、
+      # 546 行受损。溯源发现原始内容本就是 GBK 裸字节（`b5 da ce e5` = 「第五」），先有一次
+      # 「把非法字节当坏字符清理」的动作把它洗成 U+FFFD（2026-07-17 首批 3606、08-13 翻倍
+      # 到 7212），#2911「全仓控制字节批量清理」又动了这个文件。全仓另有 14 个文件带同类损坏
+      # （ai-autonomous-tester 326 / decision-log 141 / …），2 个 CSS 仍是 GBK 裸字节。
+      # **善意动作 + 错编码方向 = 静默损坏**，没有门禁则下一个人还会这么干。
+      # 判据只扫 tracked **文本**文件；*.mp4/png/woff 等二进制不是 UTF-8 属正常，不在域内。
+      # 棘轮两层：① 出现基线外的新损坏文件 ② 基线内文件的损坏量**增加**（变异实测过只判 ① 的洞）。
+      - name: "Gate 12b - Text encoding integrity (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/check-text-encoding-integrity.test.js
+          node scripts/check-text-encoding-integrity.js
+
+      # --- Gate 12c：文档绝对路径有效性门禁（#3000 逃逸分析逼出） ---
+      # 动因：仓库根 2026-10-06 改名后，文档里的**绝对路径**不会跟着改，于是静默失效
+      # （运维手册里 `cd D:\...\<旧名>\apps\desktop` 照着敲必然失败）。此前**零门禁**
+      # 检查「文档写的路径是否还存在」——check-no-brand-residue.js 只管品牌词。
+      # 落点必须是本 job：输入是文档（01-docs/**、*.md 全在 docs-only 白名单），
+      # 放进被 `docs-only != 'true'` 门控的 static-gates 等于给自己关掉校验。
+      # 口径与 Gate 2c3 同族：base 取 **merge-base**（不是 PR base sha，也不是 origin/main），
+      # 问的是「本 PR 相对自己的起点改了哪些文档、里面有没有失效路径」。
+      # 该脚本按改动集判定 —— 全量扫描会命中 100+ 处历史引用（已删除的临时 worktree、
+      # CI runner 路径等），那些不是缺陷，逐条"修好"等于篡改历史。
+      # 编号取 12c 而非 12b：#3032 的文本编码完整性门禁已占用 12b。
+      - name: "Gate 12c - Doc abs-path validity (changes job)"
+        shell: bash
+        env:
+          DP_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          node --test scripts/check-doc-abs-paths.test.js
+          BASE_REF="${DP_BASE:-HEAD^}"
+          MB="$(git merge-base "$BASE_REF" HEAD 2>/dev/null || true)"
+          echo "[doc-abs-paths] base_ref=$BASE_REF merge_base=${MB:-<unresolved => fallback to base_ref>}"
+          node scripts/check-doc-abs-paths.js --base="${MB:-$BASE_REF}" --head=HEAD
+
+      # --- P3-1：扩平台标准动作自检（设计文 §9.3 的 11 步 + 2 条额外判据）---
+      # 动因（2026-10-14）：本仓**不自动收集** `scripts/` 下的测试，未在 workflow 正文里点名的
+      # 测试永远不会跑 —— `scripts/check-unwired-tests.js` 就是为此设的门禁（本次实测抓到）。
+      # 放在 `changes` job（非 docs-only 门控）而非 static-gates：脚本只依赖 node 内置模块，
+      # 满足「changes job 无 Install deps」的约束，且 main push 那一档同样覆盖。
+      - name: "Gate 2x - Platform onboarding self-check (P3-1)"
+        run: |
+          node --test scripts/verify-platform-onboarding.test.js
+          # 判据②同时在此重跑：不存在的 slug 必须非零退出（不静默通过）
+          if node scripts/verify-platform-onboarding.js no_such_platform_xyz; then
+            echo "::error::verify-platform-onboarding 对不存在的 slug 返回了 0 —— 门禁静默通过"
+            exit 1
+          fi
+          # 判据①：已有平台必须全 PASS
+          node scripts/verify-platform-onboarding.js kuaishou
+
+      # --- Gate 12d：主规格 Purpose 去 TBD 门禁 ---
+      # 动因（2026-10-07 实测）：openspec 归档器会在 specs 文件里留下
+      # `TBD - created by archiving change <name>. Update Purpose after archive.`，而全仓
+      # **零门禁**在看它（`git grep -l Purpose -- scripts .github` = 0 命中），于是 151 份主规格里
+      # 积压了 43 份。PR #3084 一次性填平存量，本条保证不再静默积累。
+      # 判据是**全量扫描**而非改动集：Purpose 缺失由"归档"这个动作引入，与后续谁改了哪个文件无关。
+      # 落点必须是本 job 且排在 classify 之后：输入 `openspec/**` 命中 docs-only 白名单，
+      # 放进被 `docs-only != 'true'` 门控的 static-gates 等于给自己关掉校验（同族 #2718 / #2745 / #3000）；
+      # 而摆在 classify 之前时本 step 一红会让 docs-only 输出整条消失、下游重型 job 全部跑满。
+      # 位置与"测试同 step 点名"两处前提由 scripts/check-spec-purpose.test.js 的结构锁钉住。
+      - name: "Gate 12d - Spec Purpose presence (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/check-spec-purpose.test.js
+          node scripts/check-spec-purpose.js
+
+      # --- Gate 12e：CCG 任务 ↔ OpenSpec change 关联完整性，接进不被 docs-only 短路的 job ---
+      # 动因（2026-10-16 实测）：`scripts/openspec-sync-check.js` 这个审计器此前**从未对真实仓库
+      # 跑过一次** —— CI 只在 static-gates 里点名它的测试，而那份测试 20 条全部在 os.tmpdir()
+      # 自建夹具仓库上跑，于是真实仓库当场 rc=2 / 14 条违规（含 5 个 task.json 根本无法解析）
+      # 没有任何东西在看；这笔欠账 2026-10-14 就写在 openspec/records/film-production-artifact-identity.md:151，
+      # 但那句话没有消费者（「注册≠注入≠生效」家族）。
+      # 比"没跑过"更糟的一层：它审计的两类输入 `.ccg/**` 与 `openspec/**` **都在 docs-only 白名单内**
+      # （实测 scripts/classify-docs-only.js 的 CI_IGNORED_PATHS 14 条里占这两条），而唯一点名它的
+      # static-gates 带 `if: needs.changes.outputs.docs-only != 'true'` ⇒ 这把锁只可能出现在
+      # 「结构上碰不到被审计文件」的 PR 上，等于给自己关掉校验（同族 #2718 / #2745 / #3000 / #3114）。
+      # 所以这里点名**审计器本身 + 它的测试**（static-gates 那份保留，两处只构成「docs-only PR 也拦得住」）。
+      # 该测试里「真实仓库自证」那条带三个不可省构件：对真实仓库根跑、取不到 `.ccg/tasks` 即红（禁 skip）、
+      # 带 taskFiles 规模下界（扫描域塌成空集时"零违规"读起来跟通过一模一样）。
+      # 两脚本只用 node 内置模块 ⇒ 满足「本 job 无 Install deps」；接线本身由
+      # scripts/check-unwired-tests.js 的 MUST_LIVE_IN_UNGATED_JOB 登记钉住（删登记或摘掉本 step 都会红）。
+      - name: "Gate 12e - OpenSpec/CCG linkage integrity (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/openspec-sync-check.test.js
+          node scripts/openspec-sync-check.js
+
+      # --- Gate 2b2：vendored 契约镜像漂移锁，接进不被 docs-only 短路的 job ---
+      # 动因（2026-10-08 实测）：这条锁此前**只**点名在 static-gates，而该 job 有
+      # `if: needs.changes.outputs.docs-only != 'true'`；它的输入 `openspec/**` 恰好在 docs-only
+      # 白名单里 ⇒ 只改主规格的 PR 上这条锁一次都不跑。实测后果：归档 PR #3114 全绿合并
+      # （`QG Changes=pass`、`QG Static=skipping`），main 的 push 才红
+      # （run 37716816985 / step `Gate 2b` / `not ok 2 - 镜像不得自行发明或漏掉 Requirement`），
+      # 一次性卡住当时所有 open PR。
+      # 这里再点名一次（static-gates 那份保留）：两处跑同一条锁不构成交叉判定，
+      # 只构成「docs-only PR 也拦得住」。该锁只用 node 内置模块，满足「本 job 没有 Install deps」
+      # 这条硬约束（同族实测：给本 job 引 js-yaml 会当场 MODULE_NOT_FOUND）—— 该前提由
+      # scripts/quality-rhythm-spec-mirror.test.js 里的依赖面锁与自接线锁钉住。
+      - name: "Gate 2b2 - Spec mirror contract (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/quality-rhythm-spec-mirror.test.js
+
+      # --- Gate 2b3：pre-commit 判定记录暂存的进程创建预算锁 ---
+      # 为什么必须常驻 CI 而不只留在钩子测试里：scenario16 是行为测量，只有跑到那段代码才有效；
+      # 「退回逐文件循环」这种改法可以被写成注释、被临时禁用、或在另一个入口里复活。
+      # 本判据读钩子正文本身，与执行路径无关，两者互不替代。
+      # 落点必须是 changes 作业（不是 static-gates）：后者带 `if: needs.changes.outputs.docs-only != 'true'`，
+      # 守门判据若落在被自己防的形态短路的作业里，等于给自己关掉校验（同族实测见上方 Gate 2b2 注释）。
+      # 本作业没有 Install deps ⇒ 判据只能 require node 内置模块（引第三方包会当场 MODULE_NOT_FOUND）。
+      - name: "Gate 2b3 - Pre-commit spawn budget (changes job)"
+        shell: bash
+        run: |
+          node scripts/check-precommit-spawn-budget.js scripts/hooks/pre-commit
+          node --test scripts/check-precommit-spawn-budget.test.js
+
+      # --- Gate 2c3：CHANGELOG.md「只可增长」棘轮 ---
+      # 动因（实测）：b531bdfe7（PR #2884，一个 ai-taste 功能 PR）把 CHANGELOG.md 从
+      # 7,474,293 B / 1,133 条整份替换成 9,155 B / 2 条，**丢掉 1,131 条并全绿合入**。
+      # 之所以没有任何东西拦住：它是 append-only 台账，却无一处判它的单调性 ——
+      # doc-gate 只判「diff 里有没有白名单文档」（删空文档照样满足）、check-max-lines 的
+      # SCAN_DIRS 不含根级 .md、check-gate-record-debt 看执行记录不看 CHANGELOG。
+      # 落点必须是本 job：CHANGELOG.md 命中 CI_IGNORED_PATHS 的根级 *.md（docs-only 白名单），
+      # 放在被 `docs-only != 'true'` 门控的 static-gates 等于给自己关掉校验（AGENTS.md「进白名单前提锁」）。
+      # gate-result 的 rollup 里含 needs.changes.result，且 Gate Result 是必需检查 ⇒ 本条真能拦，不是探测器。
+      # base 必须取 **merge-base**，不能直接取 PR base sha，更不能取 origin/main（2026-10-05 实测）：
+      # 这条棘轮问的是「本 PR 相对自己的起点有没有把条目弄丢」。实测拿 origin/main 当 base 时，
+      # 别人在我上次同步之后并入 main 的 3 种条目会被读成"本 PR 丢了它们"⇒ rc=1 假红；
+      # 同一份 head 用 merge-base 口径是 1145 条 = 1145 条 ⇒ rc=0。
+      # GitHub 的 pull_request.base.sha 是"事件时刻的 main tip"，同样会随 main 前进漂移，所以再对它取一次
+      # merge-base。算不出 merge-base 时回落 base sha，push 事件下再回落 HEAD^（squash 合并 = 单提交，语义正确）；
+      # 回落方向是"更严"而非"更松" —— 宁可假红，不可假绿。
+      - name: "Gate 2c3 - CHANGELOG growth (changes job, 只可增长棘轮)"
+        shell: bash
+        env:
+          CL_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          node --test scripts/check-changelog-growth.test.js
+          node --test scripts/check-changelog-growth-retire.test.js
+          BASE_REF="${CL_BASE:-HEAD^}"
+          MB="$(git merge-base "$BASE_REF" HEAD 2>/dev/null || true)"
+          echo "[changelog-growth] base_ref=$BASE_REF merge_base=${MB:-<unresolved => fallback to base_ref>}"
+          node scripts/check-changelog-growth.js --base="${MB:-$BASE_REF}" --head=HEAD
+          # ── 同一步骤里的第二把锁：副本数棘轮（2026-10-07）──
+          # growth 管"条目不许丢"，本门禁管"条目不许被复制"。两条判据刻意不同：
+          #   · 用**每标题副本数不得变多**（新标题容许出现 1 次 = 正常加条目），而不是"存在重复即红"。
+          #   · 原因：main 的历史里已有数百份重复副本（实测 base 冗余 828），而 growth 的多重集包含判据
+          #     要求每一份副本都不许少 —— 两把锁若在"绝对重复"上取红，任何去重都永远落不了地，
+          #     等于把污染钉死。这里只拦"本次 PR 让副本变多"，把清理留给配套改 growth 口径的另案。
+          # 实测形状：1dd05b12（#2792）把 277 条目/1.86MB 复制成 1097 条目/7.37MB，最坏同一标题 16 次。
+          node --test scripts/check-changelog-duplicate-entries.test.js
+          node scripts/check-changelog-duplicate-entries.js --base="${MB:-$BASE_REF}" --head=HEAD
+
+  static-gates:
+    name: QG Static
+    runs-on: windows-latest
+    needs: [changes]
+    # docs-only 短路：纯文档 PR 跳过重型 job（skipped 满足 required check）
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # --- Gate 1: TypeScript 编译检查（严格卡点） ---
+      - name: "Gate 1 - TypeScript 编译检查"
+        run: cd apps/desktop && pnpm exec tsc --noEmit
+
+      # --- Gate 2: 核心 JS 文件语法检查（FUSE 断点保护）---
+      - name: "Gate 2 - JS syntax integrity (detect FUSE truncation)"
+        run: |
+          $errors = 0
+          Get-ChildItem -Recurse -Filter "*.js" -Path apps/desktop/electron -Exclude "*node_modules*" | ForEach-Object {
+            $result = node --check $_.FullName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "  [FAIL] $($_.FullName)"
+              $errors++
+            }
+          }
+          if ($errors -gt 0) { exit 1 }
+          Write-Host "All Electron JS files pass syntax check"
+
+      # --- Gate 2b: 桌面 dev 启动脚本单测（worktree 独立端口/退出留痕/Electron 环境净化回归保护）---
+      # shell: bash 是必需的而不是风格：PowerShell 步骤里一个 run 块的多条命令**不 fail-fast**，
+      # 只有最后一条的 $LASTEXITCODE 决定步骤成败（实测见 scripts/check-step-failfast.js 头注释）。
+      - name: "Gate 2b - Desktop dev scripts (node --test)"
+        shell: bash
+        run: |
+          node --test apps/desktop/scripts/dev-ports.test.js apps/desktop/scripts/dev-launcher.test.js apps/desktop/scripts/dev-exit-log.test.js apps/desktop/scripts/electron-runtime-env.test.js
+          # Vite optimizeDeps 预构建缓存过期预检（2026-10-13 事故收口）：workspace 源码变化
+          # 不触发 optimizeDeps 重建，旧缓存缺新导出时渲染层报 does-not-provide-an-export
+          node --test apps/desktop/scripts/vite-dep-cache.test.js
+          # 打包暂存端剪枝的回归锁（#2765）：extraResources 的第二条通道把仓库树里的测试文件带进
+          # app.asar 之外的松散树，判据与门禁共享同一实现（shared-utils/artifact-test-pattern）
+          node --test apps/desktop/scripts/stage-remotion-runtime.test.js
+          # 01-docs 忽略规则回归锁（#2792 复盘：「01-docs 递归 .md」全量忽略曾让正式文档
+          # 静默不入库，PRD 链接 404；见 apps/desktop/scripts/gitignore-docs.test.js 头注释）
+          node --test apps/desktop/scripts/gitignore-docs.test.js
+          node --test scripts/sync-platform-config.test.js
+          node --test scripts/compare-scheduler-models.test.js
+          # 会话隔离入口脚本的结构锁：native stderr 捕获不得处在 EAP=Stop 作用域内
+          # （否则 worktree 已建成也会以 rc=1 中止，见 scripts/start-mp-task.test.js 头注释）
+          node --test scripts/start-mp-task.test.js
+          # openspec-sync-check.test.js 自带「镜像与真源逐字节一致」锁，但历史上从未被任何
+          # workflow 收集（CI 只显式挂 scripts 下 5 个测试文件，无通配），锁等于没在跑；在此收编。
+          node --test scripts/openspec-sync-check.test.js
+          # CCG 深度双模型审查（QM-6）的后端依赖体检锁：后端 CLI 不在 PATH 时引擎会
+          # **静默降级成单后端**（评审照跑、结论照出，只少一路跨家族交叉验证），
+          # 旧实现只有一句被动 ⚠ 告警。判据与假 HOME 复现方式见该测试头注释。
+          node --test scripts/deep-review-deps.test.js
+          # plan-review.sh 的后端体检反模式锁：决策层入口曾长期是「command -v 失败
+          # 就 say 一句 ⚠ 然后照跑」的被动告警形态，后端不在 PATH 时引擎静默降级成
+          # 单后端（决策层恰是质量节拍第一道闸，降级 = 「先对抗再动手」名存实亡）。
+          # deep-review.sh 已修同一问题，本锁保证两个入口**同步受锁**，防单侧回归。
+          node --test scripts/plan-review-deps.test.js
+          # CCG 评审入口的「跑在哪个 shell」锁：本机**裸 bash 解析到 WSL shim**
+          # （C:\windows\system32\bash.exe），此时 $HOME 是 WSL 的 /home/<user>，
+          # 脚本会抛出「找不到 codeagent-wrapper」并建议「设置 CCG_ARL_DIR」——
+          # 而该变量三级作用域本就不存在，把排查者引到一个幻影变量上。
+          # 本锁要求入口先自证跑在对的 shell 里，且**只拦 WSL 不拦真 Linux**
+          # （后者含 ubuntu runner，拦了等于打死 CI）。
+          node --test scripts/ccg-bash-entry.test.js
+          # vendored 契约镜像漂移锁此前在这里也点了一次名（与 changes job 的 Gate 2b2 重复）。
+          # 已由 (白名单路径 → 门禁去向) 对账表判为「接线必须只有一处真源」而删除：
+          # changes 无 job 级 if、对每种事件都跑，static-gates 只在 docs-only != 'true' 时跑，
+          # 前者的执行域真包含后者，故删除不减少任何一次判定。理由与覆盖性论证见
+          # 01-docs/PRD-CI-BLINDSPOT-SEAL-2026-10-09.md §4（撤销 e32210e6a 的刻意冗余，显式声明）。
+          # Windows PowerShell 5.1 读**无 BOM** 的 .ps1 时按 ANSI 码页解码，中文注释/字符串可让
+          # 整个脚本 tokenize 失败（实测 2026-09-29：15 个含非 ASCII 的 .ps1 里 8 个已不可解析，
+          # 其中包括会话隔离入口 start-mp-task.ps1 ⇒ 所有新任务的 worktree 都开不出来，
+          # 而 pwsh 7 默认 UTF-8 看不见这件事）。判据与三条 fail-closed 约束见 .github/scripts/check-ps1-bom.js
+          node --test .github/scripts/check-ps1-bom.test.js
+          node .github/scripts/check-ps1-bom.js
+          # 打包配置的测试文件排除（#2702）：本仓约定单测与被测代码同目录，而 build.files 里
+          # electron 与 node_modules 两条整目录通配曾把 462 个 *.test.* 打进 app.asar
+          # （含内部接口形状、平台端点与错误码字符串）。这里守"声明还在"，
+          # 产物侧的"声明确实生效"由 Build & Release 里 --asar 那一步守（两个维度互相看不见对方）。
+          node --test .github/scripts/check-asar-test-files.test.js
+          node .github/scripts/check-asar-test-files.js
+          # 打包内置种子数据（ops-center-resilience）：L3 种子随安装包发给用户，
+          # 必须持续证明 13 个数据块齐全 / 类型正确 / 体积达标 / 编码完好 / 指纹一致，
+          # 且 content_policy.word_list 已剔除——词库进包等于公开词库（design.md §4.4）。
+          # 脚本自带接线锁：它没挂在这里时 check-ops-seed.test.js 会直接红。
+          node --test .github/scripts/check-ops-seed.test.js
+          node .github/scripts/check-ops-seed.js
+          # workflow 结构门禁：抓「GitHub 在排队之前就拒绝这份文件」的空值/缺节点形态。
+          # 动因是 87e311c45 (#3200) 把 gui-test.yml 的 defaults.run 那一项删成空值，于是该
+          # workflow 从 main 上整体消失（零 job、零日志，原因只在 Actions UI 的 annotation 里），
+          # 且此后每个从 main 切出的 PR 都拿不到这条检查——连"红"都没有。
+          # 落点选本步骤而不是 Gate 3：Gate 3 默认 pwsh 且多条命令不 fail-fast（见该步骤上方的
+          # 登记注释），接进去等于接进一个装饰门禁；本步骤整体是 shell: bash，任一非零即中止。
+          node --test .github/scripts/check-workflow-structure.test.js
+          node .github/scripts/check-workflow-structure.js
+          # 时钟位移 oracle 的锁（2026-10-13，clock-shift-oracle）。
+          # 动因：#3459 那笔"夹具写死绝对时间戳 + 被测路径读真实时钟 + 窗口是相对量"的引信，
+          # 写下的当天绿、两天后必然红；而登记要求的"先量存量再定"做完后结论是**静态形状规则不可行**
+          # （origin/main 1326 个测试文件里 148 个含绝对时间戳，其中"含窗口参数又没注入时钟"的 6 个
+          # 逐条判读全是假阳性）⇒ 换成行为判据：同一批用例跑两遍，第二遍把进程的"现在"推到未来。
+          # 这里只接**锁本体**（秒级：域推导 / 正则正负控 / setup 接线 / 真起子进程证位移生效 /
+          # gitignore 反选）；oracle 全量跑（118 文件 ×2）另接低频次入口，不进每次 PR 的关键路径。
+          node --test scripts/check-clock-shift-oracle.test.js
+          # 判据本体也要在每次 PR 上真被执行一次（--dry-run 不起 vitest，秒级）：
+          # 否则 CLI 只有本地手动跑过，会烂成"工具还在、扫描域已经漂"那种装饰性存量。
+          node scripts/check-clock-shift-oracle.js --dry-run
+
+      # --- Gate 2c: 测试收集接线棘轮 + 此前从未被 CI 收集的锁 ---
+      # 本仓不自动收集 scripts/ 与 .github/scripts/ 下的测试（vitest 只管 workspace，
+      # 根 test 脚本是 pnpm -r），新写一条不登记就等于没写。以下条目即由
+      # scripts/check-unwired-tests.js 扫出后收编的；shell: bash 与 doc-gate.yml 同形
+      # （windows-latest 上已验证 bash 可用）。
+      - name: "Gate 2c - Unwired-test ratchet (node --test / bash)"
+        shell: bash
+        run: |
+          node --test scripts/check-unwired-tests.test.js
+          node --test scripts/branch-naming-contract.test.js
+          node --test scripts/safe-delete.test.js
+          # start-app 启动链契约：WMI 脱离 + 存活断言 + 双向斜杠匹配（2026-10-16，
+          # 用户三次看不到应用，根因是启动链被 agent 会话连坐杀）
+          node --test scripts/sync-app.test.js
+          node --test scripts/qm1-child-env.test.js
+          node --test .github/scripts/check-ipc-bridge.test.js
+          node --test scripts/detect-unwired-exports.test.js
+          node --test scripts/ensure-desktop-deps.test.js
+          node --test scripts/release-gate.test.mjs
+          node --test scripts/sync-version.test.mjs
+          bash scripts/hooks/post-checkout.test.sh
+          bash scripts/hooks/pre-commit.test.sh
+          bash scripts/session-init.test.sh
+          node --test scripts/check-step-failfast.test.js
+          node scripts/check-step-failfast.js
+          # 账本门禁不在此处：账本 JSON 已进 docs-only 白名单，而本 job 整个被 docs-only 门控，
+          # 留在这里等于「纯文档 PR 没人校验账本」。它现在在无条件执行的 changes job 里。
+          # docs-only 短路判定单一真源的回归锁（change: docs-only-ci-shortcircuit）
+          node --test scripts/classify-docs-only.test.js
+          # 夹具不得对同 realm 的第三方谎报文件系统（#2794 同族）：blanket fs 夹具只能缩小
+          node --test scripts/check-blanket-fs-mock.test.js
+          node scripts/check-blanket-fs-mock.js
+          # 运行时出站台账基线棘轮的判定器（#2491 档3 改判）。判定本身不在这里做——
+          # 它的输入是一次真实测试跑产出的台账 JSONL，只有跑测试的那些 job 取得到证据
+          # （见下面 Gate 4 与 Desktop tests shard 两处 `check-test-egress-ledger.js` 调用）。
+          # 这里只锁"判定器还能跑、口径没被改松"，与 static-gates 里其它锁同形。
+          node --test scripts/check-test-egress-ledger.test.js
+          # Gate 9 覆盖审计的 PR 画像判据（2026-10-12，change: gate9-scope-fix）。
+          # 按变更文件落点分流 srcDir/docPaths，修「只改 ops-center 的 feat PR 被桌面端
+          # 存量欠账判红」这一根因（#3413 score 0.31 / #3409 连挂 4 次）。
+          node --test scripts/gate9-classify.test.js
+          # Gate 9 的 PRD 条目状态标注判据（【已实现】【规划中】【不做】【历史】四态 +
+          # 优先级 + shouldAudit）。与 gate9-classify 同批上线，同为 scripts/ 下必须点名。
+          node --test scripts/gate9-prd-status.test.js
+          # 渲染层跨包导入边界（PR #3011 事故同族）：渲染进程消费 shared-utils 的 CommonJS
+          # 模块时，vite dev server 会在运行时抛「does not provide an export named ...」，
+          # 整页渲染失败；而 vite build / vitest / tsc / electron-builder **全是绿的**
+          # （各自由 rollup commonjs 插件、vite-node interop、非类型检查、CJS 主进程兜底），
+          # 只有跑 dev server 的视觉回归会红，且报错形态与业务毫无关联、排查成本极高。
+          # 因此这里静态兜：未登记 alias 的 CJS 跨边界导入一律拦下。判据与孪生先例同源。
+          node --test scripts/check-renderer-cjs-boundary.test.js
+          node scripts/check-renderer-cjs-boundary.js
+          # Gate 4「本次 PR 有没有受影响的非桌面项目」的三态判据锁。锁的是**判定语义**而不是
+          # workflow 文本：#2902 与 #2596 两次同族假红都出自"空集"被误读，而两版的错误
+          # （$null 摊平 / stdout 被 nx 提示污染）只有真正跑判据才测得出来。
+          node --test scripts/nx-affected-probe.test.js
+          # Gate 4「nx 到底收到了什么旗标」的锁（2026-10-11 根因：`pnpm run test:all -- --exclude=X`
+          # 里那个独立 `--` 让 nx 把 exclude 当成"转发给每个任务命令"的参数，自己的选择集不受影响，
+          # desktop 全量因此混进 Gate 4 的 30 分钟预算；成功 run 1173s/1322s、失败 run 恰好 1801s）。
+          # 这里跑**单测层**（注入证据、不真起 nx）；真起 nx 的 A/B 臂由 Gate 4 在 Start-Process
+          # 之前自己调 `node scripts/check-gate4-selection.js`（见该步骤），位置选在那儿是因为
+          # 那条判据要防的代价就是"整个 30 分钟预算"，必须早于它。
+          # 口径指针：上面说的"30 分钟"是 #3315 之前的历史形态；现行测试预算只有一个真源 scripts/gate-budget.js，改数改那里。
+          node --test scripts/check-gate4-selection.test.js
+          # 视觉判定域对账（2026-10-11）：all-views 注册 37 个 + supplementary 注册 19 个视图，
+          # 但两套**只采集不比对**（走 aiVisionTest；`ERR_VISUAL_BASELINE_MISSING` 只在
+          # pixelRegressionTest 里抛），真比对的只有 pixelTests 那 20 个；而
+          # check-baseline-freshness.js 的迭代域是 `readdirSync(基线目录)` —— 只看**存在的**基线，
+          # 于是"注册一个视图却不配基线"永久免费，且没有任何门禁能看见。
+          # 本锁把判定域钉成"进域注册表（实测 5 张）的视图并集 × 浅暗两档"，缺失必须带 reason 登记且清单只能缩小；
+          # 另有一条发现式清扫：扫描根里发现的每张 `const *Tests = [`（实测共 8 张）要么进域、要么带理由豁免，
+          # 否则这道门禁自己就会静默缩小判定域（本会话实测被这一条抓到：漏掉 autonomous-loop 的两张表
+          # 会把 3 张其实有主的基线误判成"无主基线"）。登记面另有 MAX_ 上界棘轮，新增登记必须同时抬起常量。
+          # 放在本 job 而不是 changes job 的资格判据：它的**输入**只有 apps/**（五张进域注册表 + 基线目录）
+          # 与 scripts/visual-coverage-debt.json，两者都不在 CI_IGNORED_PATHS 里（该名单里 `scripts/` 只有一条
+          # `scripts/gate-record-debt-ledger.json` 字面量），因此改到任何一个输入都不可能走 docs-only
+          # 短路绕过这里 —— 与 gate-record-debt-ledger 必须搬去 changes job 是同一判据的反向应用。
+          node --test scripts/check-visual-coverage.test.js
+          node scripts/check-visual-coverage.js
+          node scripts/check-unwired-tests.js
+
+      # --- Gate 2c2 已搬出本 job（#2745）---
+      # 本 job 整个被 `if: needs.changes.outputs.docs-only != 'true'` 门控，而 Gate 2c2 校验的输入
+      # openspec/records/** 命中 docs-only 白名单 —— 留在这里等于「纯文档 PR 的整篇没写记录」
+      # 这一形态永远不被校验，而这正是该判据的主战场。它现在在无条件执行的 changes job 里，
+      # 位置早于非 PR 早退。回归锁两处：scripts/classify-docs-only.test.js 的
+      # 「(白名单路径 → 门禁命令) 清单」，与 scripts/check-pr-exec-record.test.js 的 #2745 结构锁。
+
+      # --- Gate 2d: PowerShell 侧此前从未被 CI 收集的锁 ---
+      # 分档依据：本机 pwsh 7.6 与 Windows PowerShell 5.1 各跑一遍 + **本步在 runner 上的首跑结果**。
+      # 下面 6 条：**前 5 条已在 runner 的 pwsh 7 下实测 rc=0**（#2516 留痕），第 6 条
+      # worktree-fs-longpath 由本 PR 首次回接、其成败以本 run 的这一步为准。其中
+      # applive-foreign-audit 与 start-desktop-profile-lock
+      # 带小写 `#requires -Version 7`，在 5.1 下是 ScriptRequiresUnmatchedPSVersion 根本没执行
+      # （grep 时 `-i` 才能命中，按 `#Requires` 大写找会漏）。
+      # worktree-fs-longpath 曾在此之后加一步 `shell: powershell` 单独跑，实测在 runner 上仍红
+      # （同一条负控「未加 \\?\ 前缀的 IO.Directory::Delete 应当失败」unexpectedly succeeded），
+      # 当时被撤下并登记进 KNOWN_UNWIRED。现已回接：那条负控把「本进程能不能走长路径」写死了，
+      # 而它实际由注册表 LongPathsEnabled 与该 exe 清单是否 longPathAware 共同决定（pwsh 7 带、
+      # 5.1 不带，且 .NET FW 4.6.2+ 在 OS 开启后自己补前缀）。改为运行时探针实测本进程能力再选
+      # 期望：不能走长路径 ⇒ 仍要求「未加前缀必须失败」（这才证明夹具够深、正控有意义）；
+      # 能走 ⇒ 只要求结果与探针一致，深浅由该文件第 2 节的 depth>260 硬断言守住。
+      # 本机两档各命中一条支路实跑（pwsh 7 capable / 5.1 not-capable，各 28 条 PASS）。
+      # session-write-guard 曾在撤下名单里：改成 fail-fast 后暴露它在 runner 上本就红
+      # （`FAIL: shared status stays clean after tracked restore`，本机绿）。根因已定位并修掉，
+      # 不在守卫也不在 runner 的特殊性，而在夹具两处与真实工作树不同形：索引由 `git add`
+      # 现场建立（不带 git 的换行转换状态），以及工作树 EOL 形态留给宿主 core.autocrlf 决定
+      # （本机 false=LF、runner 默认 true=CRLF）。现已改为 clone 出工作树 + 夹具自带
+      # `* text eol=lf` / `* text eol=crlf` 两档都跑；本机以 GIT_CONFIG_GLOBAL 注入
+      # autocrlf=true 复现 runner 档位后，两 shell × 有/无全局身份 4 组组合各 34 条全绿。
+      # 本步骤整体用 shell: bash —— 旧版用 pwsh 时，前一条测试抛 FAIL 后步骤仍报 success
+      # （实测 run 36313053992 的 step 11 之后继续跑完并绿），等于装饰性门禁。
+      #
+      # 上面那句「下面 6 条」是历史注释（写时确为 6 条），现在共 9 条。第 9 条是本 PR 接入的
+      # get-test-process-tree：它把 Gate 4 / Desktop shards 那段进程树遍历的 PID 复用误判钉成
+      # 确定性夹具（注入进程表，不碰任何真实进程），反证 = 把时间防护改成恒不成立，第 1 条
+      # 断言立刻报出 csrss/winlogon/fontdrvhost/dwm 四个 PID。本机 pwsh 7 与 5.1 各 7 条 PASS。
+      # 第 7 条
+      # install-session-isolation-task 由 #2551 接入、其"零计划任务"档在 runner 上实测过
+      # （run 36390636981 打印 LIVE_TASK_COUNT=0 + 7 条 PASS）。第 8 条是本 PR 接入的
+      # session-isolation-automation：它前 10 条断言要求"主工作区 + 分支名为 main + hooks 已装"，
+      # 而后 8 条要求"能注册计划任务但不得碰生产路径"。CI 给的三样都不满足 ——
+      # actions/checkout 是 detached HEAD（健康检查 line 106 的 -RequirePrimary 硬要 branch=main）、
+      # CI 从不装 hooks、PR 合并流程也不会装。⛔ 所以**不改断言，改夹具**：在 $RUNNER_TEMP 里
+      # 造一个自有临时 clone（--no-hardlinks 防与 job 工作区共享对象），checkout -B main 并复制
+      # scripts/hooks/{pre-commit,post-checkout} 进它的 .git/hooks，然后在 clone 内跑测试。
+      # 该配方已在本机把 runner 态复现出来实跑过（两档 shell 各 18 条 PASS，健康检查
+      # primary=true/branch=main/clean=true）；"注册成功 vs 0x80070005 拒绝"两条支路测试自己
+      # 会按实测选期望（#2521 那条口径），因此不依赖 runner 令牌是否提权。
+      # 注：--depth 在本地路径克隆里会被 git 忽略（实测 warning），所以不写它——
+      # 写了就是一条不生效还误导人的参数。
+      - name: "Gate 2d - PowerShell locks never collected by CI (pwsh 7)"
+        shell: bash
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/applive-foreign-audit.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/mp-applive-launcher.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/mp-worktree-health.test.ps1
+          # 安装器自身的锁：没有它，「钩子从仓库真源装到共享 .git/hooks」这条链路只有运行期兜底、
+          # 没有任何 CI 在看（三条变异 no-op 循环 / 去 -Force / 相对 dst 均已实测指名变红）。
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-git-hooks.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/session-guard.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/session-write-guard.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-session-isolation-task.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/worktree-fs-longpath.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop-profile-lock.test.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/get-test-process-tree.test.ps1
+          # 第 8 条：夹具 = $RUNNER_TEMP 下的临时 clone（分支名 main + 两个 hook 就位）
+          ISO="$RUNNER_TEMP/mp-iso-fixture"
+          rm -rf "$ISO"
+          git clone -q --no-hardlinks "$(pwd -W)" "$ISO"
+          git -C "$ISO" checkout -q -B main
+          COMMON=$(git -C "$ISO" rev-parse --path-format=absolute --git-common-dir)
+          cp "$ISO/scripts/hooks/pre-commit" "$COMMON/hooks/pre-commit"
+          cp "$ISO/scripts/hooks/post-checkout" "$COMMON/hooks/post-checkout"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "$ISO/scripts/session-isolation-automation.test.ps1"
+
+      # --- Gate 3: 硬编码密钥扫描（同时执行 CI workflow 契约测试）---
+      # 装饰态已由 gate3-failfast 收口（#3443 登记为"本 PR 刻意不动"的未收口项 ①②，本 PR 两笔一起关掉）：
+      # ① 默认 pwsh 下"中间命令非零不中止"，正文原先只在最后一条命令后转存退出码 ⇒ 第一行
+      #    node --test（含 workflow-contract 等 8 个契约测试）红掉时步骤照绿。现场证据：
+      #    run 38339739342 / job 115107955784 的本步骤日志 `# tests 115 / # pass 114 / # fail 1`
+      #    而 step conclusion=success。现按 scripts/check-step-failfast.js 的逐条配对口径逐条守卫。
+      # ② main 的自相矛盾（Gate 9 正文含 workflow-contract 更早那条断言禁止的报告读取语句，
+      #    由 52aeaf2ae(#3439) 引入并靠 ① 掩盖合入）取的是"把那段报告读取挪出 Gate 9"那一支：
+      #    verdict 令牌改由 .github/scripts/agent-review-gate.js 单算并经 --note-file 落盘，
+      #    断言本身一字未改。#3443 实测过"整体换 shell: bash"那一支会把既有红一次性倾倒在
+      #    required 的 QG Static 上；逐条守卫把暴露面收窄到每条命令，不改步骤的 shell。
+      # 未收口的只剩 #3443 那行第 ③ 项（xiaohongshu 两个 dom 函数从未存在），与本步骤无关。
+      - name: "Gate 3 - Hardcoded secrets scan"
+        run: |
+          # ⛔ 本步骤原先只在最后一条命令后面写一条守卫。默认 shell 是 pwsh，中间命令非零不会中止该步骤
+          # ——于是 2026-10-13 实测 run 38339739342 里本步骤日志的 `# tests 115 / # pass 114 / # fail 1`
+          # （not ok 62 = workflow-contract 的 Gate 9 断言）被读成 step conclusion=success。
+          # 正解见 scripts/check-step-failfast.js 的逐条配对口径：每条受管命令后面各跟一条自己的检查。
+          node --test .github/scripts/check-hardcoded-secrets.test.js .github/scripts/workflow-contract.test.js .github/scripts/autonomous-loop-workflow.test.js .github/scripts/agent-review-gate.test.js .github/scripts/classify-ci-failure.test.js .github/scripts/ci-failure-handler-contract.test.js scripts/gate-budget.test.js scripts/check-desktop-shard-forwarding.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-hardcoded-secrets.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 判据本体也跑一次：它把"消费者实收 argv""续行扫描命中数""真 vitest 两腿枚举的文件名"
+          # 打进 CI 日志（带内现场），而不只在测试名里露一下。显式转存退出码——本步骤默认 shell 是 pwsh，
+          # 中间命令非零不会自动中止该步骤（AGENTS.md「一个 run 块里塞多条命令」那条）。
+          node scripts/check-desktop-shard-forwarding.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 6: IPC bridge completeness ---
+      - name: "Gate 6 - IPC bridge completeness"
+        id: ipc-check
+        run: |
+          node .github/scripts/check-ipc-bridge.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          echo "IPC_CHECK=PASS" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # --- Gate 7: locale 内容同步（i18n-content-sync：zh/en 成对提交 + 渲染端硬编码扫描） ---
+      # PowerShell 多行 step 只取最后一条命令的退出码，中间命令失败会被静默吞掉。
+      # 2026-09-12 修复：每条命令后显式检查退出码，任一失败立即退出（与 Gate 6 同模式）。
+      # 事故背景：PR #1719/#1732 的 18 处硬编码中文曾因本缺陷从未被 CI 拦截（--cjk FAIL 但 job success）。
+      - name: "Gate 7 - locale content sync (zh/en paired + renderer CJK + key existence + python CJK)"
+        run: |
+          git fetch origin main --no-tags
+          node --test .github/scripts/check-locale-sync.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-locale-sync.js --pair-base origin/main
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-locale-sync.js --cjk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-locale-sync.js --keys
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-locale-sync.js --py-cjk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 10: 前端一致性卡点（desktop-ui-consistency：IPC 单轨 + 确认原语统一）---
+      - name: "Gate 10 - Frontend consistency (renderer IPC single-track + confirm primitive)"
+        run: |
+          # 逐条守卫：本步骤的形状是"一条测试 + 一条门禁脚本"，旧棘轮只数测试文件，连多命令都不识别。
+          node --test .github/scripts/check-frontend-consistency.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-frontend-consistency.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 11: ESLint（error 级门禁；warning 不阻断，走 pnpm run lint:warnings 观察）---
+      # 2026-09-14 接入：接入前 main 存活 17 个 error 长期无人暴露（含 4 个 no-undef 真 bug）。
+      # 与本地 `pnpm run lint`（--quiet）同口径；生成物 preload bundle 已在 eslint.config.mjs ignores 排除。
+      - name: "Gate 11 - ESLint (error-level gate)"
+        run: |
+          cd apps/desktop
+          pnpm exec eslint electron/ src/ --quiet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 12 已搬出本 job（#2745 同族第三处）---
+      # 本 job 整个被 docs-only 门控，而 *.md / 01-docs/** / docs/** 全在 docs-only 白名单里，
+      # 于是 AGENTS.md 承诺的「文档 PR 的保留门禁：品牌残留」实际一次都不执行。
+      # 它现在在无条件执行的 changes job 里（接线保持只有一处真源，本注释故不复写命令原文）。
+
+      # --- Gate 13: 路由入口登记（desktop-ui-consistency T0-5：拦住新增暗路由）---
+      # 2026-09-17 接入：src/router/index.js 新增非 redirect 路由却未在
+      # src/config/route-registry.js 登记（含 internal/entryFrom）即失败。
+      # 与 Gate 6/7/12 同模式：每条命令后显式检查退出码（PowerShell 多行 step 只取最后一条
+      # 命令的退出码，中间命令失败会被静默吞掉 —— 见 PR #1719/#1732 事故）。
+      # 本地同口径：node .github/scripts/check-route-registry.js
+      - name: "Gate 13 - Route registry completeness (route entry registry)"
+        run: |
+          node --test .github/scripts/check-route-registry.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-route-registry.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 14: 历史品牌色字面量（desktop-ui-consistency T1-1：拦住四套 token 收编后的复辟）---
+      # 2026-09-18 接入：cohere/apple 旧 token 文件已全部转发 tokens.css 后，
+      # 历史色（#5048e5/#5149e8/#409eff/#3a7be5/#007aff/#f472b6）只允许出现在
+      # tokens.css 收编槽位区；组件/视图新增历史色字面量即失败。
+      # 基线 frontend-consistency-baseline.json colorLiterals 只降不升（存量 145 由后续批次清零）。
+      # 本地同口径：node .github/scripts/check-color-literals.js
+      - name: "Gate 14 - Color literals guard (token alias consolidation)"
+        run: |
+          node --test .github/scripts/check-color-literals.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-color-literals.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 15: Vue style blocks parse (postcss strict) ---
+      # 2026-09-19: CSS 块注释里形如 --color-xxx-* 紧跟斜杠会让星号加斜杠提前闭合注释，
+      # 后续文字被 postcss 当 CSS 解析 → vite build 失败，而 vitest 单测完全发现不了
+      # （本项目已连续三次因此构建变红：ViralAnalysis #1962 / Collection / Intelligence #2003）。
+      # 本地同口径：node .github/scripts/check-vue-style-parse.js
+      - name: "Gate 15 - Vue style blocks parse (postcss strict)"
+        run: |
+          node --test .github/scripts/check-vue-style-parse.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-vue-style-parse.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 15c: 覆盖率门禁必须真的覆盖 Vue SFC（M-6 回归保护） ---
+      # apps/desktop/vitest.config.js 的 coverage.include 此前 13 条全是 `*.js`，
+      # 而 src 下有 146 个 `.vue` —— SFC 对覆盖率贡献恒为 0，「55%」是在一个
+      # 刻意排除了界面逻辑的文件集上量出来的。
+      # 这类变更删掉不会让任何门禁变红：include 缩到不含 .vue 的范围、或写成
+      # `src/**.vue` 这种零命中的拼错 glob，vitest 一声不响地按新范围出数，门禁照样绿。
+      # 故判据不止断言「配了 .vue」，还要断言「glob 实测命中到文件」且
+      # 「src 下每个 .vue 都被覆盖」，并顺带守住 thresholds 不被删/不被置 0。
+      # 本地同口径：node .github/scripts/check-coverage-include-sfc.js
+      - name: "Gate 15c - Coverage include covers Vue SFC"
+        run: |
+          node --test .github/scripts/check-coverage-include-sfc.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-coverage-include-sfc.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 15b: scoped 样式块裸 :root 选择器门禁（QM-5 回归保护 · PR #2075/#2114 事故反哺） ---
+      # Vue scoped 块中写 :root {} 会编译为 :root[data-v-xxx] 永不匹配 html，
+      # 块内 CSS token 静默失效 → 看板 hero 白字白底隐形，单测与 headless 截图均拦不住。
+      # 本地同口径：node .github/scripts/check-scoped-root.js
+      - name: "Gate 15b - Scoped style block bare :root guard"
+        run: |
+          node --test .github/scripts/check-scoped-root.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-scoped-root.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 15c: 未定义 CSS 变量引用扫描（PR #2075 白卡隐形事故反馈） ---
+      # var(--x) 无 fallback 且 --x 从未定义 → 整条声明失效（渲染隐形类缺陷，单测与截图均拦不住）；
+      # 源码层全前端扫描，存量锁基线递袬只降不升。
+      # 本地同口径：node .github/scripts/check-css-var-defined.js
+      - name: "Gate 15c - Undefined CSS var reference guard"
+        run: |
+          node --test .github/scripts/check-css-var-defined.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-css-var-defined.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 16: 字号七档（T1-6）---
+      # font-size 字面量只降不升（基线模式），应使用 var(--font-size-*) 七档槽
+      # 本地同口径：node .github/scripts/check-font-size-scale.js
+      - name: "Gate 16 - Font size scale (7-step tokens)"
+        run: |
+          node --test .github/scripts/check-font-size-scale.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-font-size-scale.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 17: IPC sender 守卫覆盖（体检报告问题 14 / P1-14）---
+      # 事故背景：10 个 service 的 `injectedIpcMain || require('electron').ipcMain` 回退写法，
+      # 漏注入即静默注册到全局 ipcMain，同时绕过 isTrustedSender 来源校验与许可证/权益门禁。
+      # 本卡点固化单一口径（递归 electron 全量 .handle 注册点），并做双校验：
+      #  1) 清单式：不可判定注册点必须逐条登记在 electron/ipc-guard-exemptions.json（陈旧条目同样失败）；
+      #  2) 比例式：显式 withSenderCheck 占比不得低于清单里的 minGuardedRatio（只允许上调）。
+      # global/fallback 两类绕过路径不可豁免。本地同口径：node .github/scripts/check-ipc-sender-guard.js
+      - name: "Gate 17 - IPC sender guard coverage (ipc-handlers + services)"
+        run: |
+          node --test .github/scripts/check-ipc-sender-guard.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-ipc-sender-guard.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 18: 管理后台会话卫生（体检报告问题 15 / P1-15）---
+      # 事故背景：POST /api/auth/login 把 HS256 JWT 放在响应体，前端存 localStorage 并手工拼
+      # Authorization 头 ⇒ 任意 XSS 即可外带管理员凭据接管会话；且 7 个 view 各自复制这份样板，
+      # 加固只能逐文件改，漏一个就留一个洞（历史上「一处改不全」正是这套重复结构导致的）。
+      # 修复口径：凭据只走后端下发的 HttpOnly + SameSite=Lax Cookie；写操作叠加自定义头
+      # X-Ops-Session；CSP 三层下发（后端中间件 / nginx 模板 / vite dev 插件）。
+      # 本卡点把这些口径固化为静态不变量（含「合规 fixture 必须绿」的门禁自证测试）。
+      # 本地同口径：node .github/scripts/check-ops-session-hygiene.js
+      - name: "Gate 18 - ops-center session hygiene (HttpOnly cookie + CSRF header + CSP)"
+        run: |
+          node --test .github/scripts/check-ops-session-hygiene.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-ops-session-hygiene.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 19: 测试层微任务自旋（缺陷 G / L 级：零容忍，无基线）---
+      # 接入日期：2026-09-26
+      # 事故背景：本会话连续四颗随机红同属一类病 —— 等待没有边界。其中
+      # `identity-auth-window.test.js` 写作 `while (...) await Promise.resolve()`：
+      # 微任务让出不走宏任务阶段，vitest 的 testTimeout 打不断它，条件永不满足时就是
+      # worker 死循环，只能靠 job 级测试预算硬杀（预算值与出处由 scripts/gate-budget.js 单一持有，改它要过 gate-budget.test.js）（表现为"CI 无故卡死"，无堆栈无主机）。
+      # 同族另三例已各自修掉（#2423 路由 chunk 就绪判据、#2438 对拍挂钟容差、#2442 文件锁握手）。
+      # 本卡点把"自旋必须让出宏任务"固化成静态不变量（含门禁自身的夹具自证 + 真实仓库 0 命中棘轮）。
+      # 本地同口径：node .github/scripts/check-test-microtask-spin.js
+      - name: "Gate 19 - test microtask spin (bounded, interruptible waits)"
+        run: |
+          node --test .github/scripts/check-test-microtask-spin.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-test-microtask-spin.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --- Gate 20: 测试层出站守卫的接线棘轮（缺陷 G 的全仓化）---
+      # 接入日期：2026-09-30
+      # 事故背景：出站守卫原先只装在 apps/desktop 一侧，packages/*（252 个测试文件）与 ops-center
+      # 全程裸奔 —— 而本仓 nock/msw/setupServer 实测 0 命中，"测试不出网"没有任何传输层兜底，
+      # 漏一处就是一次真出站；真出站挂起时先撞上框架 testTimeout，红里只剩
+      # `Test timed out in 10000ms`，既看不到目标主机也看不出该注入什么。
+      # 本卡点从 `git ls-files` **枚举测试面**（判据来自仓库自身而非印象），逐面要求引用共享 setup；
+      # 接不上的必须带原因进只可缩小的欠账清单。已把守卫收敛为
+      # packages/shared-utils/src/network-egress-guard.js 一处实现，desktop 侧改为复用。
+      # 本地同口径：node .github/scripts/check-test-egress-guard.js
+      - name: "Gate 20 - test egress guard wiring (no real outbound in any suite)"
+        run: |
+          node --test .github/scripts/check-test-egress-guard.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node .github/scripts/check-test-egress-guard.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  unit-tests:
+    name: QG Unit Tests
+    runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      # electron@43 没有 postinstall：pnpm install 之后 electron 包只有 npm 壳、没有 dist。
+      # 不先备好二进制，任何 require('electron') 会走进 node_modules/electron/index.js，
+      # 它先打 "Downloading Electron binary..." 再当场下载 ⇒ 下载耗时被记到"当时正在跑的那条用例"头上
+      # （#2783 实测：15700ms 撞 vitest testTimeout=10000，而该用例本身只要几毫秒）。
+      - name: Ensure Electron binary
+        run: node scripts/ensure-electron.js
+
+      # 构建产物不进版本控制（change: bundle-untrack）⇒ 跑测试前必须先重建它们。
+      # 本 job 里的「产物契约锁」直接读这些文件（锁名含「已重打包」/「tracked bundle」/
+      # 「路径真实存在」），它们守的性质由「提交的产物与源码一致」变成「构建出的产物与
+      # 源码一致」——仍然完全有效，且不再需要人肉记得重建。
+      - name: Build preload bundles
+        run: |
+          pnpm --filter @multi-publish/desktop run build:preload
+          pnpm --filter @multi-publish/desktop run build:paginator
+
+      # --- Gate 4: 全工作区单元测试（含 Vitest 和 Node 测试）---
+
+      - name: "Set test mode"
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            git fetch origin main --depth=1 --no-tags
+            "TEST_MODE=affected" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "TEST_MODE=affected (nx affected -t test --base=origin/main)"
+          } else {
+            "TEST_MODE=full" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "TEST_MODE=full (nx run-many -t test --all)"
+          }
+
+      - name: "Restore Nx cache"
+        uses: actions/cache@v4
+        with:
+          path: .nx/cache
+          key: nx-${{ runner.os }}-test-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            nx-${{ runner.os }}-test-
+
+      - name: "Gate 4 - Workspace unit tests"
+        shell: pwsh
+        # 运行时出站台账（#2491 档3）：让守卫把"起了非 node 子进程 / 真的试过出站"逐条落盘，
+        # 跑完在本步骤末尾与 scripts/test-egress-ledger-baseline.json 比对，新增即红。
+        # 判据位置选在这里而不是新开 job：本 job 是 main 的 required context（classic protection
+        # 的 contexts 清单实测含 "QG Unit Tests"），红了真的拦得住合并；新开非 required job 只会"显示为红"。
+        env:
+          MP_TEST_EGRESS_LEDGER: ${{ runner.temp }}\egress-ledger-unit-tests.jsonl
+          MP_TEST_EGRESS_SUITE: unit-tests
+          # 必须绕过 Nx 任务缓存：缓存命中时 nx 只重放上次结果、**不启动测试进程**，
+          # 于是台账里连 install 记录都没有 ⇒ 判定器按 fail-closed 报"装配未经证实"，
+          # 把一条正常 PR 判红（QM-6 codex 路命中的"在取不到证据的位置上 fail-closed"形态）。
+          # 这条门禁的价值就是"真的跑过一遍"，所以这里宁可牺牲缓存。
+          NX_SKIP_NX_CACHE: 'true'
+        run: |
+          # 进程树遍历收敛到 scripts/get-test-process-tree.ps1：旧的内联版本只按数字 ParentProcessId
+          # 递归，根 pnpm 退出后该 PID 会被回收，实测（run 36519025075 attempt 1）把 csrss.exe /
+          # winlogon.exe / fontdrvhost.exe / dwm.exe 认成"残留测试子进程"，随后对它们逐个 taskkill /F。
+          # 缺文件必须硬失败——静默跳过等于把这条防护降级成装饰性门禁。
+          $treeLib = if ($env:GITHUB_WORKSPACE) { Join-Path $env:GITHUB_WORKSPACE 'scripts/get-test-process-tree.ps1' }
+            else { Join-Path (Get-Location) 'scripts/get-test-process-tree.ps1' }
+          if (-not (Test-Path -LiteralPath $treeLib)) { throw "缺少进程树防护脚本: $treeLib" }
+          . $treeLib
+
+          # 自检：nx 是否**真的**收到了 --exclude。放在这里而不是只放 Gate 2b，因为这条判据
+          # 的代价是"整个 30 分钟预算"——必须先于 Start-Process 完成。它自己会真跑两次
+          # `nx run-many`（A/B），读完 nx 打印的选择声明就把**自己 spawn 的那棵树**杀掉，
+          # 所以只花十几秒；而 2026-10-11 之前它不存在，desktop 全量就混在 Gate 4 里跑，
+          # 成功 run 实测 1173s / 1322s、失败 run 恰好 1801s = 预算到点（详见 PRD §2）。
+          # pwsh 步骤不会因中间命令非零自动中止（check-step-failfast 同族），必须显式判 rc。
+          # 口径指针：上面说的"30 分钟"是 #3315 之前的历史形态；现行测试预算只有一个真源 scripts/gate-budget.js，改数改那里。
+          node scripts/check-gate4-selection.js
+          if ($LASTEXITCODE -ne 0) { throw "Gate 4 自检失败：@multi-publish/desktop 没有被挡在 nx 选择集之外（exit $LASTEXITCODE）" }
+
+          if ($env:TEST_MODE -eq "affected") {
+            # 探测受影响项目（排除 desktop）；为空则跳过，避免 nx 空集挂起、把整档测试预算白白烧光
+            # 关键：必须区分「nx 执行失败」与「确实无受影响项目」——失败不能静默跳过，否则测试被假绿关闭
+            $affectedRaw = & pnpm exec nx show projects --affected --with-target=test --base=origin/main --exclude=@multi-publish/desktop --json 2>$null
+            $nxExit = $LASTEXITCODE
+            # 判据搬进 scripts/nx-affected-probe.js（三态语义由 `node --test
+            # scripts/nx-affected-probe.test.js` 钉住），这里只负责把结论分流。判据为什么不能留在这段里：
+            #
+            #   #2902 修过一次同形问题：pwsh 里 ConvertFrom-Json '[]' 得到的是 $null（同族坑见
+            #   AGENTS.md「@(...) 摊平成 $null」），于是「本轮没有任何受影响项目」被误分类成检测失败。
+            #   当时的口径是**字符串全等** `$t -eq '' -or $t -eq '[]'` —— 全等只对「输出恰好是这两种
+            #   形态」成立，而 nx 会往 stdout 掺自己的提示。CI runner 还原 Nx 缓存后（缓存键只含
+            #   .nx/cache，.nx/workspace-data/d 那个 db 不在键内）就会打出
+            #   `NX   Unrecognized Cache Artifacts`（run 37255412754 实测原文）。
+            #   提示一掺，全等两条全不成立 ⇒ 空集被降级成「检测失败」⇒ 继续跑 test:affected
+            #   ⇒ nx 实跑 0 个任务、不启动任何测试进程 ⇒ 末尾运行时出站台账判定
+            #   （fail-closed：无台账即红）把 PR #2596 判红，Gate Result 连带红。
+            #
+            # 早退必须排在降级判定之前，且只在 kind=empty（**确证**空集）时才早退。
+            $probeJson = $affectedRaw | node scripts/nx-affected-probe.js --exit $nxExit
+            if ($LASTEXITCODE -ne 0) {
+              throw "nx affected 判读脚本执行失败（exit $LASTEXITCODE）—— 判据没跑起来，不得当作空集早退"
+            }
+            $probe = $probeJson | ConvertFrom-Json
+            if ($probe.kind -eq 'empty') {
+              Write-Host "No non-desktop projects with a test target affected by this PR; skipping workspace unit tests (Gate 4) to avoid nx empty-set hang."
+              exit 0
+            }
+            if ($probe.kind -eq 'non-empty') {
+              Write-Host "Affected non-desktop projects: $($probe.projects -join ', ')"
+            } else {
+              Write-Host "::warning::nx affected detection unusable (kind=$($probe.kind), nx exit $nxExit, reason=$($probe.reason)); running tests:affected normally rather than skipping."
+            }
+            $testArgs = @("run", "test:affected:no-desktop")
+          } else {
+            $testArgs = @("run", "test:all:no-desktop")
+          }
+          # 预算来自 scripts/gate-budget.js（单一真源）。取不到必须当场红 —— 静默回落到写死值就是把
+          # "装配失败"读成"没超时"，正是本仓反复出事的形态（见 gate-budget.test.js 的同名锁）。
+          $gateBudgetMs = & node -e "process.stdout.write(String(require('./scripts/gate-budget.js').GATE_TEST_BUDGET_MS))"
+          if ($LASTEXITCODE -ne 0 -or -not $gateBudgetMs -or $gateBudgetMs -notmatch '^\d+$') { throw "取不到 Gate 测试预算（scripts/gate-budget.js）—— 不得回落到写死值" }
+          $launchMark = Get-Date
+          $testProcess = Start-Process -FilePath "pnpm.cmd" `
+            -ArgumentList $testArgs `
+            -NoNewWindow -PassThru
+
+          if (-not $testProcess.WaitForExit([int]$gateBudgetMs)) {
+            Write-Host "Gate 4 exceeded its $([int]($gateBudgetMs / 60000))-minute execution budget (elapsed budget exhausted; see scripts/gate-budget.js)."
+            $treeRows = @(Get-TestProcessTree -RootProcessId $testProcess.Id -NotBefore $launchMark)
+            $treeRows | Format-Table -AutoSize
+            # 为什么需要命令行：见 scripts/get-test-process-tree.ps1 的 Format-TestProcessTreeLine docblock
+            Write-TestProcessTreeDetail -Processes $treeRows
+            taskkill /PID $testProcess.Id /T /F 2>$null | Out-Null
+            throw "Gate 4 timed out; terminated the pnpm process tree."
+          }
+          # 带内贴脸告警：核心指标（实际耗时 vs 预算）每次跑都出声，不依赖有人想起去跑手动探针。
+          # 阈值与 scripts/gate-budget.js 的 WARN_RATIO 同档；贴脸＝要重测重定数，不是要放宽判据。
+          $gateElapsedMin = [math]::Round(((Get-Date) - $launchMark).TotalMinutes, 1)
+          $gateBudgetMin = [math]::Round(([int]$gateBudgetMs) / 60000, 1)
+          $gateUsePct = [math]::Round(100 * $gateElapsedMin / $gateBudgetMin)
+          if ($gateElapsedMin -ge ($gateBudgetMin * 0.8)) {
+            Write-Host "::warning::Gate 4 elapsed $gateElapsedMin min = $gateUsePct% of $gateBudgetMin min budget —— 贴脸：跑 node scripts/gate-budget-probe.js --check 重测并重定数（不得改判据消化它）"
+          } else {
+            Write-Host "[gate-budget] Gate 4 elapsed $gateElapsedMin min = $gateUsePct% of $gateBudgetMin min budget"
+          }
+
+          if ($testProcess.ExitCode -ne 0) {
+            $treeRows = @(Get-TestProcessTree -RootProcessId $testProcess.Id -NotBefore $launchMark)
+            $treeRows | Format-Table -AutoSize
+            # 为什么需要命令行：见 scripts/get-test-process-tree.ps1 的 Format-TestProcessTreeLine docblock
+            Write-TestProcessTreeDetail -Processes $treeRows
+            exit $testProcess.ExitCode
+          }
+
+          $remainingTestProcesses = @(Get-TestProcessTree -RootProcessId $testProcess.Id -NotBefore $launchMark)
+          if ($remainingTestProcesses.Count -gt 0) {
+            Write-Host "Gate 4 completed but left test child processes alive."
+            $remainingTestProcesses | Format-Table -AutoSize
+            foreach ($process in $remainingTestProcesses) {
+              taskkill /PID $process.ProcessId /T /F 2>$null | Out-Null
+            }
+            throw "Gate 4 left child processes alive after pnpm exited."
+          }
+
+          # 运行时出站台账判定：必须放在"真的跑过测试"这条路径的末尾。
+          # affected 为空时上面有一支 `exit 0` 早退 —— 那条路径不跑测试也没有台账，
+          # 若把判定做成独立 step 并 always() 执行，就会把"这次没有受影响项目"读成"台账缺失"（假红）。
+          # pwsh 步骤不会因中间命令非零自动中止，所以这里显式判 $LASTEXITCODE（check-step-failfast 同族）。
+          node scripts/check-test-egress-ledger.js --ledger "$env:MP_TEST_EGRESS_LEDGER"
+          if ($LASTEXITCODE -ne 0) { throw "运行时出站台账出现基线之外的新条目，或台账装配未经证实（清单只能缩小）" }
+
+      # --- Gate 4b: Startup and require smoke tests ---
+      - name: "Gate 4b - Startup and require smoke tests"
+        run: pnpm --filter @multi-publish/desktop test:startup
+
+  desktop-shards:
+    name: QG Desktop Shards
+    runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/2", "2/2"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      # electron@43 没有 postinstall：pnpm install 之后 electron 包只有 npm 壳、没有 dist。
+      # 不先备好二进制，任何 require('electron') 会走进 node_modules/electron/index.js，
+      # 它先打 "Downloading Electron binary..." 再当场下载 ⇒ 下载耗时被记到"当时正在跑的那条用例"头上
+      # （#2783 实测：15700ms 撞 vitest testTimeout=10000，而该用例本身只要几毫秒）。
+      - name: Ensure Electron binary
+        run: node scripts/ensure-electron.js
+
+      # 构建产物不进版本控制（change: bundle-untrack）⇒ 跑测试前必须先重建它们。
+      # 本 job 里的「产物契约锁」直接读这些文件（锁名含「已重打包」/「tracked bundle」/
+      # 「路径真实存在」），它们守的性质由「提交的产物与源码一致」变成「构建出的产物与
+      # 源码一致」——仍然完全有效，且不再需要人肉记得重建。
+      - name: Build preload bundles
+        run: |
+          pnpm --filter @multi-publish/desktop run build:preload
+          pnpm --filter @multi-publish/desktop run build:paginator
+
+
+      # --- 桌面 vitest 分片（跨 runner 并行；进程内保持串行确定性契约）---
+      # 环境契约：本 job 有意不继承 electron-ci.yml 的 NODE_ENV=test + SKIP_NATIVE_MEDIA_TOOL_TESTS=1，
+      # 桌面套件里依赖真实 ffmpeg/ffprobe 的 suite 因此会真跑原生工具（保留这条真实路径覆盖）。
+      # 代价是这类 suite 的 beforeAll 必须自带显式 hook 预算，不能指望全局 --hookTimeout=10000；
+      # 现有实例见 story2video-stages.test.js 的媒体 beforeAll（MEDIA_SETUP_HOOK_TIMEOUT_MS）。
+      - name: "Desktop tests shard ${{ matrix.shard }}"
+        shell: pwsh
+        # 运行时出站台账（与 Gate 4 同一份基线、同一个判定器）：桌面面是唯一真的会起
+        # ffmpeg/ffprobe/chrome-headless-shell/powershell 这些**非 node 子进程**的地方，
+        # 那些子进程里的出站注不进守卫，只能靠"新命令名一律出声并判红"来兜住。
+        env:
+          MP_TEST_EGRESS_LEDGER: ${{ runner.temp }}\egress-ledger-desktop-shard.jsonl
+          MP_TEST_EGRESS_SUITE: desktop-shard
+        run: |
+          # 进程树遍历收敛到 scripts/get-test-process-tree.ps1：旧的内联版本只按数字 ParentProcessId
+          # 递归，根 pnpm 退出后该 PID 会被回收，实测（run 36519025075 attempt 1）把 csrss.exe /
+          # winlogon.exe / fontdrvhost.exe / dwm.exe 认成"残留测试子进程"，随后对它们逐个 taskkill /F。
+          # 缺文件必须硬失败——静默跳过等于把这条防护降级成装饰性门禁。
+          $treeLib = if ($env:GITHUB_WORKSPACE) { Join-Path $env:GITHUB_WORKSPACE 'scripts/get-test-process-tree.ps1' }
+            else { Join-Path (Get-Location) 'scripts/get-test-process-tree.ps1' }
+          if (-not (Test-Path -LiteralPath $treeLib)) { throw "缺少进程树防护脚本: $treeLib" }
+          . $treeLib
+
+          # 预算来自 scripts/gate-budget.js（单一真源）。取不到必须当场红 —— 静默回落到写死值就是把
+          # "装配失败"读成"没超时"，正是本仓反复出事的形态（见 gate-budget.test.js 的同名锁）。
+          $gateBudgetMs = & node -e "process.stdout.write(String(require('./scripts/gate-budget.js').GATE_TEST_BUDGET_MS))"
+          if ($LASTEXITCODE -ne 0 -or -not $gateBudgetMs -or $gateBudgetMs -notmatch '^\d+$') { throw "取不到 Gate 测试预算（scripts/gate-budget.js）—— 不得回落到写死值" }
+          $launchMark = Get-Date
+          # 注意：-ArgumentList 里**不放**裸 "--"。pnpm 会把 "--" 原样交给脚本（实测 argv[0]=脚本、其后
+          # 依次为 "--","--shard=1/2",…），而 vitest 在 "--" 处停止解析选项 ⇒ 下面七个旗标全部静默失效，
+          # 两个 matrix 腿各跑全量 873 个文件（run 38143550282 两片都自报 Test Files 872 passed | 1 skipped (873)）。
+          # 判据：scripts/check-desktop-shard-forwarding.js（结构 + 真跑一次读被调用方自己收到的 argv）。
+          # 位置纪律：这段必须整块放在 Start-Process 之前——它一旦插进反引号续行的中间，PowerShell 会把
+          # 续行当注释吃掉，`-ArgumentList @(...)` 立刻变成一条独立语句并在 `${{ matrix.shard }}` 处解析失败。
+          $testProcess = Start-Process -FilePath "pnpm.cmd" `
+            -ArgumentList @(
+              "--filter",
+              "@multi-publish/desktop",
+              "test",
+              "--shard=${{ matrix.shard }}",
+              "--maxWorkers=1",
+              "--no-file-parallelism",
+              "--reporter=verbose",
+              "--testTimeout=10000",
+              "--hookTimeout=10000",
+              "--teardownTimeout=10000"
+            ) `
+            -NoNewWindow -PassThru
+
+          if (-not $testProcess.WaitForExit([int]$gateBudgetMs)) {
+            Write-Host "Desktop shard exceeded its $([int]($gateBudgetMs / 60000))-minute execution budget (see scripts/gate-budget.js)."
+            $treeRows = @(Get-TestProcessTree -RootProcessId $testProcess.Id -NotBefore $launchMark)
+            $treeRows | Format-Table -AutoSize
+            # 为什么需要命令行：见 scripts/get-test-process-tree.ps1 的 Format-TestProcessTreeLine docblock
+            Write-TestProcessTreeDetail -Processes $treeRows
+            taskkill /PID $testProcess.Id /T /F 2>$null | Out-Null
+            throw "Desktop shard timed out; terminated the pnpm process tree."
+          }
+          # 带内贴脸告警：核心指标（实际耗时 vs 预算）每次跑都出声，不依赖有人想起去跑手动探针。
+          # 阈值与 scripts/gate-budget.js 的 WARN_RATIO 同档；贴脸＝要重测重定数，不是要放宽判据。
+          $gateElapsedMin = [math]::Round(((Get-Date) - $launchMark).TotalMinutes, 1)
+          $gateBudgetMin = [math]::Round(([int]$gateBudgetMs) / 60000, 1)
+          $gateUsePct = [math]::Round(100 * $gateElapsedMin / $gateBudgetMin)
+          if ($gateElapsedMin -ge ($gateBudgetMin * 0.8)) {
+            Write-Host "::warning::Desktop shard elapsed $gateElapsedMin min = $gateUsePct% of $gateBudgetMin min budget —— 贴脸：跑 node scripts/gate-budget-probe.js --check 重测并重定数（不得改判据消化它）"
+          } else {
+            Write-Host "[gate-budget] Desktop shard elapsed $gateElapsedMin min = $gateUsePct% of $gateBudgetMin min budget"
+          }
+
+          if ($testProcess.ExitCode -ne 0) {
+            $treeRows = @(Get-TestProcessTree -RootProcessId $testProcess.Id -NotBefore $launchMark)
+            $treeRows | Format-Table -AutoSize
+            # 为什么需要命令行：见 scripts/get-test-process-tree.ps1 的 Format-TestProcessTreeLine docblock
+            Write-TestProcessTreeDetail -Processes $treeRows
+            exit $testProcess.ExitCode
+          }
+
+          $remainingTestProcesses = @(Get-TestProcessTree -RootProcessId $testProcess.Id -NotBefore $launchMark)
+          if ($remainingTestProcesses.Count -gt 0) {
+            Write-Host "Desktop shard completed but left test child processes alive."
+            $remainingTestProcesses | Format-Table -AutoSize
+            foreach ($process in $remainingTestProcesses) {
+              taskkill /PID $process.ProcessId /T /F 2>$null | Out-Null
+            }
+            throw "Desktop shard left child processes alive after pnpm exited."
+          }
+
+          # 运行时出站台账判定（口径同 Gate 4：放在"真的跑完测试"这条路径末尾，显式判 $LASTEXITCODE）。
+          # 两片分片各写自己的 runner.temp 文件、各判同一个基线 —— 键里没有分片维度，
+          # 所以"某条命令只在另一半出现"不会漏检，也不会因为本片没跑到而误判陈旧。
+          node scripts/check-test-egress-ledger.js --ledger "$env:MP_TEST_EGRESS_LEDGER"
+          if ($LASTEXITCODE -ne 0) { throw "运行时出站台账出现基线之外的新条目，或台账装配未经证实（清单只能缩小）" }
+
+
+  coverage:
+    name: QG Coverage
+    runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      # electron@43 没有 postinstall：pnpm install 之后 electron 包只有 npm 壳、没有 dist。
+      # 不先备好二进制，任何 require('electron') 会走进 node_modules/electron/index.js，
+      # 它先打 "Downloading Electron binary..." 再当场下载 ⇒ 下载耗时被记到"当时正在跑的那条用例"头上
+      # （#2783 实测：15700ms 撞 vitest testTimeout=10000，而该用例本身只要几毫秒）。
+      - name: Ensure Electron binary
+        run: node scripts/ensure-electron.js
+
+      # 构建产物不进版本控制（change: bundle-untrack）⇒ 跑测试前必须先重建它们。
+      # 本 job 里的「产物契约锁」直接读这些文件（锁名含「已重打包」/「tracked bundle」/
+      # 「路径真实存在」），它们守的性质由「提交的产物与源码一致」变成「构建出的产物与
+      # 源码一致」——仍然完全有效，且不再需要人肉记得重建。
+      - name: Build preload bundles
+        run: |
+          pnpm --filter @multi-publish/desktop run build:preload
+          pnpm --filter @multi-publish/desktop run build:paginator
+
+      # --- Gate 5: Coverage 检查（单 worker 串行，独立 job 避免与 Gate 4 争资源）---
+      - name: "Gate 5 - Test coverage check"
+        run: pnpm --filter @multi-publish/desktop test:coverage -- --coverage.reporter=text-summary
+
+  visual:
+    name: QG Visual
+    runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # --- Gate 7: 视觉回归测试 ---
+      - name: "Gate 7 - Visual regression"
+        id: visual-gate
+        shell: pwsh
+        env:
+          TEST_URL: http://127.0.0.1:5174
+          HEADLESS: "true"
+          PIXEL_THRESHOLD: "0.06"
+          VISUAL_READY_TIMEOUT: "15000"
+          # 视觉门禁要拍「由运营 flag 控制的入口」的开启态，所以这里显式注入构建期开关。
+          # 它是**显式 opt-in**，不依赖环境巧合：正式包构建不设该变量 ⇒ 该分支被静态折叠。
+          # （曾以为必需它是因为「CI 的 vite 带 NODE_ENV=production 压掉了 DEV」——该判定已被
+          #   本 step 的探针证伪：实测 VITE_MP_DEV_FLAG_OVERRIDE=[1] NODE_ENV=[]。真正根因是
+          #   hash 路由下「同一路由只改 query」会复用组件实例，见 PRD §17.5。）
+          VITE_MP_DEV_FLAG_OVERRIDE: "1"
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          Write-Host "=== Gate 7: Visual Regression Test ==="
+          $desktopDir = Join-Path $PWD "apps/desktop"
+
+          Push-Location $desktopDir
+          try {
+            Write-Host "Installing Playwright chromium..."
+            pnpm.cmd exec playwright install chromium
+            $playwrightExit = $LASTEXITCODE
+            if ($playwrightExit -ne 0) { exit $playwrightExit }
+
+            Write-Host "Building Vue frontend..."
+            pnpm.cmd run build:vue
+            $buildExit = $LASTEXITCODE
+            if ($buildExit -ne 0) { exit $buildExit }
+          } finally {
+            Pop-Location
+          }
+
+          $viteProcess = $null
+          $pixelExit = 1
+          $judgeExit = 1
+          # 就绪类故障的套件名单（空串 = 没有）。必须在 try 之前初始化：
+          # $null -ne '' 在 PowerShell 里是**真**，未赋值的变量会把下面的拦截变成恒真。
+          $suitesNotReady = ''
+          try {
+            Write-Host "Starting Vite dev server..."
+            # 取证：视觉门禁要拍 flag 开启态，而通道由构建期常量决定。把进程侧到底有没有拿到变量
+            # 原样打出来，避免再靠猜（这两个变量都不是密钥）。
+            Write-Host "flag-override env probe: VITE_MP_DEV_FLAG_OVERRIDE=[$env:VITE_MP_DEV_FLAG_OVERRIDE] NODE_ENV=[$env:NODE_ENV]"
+            # 探针打完之后按最稳的方式自己设一遍：step 级 env 是否被 Start-Process 子进程继承，不该靠假设。
+            $env:VITE_MP_DEV_FLAG_OVERRIDE = "1"
+            $viteProcess = Start-Process -FilePath "pnpm.cmd" `
+              -ArgumentList @("exec", "vite", "--host", "127.0.0.1", "--port", "5174") `
+              -WorkingDirectory $desktopDir `
+              -RedirectStandardOutput (Join-Path $desktopDir "vite-visual.stdout.log") `
+              -RedirectStandardError (Join-Path $desktopDir "vite-visual.stderr.log") `
+              -WindowStyle Hidden -PassThru
+
+            $viteReady = $false
+            for ($i = 1; $i -le 30; $i++) {
+              Start-Sleep -Seconds 1
+              $viteProcess.Refresh()
+              if ($viteProcess.HasExited) {
+                throw "Vite exited before becoming ready (exit=$($viteProcess.ExitCode))"
+              }
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:5174/" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  Write-Host "Vite ready after $i seconds"
+                  $viteReady = $true
+                  break
+                }
+              } catch {}
+            }
+            if (-not $viteReady) { throw "Vite never became ready" }
+
+            Push-Location $desktopDir
+            try {
+              Write-Host "Running pixel diff tests..."
+              pnpm.cmd run test:visual:pixel
+              $pixelExit = $LASTEXITCODE
+
+              # Gate 7b 的判据域：基线的**权威渲染**是 views 套件产出的 `<name>.png`
+              # （检查器的 findRender 优先取它）。本 job 若只跑像素套，磁盘上就只有
+              # `<name>-current.png`，而它与 views 渲染**不是同一张图**（实测同一次 run 内
+              # dashboard 差 350 px、collection 差 67870 px，且该差值在两个不同 head 上逐字相同
+              # ⇒ 确定性、非噪声）。拿它去比 views 域基线会报出假违规。
+              # 所以这里补跑 views 两套，让 Gate 7b 在正确的域上判定。
+              # 它们的**比较结果不另设门禁**：Gate 7b 判的是「基线 == 本次渲染，0 px」，
+              # 严格强于 views 自己的 6% 阈值（0 px 成立则 6% 必然成立），
+              # 但退出码必须原样打出来，否则「套件崩了」会伪装成「本次没产图」。
+              Write-Host "Running views suites (to produce the authoritative render for Gate 7b)..."
+              pnpm.cmd run test:visual
+              $viewsExit = $LASTEXITCODE
+              pnpm.cmd run test:visual:supplement
+              $viewsSuppExit = $LASTEXITCODE
+              # 暗档像素套（门禁②）。本步骤的目的**不是**再设一道比较门禁 —— Gate 7b 判的是
+              # 「基线 == 本次渲染，0 px」，严格强于像素套自己的 6% 阈值；目的是产出
+              # `<view>-dark-current.png`。没有它，PR 侧 Gate 7b 对每张 `*-dark.png` 只能记
+              # skipped，而 skipped 在 partial 下是**放行**的 —— 于是暗色漂移只能在 main push
+              # 暴露，而那道门禁不是必需上下文（实测 PR #3159 全绿合入后 main 红约 9 小时无人认领，
+              # 违规 8 张全部 *-dark.png）。
+              # 退出码照旧逐条打印：「暗档套件崩了」不得伪装成「本次没产图」。
+              Write-Host "Running dark pixel suite (to produce the dark renders for Gate 7b)..."
+              pnpm.cmd run test:visual:pixel:dark
+              $darkExit = $LASTEXITCODE
+              Write-Host "[GATE-7] suite exits: pixel=$pixelExit views=$viewsExit views-supplement=$viewsSuppExit dark=$darkExit"
+
+              # 退出码 3 = 有视图**从未渲染出来**（就绪超时）：确定性的路由/选择器故障，
+              # Gate 7b 的两轮 flake 甄别对它不适用，必须在本步骤当场拦。
+              # 退出码 1 = 像素/校验类失败，照旧只留痕、交给 Gate 7b —— 把它也接成阻断，
+              # 会把历史上确实存在的采集抖动变成所有 PR 的常量红（#2914 同 sha 两次 attempt
+              # 一档红一档绿即现场；Gate 7b 的两轮机制正是为此而生）。
+              $notReadySuites = @()
+              if ($pixelExit -eq 3) { $notReadySuites += 'pixel' }
+              if ($viewsExit -eq 3) { $notReadySuites += 'views' }
+              if ($viewsSuppExit -eq 3) { $notReadySuites += 'views-supplement' }
+              if ($darkExit -eq 3) { $notReadySuites += 'dark' }
+              if ($notReadySuites.Count -gt 0) { $suitesNotReady = $notReadySuites -join ',' }
+              # 如实记录当前可达性：pixel 与 dark 两套由 run-pixel-tests.js 直接
+              # `process.exitCode = 1`（实测该文件仅此一处退出码赋值，含 ERR_VISUAL_ENV_MISSING 也走 1），
+              # 所以它们那两条 `-eq 3` 今天**不可达**。保留而不是删掉，是因为下一个开始发 3 的套件
+              # 不必再改判定面；但不得把它当成"环境缺失已经被这道门禁拦住" —— 环境类故障的既有
+              # 出口是 ERR_VISUAL_ENV_MISSING（由脚本自身非零退出、经 $pixelExit -ne 0 拦住），语义是 1 不是 3。
+
+              Write-Host "Generating Agent judge report..."
+              node tests/visual-testing/scripts/agent-visual-judge.js
+              $judgeExit = $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+          } finally {
+            if ($viteProcess -and -not $viteProcess.HasExited) {
+              taskkill /PID $viteProcess.Id /T /F 2>$null | Out-Null
+            }
+          }
+
+          if ($suitesNotReady -ne '') {
+            Write-Host "[GATE-7] FATAL: 视图从未渲染出来（就绪超时）— 套件: $suitesNotReady"
+            Write-Host "[GATE-7] 这不是像素抖动：路由或就绪选择器指错了节点，两轮采集甄别救不了它。"
+            Write-Host "[GATE-7] 排障入口：套件日志的 [VISUAL-READY] 行点名了具体视图。"
+            exit 3
+          }
+          if ($pixelExit -ne 0) {
+            Write-Host "[GATE-7] Pixel diff failed - see artifacts for details"
+            exit $pixelExit
+          }
+          if ($judgeExit -ne 0) {
+            Write-Host "[GATE-7] Agent visual report generation failed"
+            exit $judgeExit
+          }
+          Write-Host "[GATE-7] All visual tests passed"
+
+      # Gate 7c：深色模式文字对比度（2026-10-07，Wave 0.4）。
+      #
+      # 存在的理由：Gate 7 全绿**不能**证明深色模式可读。
+      # 2026-10-07 实测 18 视图全部存在低对比文本（阈值 3:1，合计 61 处），
+      # 最差 1.09:1（浅字压浅底），而 Gate 7 与既有 dark-mode-audit.js 当时全绿。
+      # 根因是那套启发式只统计「接近纯白(≥240)的**背景**像素」，而坏掉的是
+      # **文字色** —— 背景仍是深色，整类问题落在检测盲区。
+      #
+      # 判据是「不许超过基线」而非「必须为 0」：存量是已登记的已知债务，
+      # 一次清零会让所有后续 PR 全红；逐波下降才是可执行的判据。
+      # 降基线必须显式跑 `node contrast-audit.js --update-baseline`。
+      #
+      # 复用本 job 已起的 vite（5174，TEST_URL 见上方 env），不额外起服务。
+      - name: "Gate 7c - Dark mode text contrast"
+        shell: pwsh
+        # ⚠ env 必须在本 step 重新声明。Gate 7 那个 env 是 **step 级**的，
+        # 不跨 step 继承（与 $desktopDir 同源问题，只是前者静默、后者直接报错）。
+        # 实测漏掉它时 CI 上 TEST_URL 为空 ⇒ 18 个视图全部 goto 失败，
+        # 而脚本的 fail-closed 只在「全部视图都失败」时才触发——这里恰好该红，
+        # 但此前 4 轮都被 $desktopDir 挡住，看不到这一层。
+        env:
+          TEST_URL: http://127.0.0.1:5174
+          HEADLESS: "true"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # ⚠ $desktopDir 必须在**本 step 内**重新计算：它是 Gate 7 step 里的局部变量，
+          # step 之间不共享（job 级 env 可以，shell 变量不行）。上一版直接
+          # Push-Location $desktopDir → 变量为 null → step 在第一行 Write-Host 之后
+          # 就抛错退出，node 从未执行 ⇒ 表现为「只有 exit code 1、没有报告没有诊断」。
+          $desktopDir = Join-Path $PWD "apps/desktop"
+          # 目录不存在就直接失败并说清楚，不要让 Push-Location 静默抛错
+          if (-not (Test-Path -LiteralPath $desktopDir)) {
+            Write-Host "[GATE-7c] FATAL: apps/desktop 不存在 (cwd=$((Get-Location).Path))"
+            exit 2
+          }
+          Write-Host "[GATE-7c] desktopDir = $desktopDir"
+          Push-Location $desktopDir
+
+          # ── 自己确保 dev server 可用 ──────────────────────────────────
+          # Gate 7 在自己 step 的 finally 里 taskkill 掉了 vite，所以 Gate 7c 跑到
+          # 此刻时 5174 已经是死的（实测报告：18 个视图全部
+          # ERR_CONNECTION_REFUSED）。「复用 Gate 7 起的服务」这个假设不成立。
+          # 这里不假设：先探活，活着就复用；死了就自己起一份，并在 finally 里收掉。
+          $viteProc = $null
+          $ownsVite = $false
+          try {
+            Write-Host "=== Gate 7c: dark mode contrast audit ==="
+            Write-Host "[diag] cwd       = $((Get-Location).Path)"
+            Write-Host "[diag] TEST_URL  = $env:TEST_URL"
+            Write-Host "[diag] HEADLESS  = $env:HEADLESS"
+            Write-Host "[diag] DEV_FLAG  = $env:VITE_MP_DEV_FLAG_OVERRIDE"
+            Write-Host "[diag] node      = $(node --version)"
+
+            $probe = $env:TEST_URL
+            $alive = $false
+            try {
+              $r = Invoke-WebRequest -Uri $probe -UseBasicParsing -TimeoutSec 5
+              Write-Host "[diag] probe $probe -> HTTP $($r.StatusCode)"
+              $alive = ($r.StatusCode -eq 200)
+            } catch {
+              Write-Host "[diag] probe $probe -> FAIL: $($_.Exception.Message)"
+            }
+
+            if (-not $alive) {
+              Write-Host "[GATE-7c] dev server 不可用，本 step 自起 vite ..."
+              $viteProc = Start-Process -FilePath "pnpm.cmd" `
+                -ArgumentList @("exec", "vite", "--host", "127.0.0.1", "--port", "5174") `
+                -WorkingDirectory $desktopDir -PassThru -NoNewWindow `
+                -RedirectStandardOutput (Join-Path $desktopDir "vite-gate7c.stdout.log") `
+                -RedirectStandardError (Join-Path $desktopDir "vite-gate7c.stderr.log")
+              $ownsVite = $true
+              $ready = $false
+              for ($i = 0; $i -lt 30; $i++) {
+                Start-Sleep -Seconds 2
+                try {
+                  $rr = Invoke-WebRequest -Uri $probe -UseBasicParsing -TimeoutSec 3
+                  if ($rr.StatusCode -eq 200) { $ready = $true; break }
+                } catch {}
+                if ($viteProc.HasExited) {
+                  Write-Host "[GATE-7c] vite 进程已退出 (exit=$($viteProc.ExitCode))"
+                  break
+                }
+              }
+              if (-not $ready) {
+                Write-Host "[GATE-7c] FATAL: 自起 vite 未就绪"
+                Get-Content (Join-Path $desktopDir "vite-gate7c.stderr.log") -Tail 30 -ErrorAction SilentlyContinue
+                Pop-Location
+                exit 2
+              }
+              Write-Host "[GATE-7c] vite 已就绪 (pid=$($viteProc.Id))"
+            } else {
+              Write-Host "[GATE-7c] 复用已在运行的 dev server"
+            }
+
+            try {
+              $pc = node -e "console.log(require.resolve('playwright-core'))"
+              Write-Host "[diag] playwright-core -> $pc"
+            } catch {
+              Write-Host "[diag] playwright-core -> FAIL: $($_.Exception.Message)"
+            }
+
+            $bl = "apps/desktop/tests/visual-testing/reports/contrast-audit-baseline.json"
+            if (Test-Path $bl) {
+              Write-Host "[diag] baseline 存在, sha=$((Get-FileHash $bl -Algorithm SHA256).Hash)"
+              Write-Host "[diag] baseline 内容: $(Get-Content $bl -Raw)"
+            } else {
+              Write-Host "[diag] baseline 缺失: $bl"
+            }
+
+            node tests/visual-testing/scripts/contrast-audit.js 2>&1 | Tee-Object -Variable contrastOut
+            $contrastExit = $LASTEXITCODE
+            Write-Host "[GATE-7c] contrast-audit exit: $contrastExit"
+            if ($contrastExit -ne 0) {
+              Write-Host "[GATE-7c] ---- 脚本输出 ----"
+              $contrastOut | ForEach-Object { Write-Host $_ }
+              $diagFile = Join-Path $desktopDir "tests/visual-testing/contrast-audit-diag.txt"
+              if (Test-Path $diagFile) {
+                Write-Host "[GATE-7c] ---- 启动期诊断 ----"
+                Get-Content $diagFile
+              } else {
+                Write-Host "[GATE-7c] 无诊断文件 —— 脚本连 module 加载都没走到"
+              }
+              $reportPath = Join-Path $desktopDir "tests/visual-testing/contrast-audit-report.json"
+              if (Test-Path $reportPath) {
+                Write-Host "[GATE-7c] ---- 报告前 200 行 ----"
+                Get-Content $reportPath -TotalCount 200
+              } else {
+                Write-Host "[GATE-7c] 未生成报告 —— 脚本在写报告前退出，看上方 [diag] 行"
+              }
+              Pop-Location
+              if ($ownsVite -and $viteProc -and -not $viteProc.HasExited) {
+                taskkill /PID $viteProc.Id /T /F 2>$null | Out-Null
+              }
+              exit $contrastExit
+            }
+            Write-Host "[GATE-7c] contrast audit passed"
+          } finally {
+            # 只收自己起的那份；复用的（Gate 7 起的）不归本 step 管
+            if ($ownsVite -and $viteProc -and -not $viteProc.HasExited) {
+              taskkill /PID $viteProc.Id /T /F 2>$null | Out-Null
+            }
+            Pop-Location
+          }
+
+      # Gate 7b：基线新鲜度（PR 侧、partial 形态）+ 两轮有界重试终判（#31）。
+      # 存在的理由：#2761 改了发布表单 UI 却没刷新基线，而新鲜度检查当时只接在
+      # visual-test.yml（2026-09-17 起不再由 PR 触发）里 ⇒ 它全绿合并、main 连红 11 次。
+      # 那道门禁是探测器，这一步把它变成防线。
+      #
+      # 为什么必须 partial：本 job 不跑暗色套，所以只产出一部分基线的同源渲染。
+      # partial = **只缩小判定面，绝不弱化已判的那部分**：
+      # 无渲染的记为 skipped 并逐个点名打印（不得静默），有渲染而过期的照常判红。
+      # 覆盖面以现场打印为准，不在此写死数字（写死就会漂）。
+      # 判定域必须与 Gate 7 里补跑的 views 两套一致（见该处注释）：基线的权威渲染是
+      # views 套件的 `<name>.png`，不是像素套件的 `<name>-current.png`。
+      #
+      # 为什么两轮（#31，2026-10-05 实测）：单张视图的采集不可复现会卡住任意 PR ——
+      # PR #2914 run 37267645916 attempt=1 红在 create-history.png 3909 px / 0.189%，
+      # 同 sha 的 attempt=2 与同 sha 的 main push 全绿 ⇒ 采集 flake，不是基线漂移。
+      # 终判 = 违规视图的**两轮交集**：两轮都红是确定性漂移，照旧拦；
+      # 单轮红判定为 flake，放行但逐个留痕；round2 没采到的（skipped）无证据，
+      # 不得当 flake 放行（判据不存在时不得改变结论）。round2 在清空后的渲染目录里重采，
+      # 套件崩溃残留的 round1 渲染不会被误读成 round2 证据。
+      - name: "Gate 7b - Baseline freshness (PR-side, partial, two-round verdict)"
+        shell: bash
+        run: |
+          node --test scripts/check-baseline-freshness.test.js
+
+          mkdir -p apps/desktop/tests/visual-testing/reports
+          R1=apps/desktop/tests/visual-testing/reports/gate7b-round1.json
+          R2=apps/desktop/tests/visual-testing/reports/gate7b-round2.json
+
+          # round 1：现行判定。干净即过（绝大多数 run 走这条路，零额外开销）。
+          if node scripts/check-baseline-freshness.js \
+            --renders=apps/desktop/tests/visual-testing/screenshots \
+            --baselines=apps/desktop/tests/visual-testing/base-screenshots \
+            --partial \
+            --json-out=$R1; then
+            echo "[GATE-7B] round 1 clean"
+            exit 0
+          fi
+
+          echo "[GATE-7B] round 1 reported violations - re-capturing views suites for flake discrimination"
+          mv apps/desktop/tests/visual-testing/screenshots apps/desktop/tests/visual-testing/screenshots-round1
+          mkdir -p apps/desktop/tests/visual-testing/screenshots
+
+          export TEST_URL=http://127.0.0.1:5174
+          export HEADLESS=true
+          export VITE_MP_DEV_FLAG_OVERRIDE=1
+          cd apps/desktop
+          pnpm.cmd exec vite --host 127.0.0.1 --port 5174 >vite-gate7b-round2.stdout.log 2>vite-gate7b-round2.stderr.log &
+          VITE_PID=$!
+          # kill 只打得到 pnpm.cmd 包装进程，杀不掉 vite 的 node 子进程树
+          # （同文件 Gate 7 的 pwsh 块用 taskkill /T /F 杀树，这里对齐）。
+          cleanup() { taskkill //PID $VITE_PID //T //F 2>/dev/null || kill $VITE_PID 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          ready=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -sf http://127.0.0.1:5174/ >/dev/null 2>&1; then ready=1; break; fi
+            if ! kill -0 $VITE_PID 2>/dev/null; then echo "[GATE-7B] round2 vite exited before ready"; exit 1; fi
+          done
+          if [ "$ready" != "1" ]; then echo "[GATE-7B] round2 vite never became ready"; exit 1; fi
+
+          # views 两套的比较结果不另设门禁（Gate 7b 的 0 px 严格强于 6%），
+          # 但退出码必须出声，否则「套件崩了」会伪装成「本次没产图」。
+          pnpm.cmd run test:visual || views_exit=$?
+          pnpm.cmd run test:visual:supplement || views_supp_exit=$?
+          # 暗档必须在 round2 也重采：否则 round2 的判定域缺暗档，一次暗档采集 flake
+          # 会因「本轮无证据」而放弃剩余预算，或直接被当成漂移判红。
+          pnpm.cmd run test:visual:pixel:dark || dark_exit=$?
+          echo "[GATE-7B] round2 suite exits: views=${views_exit:-0} views-supplement=${views_supp_exit:-0} dark=${dark_exit:-0}"
+          # round2 的两套 suite 在 apps/desktop 里跑；取证脚本在仓库根——必须回两层。
+          # #2934 引入时只回一层（apps/），导致 apps/scripts/... 找不到模块，所有触发 round2 重采的 PR 一律假红。
+          cd ../..
+
+          node scripts/check-baseline-freshness.js \
+            --renders=apps/desktop/tests/visual-testing/screenshots \
+            --baselines=apps/desktop/tests/visual-testing/base-screenshots \
+            --partial \
+            --json-out=$R2 || true
+          node scripts/check-baseline-freshness.js --verdict-rounds=$R1,$R2
+
+      - name: "Upload GUI quality artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-visual-reports
+          path: |
+            apps/desktop/tests/visual-testing/reports/**
+            apps/desktop/tests/visual-testing/contrast-audit-report.json
+            apps/desktop/tests/visual-testing/contrast-audit-diag.txt
+            apps/desktop/tests/visual-testing/screenshots/**
+            apps/desktop/tests/visual-testing/screenshots-round1/**
+            apps/desktop/vite-visual.*.log
+            apps/desktop/vite-gate7b-round2.*.log
+            apps/desktop/vite-gate7c.*.log
+          if-no-files-found: ignore
+          retention-days: 5
+
+  e2e:
+    name: QG Browser E2E
+    runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright (for Browser E2E)
+        run: pnpm.cmd exec playwright install chromium
+
+      # --- Gate 8: 真实浏览器端到端测试 ---
+      - name: "Gate 8 - Browser E2E"
+        id: e2e-gate
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          Write-Host "=== Gate 8: Browser E2E ==="
+          $desktopDir = Join-Path $PWD "apps/desktop"
+          $viteProcess = $null
+          $e2eExit = 1
+          try {
+            $viteProcess = Start-Process -FilePath "pnpm.cmd" `
+              -ArgumentList @("exec", "vite", "--host", "127.0.0.1", "--port", "5174") `
+              -WorkingDirectory $desktopDir `
+              -RedirectStandardOutput (Join-Path $desktopDir "vite-e2e.stdout.log") `
+              -RedirectStandardError (Join-Path $desktopDir "vite-e2e.stderr.log") `
+              -WindowStyle Hidden -PassThru
+
+            $viteReady = $false
+            for ($i = 1; $i -le 30; $i++) {
+              Start-Sleep -Seconds 1
+              $viteProcess.Refresh()
+              if ($viteProcess.HasExited) {
+                throw "Vite exited before becoming ready (exit=$($viteProcess.ExitCode))"
+              }
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:5174/" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  Write-Host "Vite ready after $i seconds"
+                  $viteReady = $true
+                  break
+                }
+              } catch {}
+            }
+            if (-not $viteReady) { throw "Vite never became ready" }
+
+            node apps/desktop/tests/e2e/helpers/route-functional-suite.test.js
+            $contractExit = $LASTEXITCODE
+            if ($contractExit -ne 0) { exit $contractExit }
+
+            node apps/desktop/tests/e2e/helpers/functional-runner.test.js
+            $runnerContractExit = $LASTEXITCODE
+            if ($runnerContractExit -ne 0) { exit $runnerContractExit }
+
+            node apps/desktop/tests/e2e/helpers/run-all.test.js
+            $runAllContractExit = $LASTEXITCODE
+            if ($runAllContractExit -ne 0) { exit $runAllContractExit }
+
+            pnpm.cmd --filter @multi-publish/desktop run test:e2e
+            $e2eExit = $LASTEXITCODE
+          } finally {
+            if ($viteProcess -and -not $viteProcess.HasExited) {
+              taskkill /PID $viteProcess.Id /T /F 2>$null | Out-Null
+            }
+          }
+
+          if ($e2eExit -ne 0) {
+            echo "E2E_GATE=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            exit $e2eExit
+          }
+          echo "E2E_GATE=PASS" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "[GATE-8] Browser E2E passed"
+          exit 0
+
+      - name: "Upload GUI quality artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-e2e-reports
+          path: |
+            apps/desktop/tests/e2e/reports/**
+            apps/desktop/vite-e2e.*.log
+          if-no-files-found: ignore
+          retention-days: 5
+
+  autonomous:
+    name: QG Autonomous
+    runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 15
+    # verdict 令牌的跨 job 通路。此前**整块声明不存在**，于是 gate-result 里的
+    # ${{ needs.autonomous.outputs.verdict-note }} 恒为空串 ⇒ `if ($env:AUTONOMOUS_VERDICT_NOTE)` 永不成立，
+    # "本次覆盖审计其实没发生"在 PR 汇总里根本打不出来（#3443 登记注释说"探针补上了可见性"，
+    # 那句只在 autonomous 自己的日志里成立）。由 workflow-contract 的同名用例钉住。
+    outputs:
+      verdict-note: ${{ steps.autonomous-gate.outputs.verdict_note }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整历史（与 origin/main 计算 merge-base/diff 需要；对齐 doc-gate.yml）
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # --- Gate 9: PRD/源码自主覆盖审计 ---
+      # 判据单一真源：scripts/gate9-classify.js（可单测，勿再在此处抄 PowerShell 字面量）。
+      # 2026-10-12 三缺陷修复见该文件头注：① 作用域按变更文件落点分流（不再固定审桌面端，
+      #   #3413 只动 ops-center 被判 0.31 分拦合并、#3409 连挂 4 次即此根因）；
+      #   ② 空 LLM 输出不再静默放行（见 autonomous-gate 步的 verdict 探针）；
+      #   ③ 口径统一（CI advisory / 本机 enforce 分裂，见 gate-result 注释）。
+      - name: "Gate 9 - PR metadata"
+        id: pr-meta
+        shell: pwsh
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          $title = "" + "$env:PR_TITLE" + ""
+          $body = "" + "$env:PR_BODY" + ""
+          $labels = "" + "$env:PR_LABELS" + ""
+          # 变更清单**不用** github.event.pull_request.changed_files：那是**整数计数**
+          # （实测 PR #3439 该字段 = 13，不是清单），toJSON 后 ConvertFrom-Json 得到标量，
+          # 分类器会把「13」当成一个假文件名 → 落到 fail-closed 桌面端全量（正是要修的根因）。
+          # 标准 PR payload 也没有 files 数组，故用 git 自己算：merge-base 三点 diff。
+          $base = & git merge-base origin/main HEAD 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $base) { $base = "origin/main" }
+          $raw = & git diff --name-only "$base" HEAD 2>$null
+          $files = @($raw | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+          Write-Host "Gate 9 changed files ($($files.Count)): $($files -join ', ')"
+          $input = @{ title = $title; body = $body; labels = $labels; changedFiles = $files } | ConvertTo-Json -Compress -Depth 4
+          $input | Out-File -FilePath gate9-input.json -Encoding utf8
+          # ⚠️ node -e 的 require('./x') 不相对 cwd 而相对 eval 脚本（CI 实测
+          #    Cannot find module './scripts/gate9-classify.js'），必须用绝对路径。
+          $out = & node -e "const path=require('path');const {classifyGate9}=require(path.join(process.cwd(),'scripts','gate9-classify.js'));const fs=require('fs');const r=classifyGate9(JSON.parse(fs.readFileSync('gate9-input.json','utf8')));fs.writeFileSync('gate9-meta.json',JSON.stringify(r));console.log('PR_MODE='+r.mode);console.log('GATE9_SRC='+r.srcDir);console.log('GATE9_DOCS='+r.docPaths.join(','));console.log('GATE9_REASON='+r.reason);if(r.featureIds.length)console.log('REQUIRED_FEATURE_IDS='+r.featureIds.join(','))"
+          $out | ForEach-Object { Write-Host $_ }
+          $mode = ($out | Select-String -Pattern '^PR_MODE=' | Select-Object -First 1).Line -replace '^PR_MODE=',''
+          $src = ($out | Select-String -Pattern '^GATE9_SRC=' | Select-Object -First 1).Line -replace '^GATE9_SRC=',''
+          $docs = ($out | Select-String -Pattern '^GATE9_DOCS=' | Select-Object -First 1).Line -replace '^GATE9_DOCS=',''
+          $ids = ($out | Select-String -Pattern '^REQUIRED_FEATURE_IDS=' | Select-Object -First 1).Line -replace '^REQUIRED_FEATURE_IDS=',''
+          # 判据没跑起来（node 崩溃/无输出）必须当场红：静默回落 full 就是让门禁名存实亡
+          if (-not $mode) { throw "Gate 9 PR 画像判据未产出 PR_MODE（node 执行失败？）—— 不得静默回落" }
+          "PR_MODE=$mode" | Out-File -Append $env:GITHUB_ENV
+          if ($src)  { "GATE9_SRC=$src"   | Out-File -Append $env:GITHUB_ENV }
+          if ($docs) { "GATE9_DOCS=$docs" | Out-File -Append $env:GITHUB_ENV }
+          if ($ids)  { "REQUIRED_FEATURE_IDS=$ids" | Out-File -Append $env:GITHUB_ENV }
+      - name: "Gate 9 - Autonomous coverage audit"
+        id: autonomous-gate
+        shell: pwsh
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          Write-Host "=== Gate 9: Autonomous Coverage Audit ==="
+          Write-Host "PR_MODE=$env:PR_MODE  SRC=$env:GATE9_SRC  DOCS=$env:GATE9_DOCS"
+          $reportStart = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          # srcDir/docs 由 gate9-classify.js 按变更落点给出；未给出时（report-only）传空串，
+          # 由审计器自身走 report-only 短路（run-autonomous-e2e.js:148 的 PR_MODE 判据）。
+          $src = if ($env:GATE9_SRC) { $env:GATE9_SRC } else { "apps/desktop/src" }
+          $docs = if ($env:GATE9_DOCS) { $env:GATE9_DOCS } else { "01-docs/PRD.md" }
+          $auditArgs = @(
+            "packages/ai-autonomous-tester/scripts/run-autonomous-e2e.js",
+            "--prd=$docs",
+            "--src=$src",
+            "--skip-server",
+            "--skip-visual",
+            "--docs=$docs",
+            "--threshold=0.5"
+            "--pr-mode=$env:PR_MODE"
+          )
+          if ($env:REQUIRED_FEATURE_IDS) { $auditArgs += "--required-feature-ids=$env:REQUIRED_FEATURE_IDS" }
+          if ($env:OPENAI_API_KEY) { $auditArgs += "--llm=openai" }
+
+          $output = & node @auditArgs 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          Write-Host "Autonomous audit exit code: $exitCode"
+
+          # ⛔ 这里原先内联了一份 verdict 探针（枚举报告文件 + 就地解析 JSON），与
+          # .github/scripts/agent-review-gate.js 的 judgeVerdictMissing 构成第二份同用途实现，
+          # 而且它按「目录里最新 mtime 的报告」取文件、不带 started-after ⇒ 重跑/残留时读到上一轮旧报告。
+          # 正解：令牌由门禁自己算（带 started-after）并经 --note-file 落盘，本步只读那个文件。
+          # 缺 --note-file 参数时下面 Test-Path 会恒走 else ⇒ 覆盖审计永远显示「未审计」，
+          # 与删掉可见性同等错误，所以由 workflow-contract 的 --note-file= 正向锁钉住。
+          # --required-feature-ids：本 PR 声明要实现的 feat_ 特性，与喂给审计器的是同一个值
+          # （审计器已按它把评估面收窄）。门禁必须知道这一点，否则「全仓存量欠账」与
+          # 「本 PR 声称实现却没实现」在门禁眼里是同一个 FAIL，前者会把后者一起吃掉。
+          # 未声明时 GITHUB_ENV 里根本没有该键，展开成空串 ⇒ 按存量归属处理。
+          $gateArgs = @(
+            ".github/scripts/agent-review-gate.js",
+            "autonomous",
+            "--report-dir=apps/desktop/tests/visual-testing/reports",
+            "--started-after=$reportStart",
+            "--audit-exit-code=$exitCode",
+            "--has-openai-key=$([bool]$env:OPENAI_API_KEY)",
+            "--note-file=gate9-verdict-note.txt",
+            "--required-feature-ids=$env:REQUIRED_FEATURE_IDS"
+          )
+          & node @gateArgs
+          $gateExit = $LASTEXITCODE
+          $verdictNoteOut = ""
+          if (Test-Path gate9-verdict-note.txt) {
+            # 空文件时 Get-Content -Raw 返回 $null（不是空串），直接 .Trim() 会抛
+            # "You cannot call a method on a null-valued expression" —— PASS 路径就是空文件，实测把整步打成 rc=1。
+            # [string] 归一化把 $null 变成空串，语义保持"没有令牌"。
+            $verdictNote = [string](Get-Content gate9-verdict-note.txt -Raw)
+            if ($verdictNote) {
+              Write-Host "##[warning]Gate 9: 覆盖审计未实际产出有效 verdict（令牌 $verdictNote）——green 不代表已审计"
+              $verdictNoteOut = $verdictNote
+            }
+          } else {
+            # 令牌文件总在（写盘发生在退出之前），所以缺文件只有一种解释：门禁进程没跑到写盘。
+            Write-Host "##[warning]Gate 9: verdict 令牌文件缺失——覆盖审计可见性未知，不得当作已审计"
+            $verdictNoteOut = "NOTE_FILE_MISSING"
+          }
+          if ($verdictNoteOut) {
+            # 两条都要写：GITHUB_ENV 给本作业后面的步骤，GITHUB_OUTPUT 给 gate-result 作业
+            # （作业 output 只能取自步骤 output，取不到 env —— 这是此前那条通路整条断掉的机制原因）。
+            echo "AUTONOMOUS_VERDICT_NOTE=$verdictNoteOut" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            echo "verdict_note=$verdictNoteOut" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+          if ($gateExit -eq 0) {
+            $gateStatus = if ($exitCode -eq 0) { "PASS" } else { "PROMPT_REVIEW_REQUIRED" }
+            echo "AUTONOMOUS_GATE=$gateStatus" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            exit 0
+          }
+          echo "AUTONOMOUS_GATE=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit $gateExit
+
+      - name: "Upload GUI quality artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-autonomous-reports
+          path: |
+            apps/desktop/tests/visual-testing/reports/**
+          if-no-files-found: ignore
+          retention-days: 5
+
+  business-api-postgres:
+    name: QG Business API Postgres
+    # 账号云镜像的迁移与仓储必须跑在真 PostgreSQL 上：Windows runner 不支持 services:，
+    # 因此这是独立的 ubuntu-latest job，而不是塞进 windows 的 unit-tests（AGENTS.md
+    # 「Docker runner 文件集 / PostgreSQL migration 最小权限」同族口径）。
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mulpub_test
+          POSTGRES_PASSWORD: mulpub_test_pw
+          POSTGRES_DB: mulpub_business_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mulpub_test -d mulpub_business_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: "Gate 4p-1 - 真实迁移（含 005_cloud_accounts）先 dry-run 再执行"
+        env:
+          BUSINESS_DATABASE_URL: postgresql://mulpub_test:mulpub_test_pw@127.0.0.1:5432/mulpub_business_test
+        run: |
+          cd packages/api-publish-engine
+          # ⛔ 本步骤**不要**加 PowerShell 的 if ($LASTEXITCODE...) 守卫：它所在的 business-api-postgres 作业是
+          # runs-on: ubuntu-latest，未声明 shell ⇒ 默认 bash（GitHub 给 bash 带 -e -o pipefail），本来就逐条中止。
+          # 2026-10-13 实测：加了 PowerShell 守卫后 runner 报 `syntax error near unexpected token (quote brace)`、
+          # 整步 exit 2。判据侧由 scripts/check-step-failfast.js 的 defaultShellForRunsOn 守住（把 bash 当 pwsh
+          # 是"误报合规形态"，比漏报更难自查，因为它会把坏语法推给 CI）。
+          node scripts/migrate-postgres.js --dry-run
+          node scripts/migrate-postgres.js | tee /tmp/migrate.json
+          node -e "
+            const r=JSON.parse(require('fs').readFileSync('/tmp/migrate.json','utf8'));
+            const hit=r.applied.concat(r.skipped).includes('005_cloud_accounts.sql');
+            if(!hit){console.error('LEDGER_MISSING_005_cloud_accounts');process.exit(1);}
+            console.log('005_cloud_accounts.sql 已在真实库执行:', r.applied.includes('005_cloud_accounts.sql')?'applied':'skipped');
+          "
+      - name: "Gate 4p-2 - 真库二次执行必须幂等（重复迁移不得重复建表或改 checksum）"
+        env:
+          BUSINESS_DATABASE_URL: postgresql://mulpub_test:mulpub_test_pw@127.0.0.1:5432/mulpub_business_test
+        run: |
+          cd packages/api-publish-engine
+          node scripts/migrate-postgres.js | tee /tmp/migrate2.json
+          node -e "
+            const r=JSON.parse(require('fs').readFileSync('/tmp/migrate2.json','utf8'));
+            if(r.applied.length){console.error('MIGRATION_NOT_IDEMPOTENT::'+r.applied.join(','));process.exit(1);}
+          "
+      - name: "Gate 4p-3 - 云账号仓储真 SQL 回归（合并键唯一约束 / 墓碑 / 按用户隔离 / 密文不含明文）"
+        env:
+          BUSINESS_DATABASE_URL: postgresql://mulpub_test:mulpub_test_pw@127.0.0.1:5432/mulpub_business_test
+          BUSINESS_DATABASE_MIGRATIONS_DIR: ${{ github.workspace }}/migrations/postgresql
+        run: |
+          cd packages/api-publish-engine
+          node --test test/cloud-accounts-postgres-real.test.js
+
+  gate-result:
+    name: Gate Result
+    runs-on: windows-latest
+    needs: [changes, static-gates, unit-tests, desktop-shards, coverage, business-api-postgres, visual, e2e, autonomous]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      # --- Gate result ---
+      # 本 job 是 main 的必需状态检查，但历史上只 echo 不判定，上游全红它也恒绿。
+      # 口径：success/skipped 放行，其余（failure/cancelled/timed_out/action_required/空值）一律拦。
+      # skipped 放行的依据：上游失败会把其下游置为 skipped，失败本身已由那个 failed 的上游捕获。
+      #
+      # 缺陷③口径统一（2026-10-12）：`autonomous` 在此列为 blocking，而 CI 侧 exec-record
+      # 跑的是 advisory（恒 0）、agent-review-gate 对 LLM 空输出也放行 —— 三处口径分裂。
+      # 现由 autonomous job 内的 verdict 探针补上「未实际审计」的可见性（AUTONOMOUS_VERDICT_NOTE），
+      # 此处把该 note 一并打印，使 blocking 的语义与可观测性对齐。
+      - name: "Gate result"
+        shell: pwsh
+        env:
+          AUTONOMOUS_VERDICT_NOTE: ${{ needs.autonomous.outputs.verdict-note }}
+        run: |
+          $results = [ordered]@{
+            'changes'        = '${{ needs.changes.result }}'
+            'static-gates'   = '${{ needs.static-gates.result }}'
+            'unit-tests'     = '${{ needs.unit-tests.result }}'
+            'desktop-shards' = '${{ needs.desktop-shards.result }}'
+            'coverage'        = '${{ needs.coverage.result }}'
+            'biz-api-pg'      = '${{ needs.business-api-postgres.result }}'
+            'visual'         = '${{ needs.visual.result }}'
+            'e2e'            = '${{ needs.e2e.result }}'
+            'autonomous'     = '${{ needs.autonomous.result }}'
+          }
+          Write-Host "=============================="
+          Write-Host "  quality-rhythm CI gate report"
+          Write-Host "=============================="
+          foreach ($k in $results.Keys) {
+            Write-Host ("  {0,-16}: {1}" -f $k, $results[$k])
+          }
+          if ($env:AUTONOMOUS_VERDICT_NOTE) {
+            Write-Host ("  autonomous-verdict : {0}  <-- 覆盖审计未实际产出有效 verdict（LLM 空输出/报告缺失），绿色不代表已审计" -f $env:AUTONOMOUS_VERDICT_NOTE)
+          }
+          Write-Host "=============================="
+          $allowed = @('success', 'skipped')
+          $blocking = @($results.Keys | Where-Object { $allowed -notcontains $results[$_] })
+          if ($blocking.Count -gt 0) {
+            Write-Host "[GATE-RESULT] FAIL - blocking job(s): $($blocking -join ', ')"
+            exit 1
+          }
+          Write-Host "[GATE-RESULT] PASS - all upstream jobs succeeded"

@@ -1,0 +1,184 @@
+// @ts-check
+/**
+ * usage-reporter.test.js — 模型调用用量脱敏上报
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+
+const { UsageReporter, classifyStatus } = require('./usage-reporter')
+
+function makeDb (rows) {
+  const statements = []
+  return {
+    prepare: vi.fn((sql) => {
+      const stmt = {
+        all: vi.fn((...args) => rows),
+        run: vi.fn(() => ({ changes: 1 })),
+      }
+      statements.push({ sql, stmt })
+      return stmt
+    }),
+    _statements: statements,
+  }
+}
+
+// 与真实 settings-store 同形：落盘是文本，读回是**解析后的值**（原样回吐会替被测代码改契约）
+function makeStore (rows, initial) {
+  let data = initial || ''
+  const stored = () => { try { return JSON.parse(data) } catch { return data } }
+  return {
+    db: makeDb(rows),
+    getSetting: vi.fn(() => (data ? stored() : '')),
+    getSettingObject: vi.fn((_k, d = {}) => {
+      const v = data ? stored() : null
+      return v && typeof v === 'object' && !Array.isArray(v) ? v : d
+    }),
+    setSetting: vi.fn((_k, v) => { data = (typeof v === 'string' ? v : JSON.stringify(v)) }),
+    _getData: () => data,
+  }
+}
+
+const LOG = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), notify: vi.fn() }
+const AUTH = { url: 'https://ops.example.com', apiKey: 'k' }
+
+describe('classifyStatus', () => {
+  it('success / 限流 / 普通失败分类', () => {
+    expect(classifyStatus({ status: 'success' })).toEqual({ ok: true, ratelimit: false })
+    expect(classifyStatus({ status: 'error', error_message: 'rate limit exceeded' }).ratelimit).toBe(true)
+    expect(classifyStatus({ status: 'error', error_message: 'HTTP 429' }).ratelimit).toBe(true)
+    expect(classifyStatus({ status: 'timeout', error_message: 'ETIMEDOUT' })).toEqual({ ok: false, ratelimit: false })
+  })
+})
+
+describe('UsageReporter.reportPending', () => {
+  let originalFetch
+  beforeEach(() => { originalFetch = global.fetch })
+  afterEach(() => {
+    global.fetch = originalFetch
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
+  it('未配置 auth 时静默跳过', async () => {
+    const store = makeStore([])
+    const r = new UsageReporter({ store, log: LOG, getOpsCenterAuth: () => null })
+    const res = await r.reportPending()
+    expect(res).toEqual({ code: 0, skipped: true })
+  })
+
+  it('无待上报日志时直接返回 0', async () => {
+    const store = makeStore([])
+    const r = new UsageReporter({ store, log: LOG, getOpsCenterAuth: () => AUTH, getClientId: () => 'dev-1' })
+    const res = await r.reportPending()
+    expect(res).toEqual({ code: 0, reported: 0 })
+  })
+
+  it('聚合上报并按水印推进；脱敏（不含 error_message）', async () => {
+    const rows = [
+      { id: 1, provider_id: 'openai', category: 'llm', action: 'chat', status: 'success', latency_ms: 500, tokens_in: 100, tokens_out: 50, cost: 0.01, error_message: null, created_at: '2026-08-09 10:00:00' },
+      { id: 2, provider_id: 'openai', category: 'llm', action: 'chat', status: 'error', latency_ms: 2000, tokens_in: 0, tokens_out: 0, cost: 0, error_message: 'rate limit exceeded 敏感信息', created_at: '2026-08-09 11:00:00' },
+      { id: 3, provider_id: 'minimax-multimodal', category: 'multimodal', action: 'tts', status: 'success', latency_ms: 12000, tokens_in: 0, tokens_out: 0, cost: 0.5, error_message: null, created_at: '' },
+    ]
+    const store = makeStore(rows)
+    const r = new UsageReporter({ store, log: LOG, getOpsCenterAuth: () => AUTH, getClientId: () => 'dev-1' })
+    let body
+    global.fetch = vi.fn(async (url, opts) => {
+      body = JSON.parse(opts.body)
+      return { ok: true, status: 200 }
+    })
+    const res = await r.reportPending()
+    expect(res.code).toBe(0)
+    expect(res.reported).toBe(2)
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://ops.example.com/api/v1/usage/ingest',
+      expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'X-Catalog-Key': 'k' }) }),
+    )
+    // 批次号随请求发出（服务端按 client_id+batch_id 去重防重试翻倍）
+    expect(body.batch_id).toContain('dev-1:0:3')
+    const byAction = Object.fromEntries(body.items.map(i => [i.action, i]))
+    expect(byAction.chat.usage_date).toBe('2026-08-09') // 按 created_at 真实日期归日
+    expect(byAction.chat.calls).toBe(2)
+    expect(byAction.chat.ok_count).toBe(1)
+    expect(byAction.chat.fail_count).toBe(1)
+    expect(byAction.chat.ratelimit_count).toBe(1)
+    expect(byAction.chat.latency_buckets).toEqual({ lt1s: 1, '1to3s': 1, '3to10s': 0, gt10s: 0 })
+    expect(byAction.tts.calls).toBe(1)
+    expect(byAction.tts.latency_buckets.gt10s).toBe(1)
+    // 脱敏：不上报 error_message 字段
+    expect(JSON.stringify(body)).not.toContain('rate limit exceeded')
+    expect(JSON.stringify(body)).not.toContain('error_message')
+    // 水印推进到 max id
+    expect(store._getData()).toContain('lastId')
+    expect(JSON.parse(store._getData()).lastId).toBe(3)
+  })
+
+  it('上报失败保留水印，下次重试不丢数据', async () => {
+    const rows = [{ id: 1, provider_id: 'openai', category: 'llm', action: 'chat', status: 'success', latency_ms: 100, tokens_in: 0, tokens_out: 0, cost: 0, error_message: null }]
+    const store = makeStore(rows)
+    const r = new UsageReporter({ store, log: LOG, getOpsCenterAuth: () => AUTH })
+    global.fetch = vi.fn(async () => ({ ok: false, status: 500 }))
+    const res = await r.reportPending()
+    expect(res.code).toBe(-1)
+    expect(store._getData()).toBe('') // 水印未推进
+  })
+
+  it('start 后定时与首报触发（fake timers）', async () => {
+    vi.useFakeTimers()
+    const rows = []
+    const store = makeStore(rows)
+    const r = new UsageReporter({ store, log: LOG, getOpsCenterAuth: () => AUTH })
+    const spy = vi.spyOn(r, 'reportPending').mockResolvedValue({ code: 0 })
+    r.start()
+    expect(spy).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(5001)
+    expect(spy).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(30 * 60 * 1000)
+    expect(spy).toHaveBeenCalledTimes(2)
+    r.stop()
+  })
+})
+
+describe('P1 调度可观测性上报（scheduler 聚合项）', () => {
+  let originalFetch
+  beforeEach(() => { originalFetch = global.fetch })
+  afterEach(() => {
+    global.fetch = originalFetch
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
+  it('governor 排队/冷却计数以 scheduler-observation 项上报', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true })
+    // 至少一条调用日志触发上报路径（scheduler 项追加在调用桶之后）
+    const store = makeStore([{ id: 1, provider_id: 'openai', category: 'llm', action: 'chat', status: 'success', latency_ms: 10, tokens_in: 1, tokens_out: 1, cost: 0, error_message: null, created_at: new Date().toISOString().slice(0, 10) }])
+    const r = new UsageReporter({
+      store,
+      log: LOG,
+      getOpsCenterAuth: () => AUTH,
+      getClientId: () => 'dev-1',
+      getSchedulerMetrics: () => ({
+        'minimax-tts': { queuedCount: 3, cooldownCount: 1, queueWaitMs: 4500, cooldownWaitMs: 30000 },
+      }),
+    })
+    const res = await r.reportPending()
+    expect(res.code).toBe(0)
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body)
+    const sched = body.items.find(i => i.action === 'scheduler-observation')
+    expect(sched).toBeTruthy()
+    expect(sched.provider_id).toBe('minimax-tts')
+    expect(sched.category).toBe('scheduler')
+    expect(sched.queued_count).toBe(3)
+    expect(sched.cooldown_count).toBe(1)
+    expect(sched.queue_wait_ms).toBe(4500)
+    expect(sched.cooldown_wait_ms).toBe(30000)
+  })
+
+  it('未注入 getSchedulerMetrics 时不上报 scheduler 项（向后兼容）', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true })
+    const store = makeStore([{ id: 1, provider_id: 'openai', category: 'llm', action: 'chat', status: 'success', latency_ms: 10, tokens_in: 1, tokens_out: 1, cost: 0, error_message: null, created_at: new Date().toISOString().slice(0, 10) }])
+    const r = new UsageReporter({ store, log: LOG, getOpsCenterAuth: () => AUTH, getClientId: () => 'dev-1' })
+    const res = await r.reportPending()
+    expect(res.code).toBe(0)
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body)
+    expect(body.items.filter(i => i.action === 'scheduler-observation')).toHaveLength(0)
+  })
+})

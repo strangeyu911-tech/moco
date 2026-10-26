@@ -1,0 +1,336 @@
+// @ts-check
+/**
+ * content-intelligence-analysis — 分析逻辑 mixin
+ *
+ * 拆分自 content-intelligence.js (2026-07-16 架构重构)
+ * 通过 Object.assign 注入 ContentIntelligence.prototype，方法内通过 this.search() /
+ * this._extractKeywords() 等访问主类与 mixin 提供的方法。
+ *
+ * 依赖：calculateStats（content-intelligence-utils，getBenchmark 使用）
+ *      this.search()           — 主类提供的跨平台搜索入口
+ *      this._extractKeywords() — 本 mixin 内部方法
+ */
+const { calculateStats, tokenizeContentWords } = require('./content-intelligence-utils')
+const { suggestTagsWithLLM } = require('./tag-suggest')
+const { suggestFallback } = require('./tag-suggest/fallback-extractor')
+const log = require('./logger')
+
+const analysisMixin = {
+  _extractPatterns (results) {
+    if (!results || results.length === 0) return null
+
+    // Find common words in high-engagement titles
+    const highEng = results.filter(r => r.engagement > 1.0)
+    if (highEng.length < 2) return null
+
+    // 词素切分复用 content-intelligence-utils 的 CJK 感知分词。
+    // 旧实现按空白/标点切，中文整句会变成一个"词"，实测把 GitHub issue 的
+    // 「申请加入请在这里评论」当成同类标题高频词渲染给用户。
+    //
+    // 计数口径 = 出现在多少条标题里（document frequency），不是出现总次数：
+    // 同一条标题里重复三次的词不代表是同类标题的共性。
+    // 并列时按词素字典序，保证同一批结果每次渲染顺序一致。
+    const wordFreq = {}
+    for (const r of highEng) {
+      for (const w of new Set(tokenizeContentWords(r.title))) {
+        wordFreq[w] = (wordFreq[w] || 0) + 1
+      }
+    }
+
+    const sorted = Object.entries(wordFreq)
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .slice(0, 5)
+
+    return sorted.length > 0 ? sorted : null
+  },
+
+  _generateTitleSuggestion (title, patterns) {
+    if (!patterns) return null
+
+    const topKeywords = patterns.slice(0, 3).map(([w]) => w)
+
+    // Check if title already contains these keywords
+    const missing = topKeywords.filter(kw =>
+      !title.toLowerCase().includes(kw)
+    )
+
+    if (missing.length === 0) return null
+
+    return {
+      keywords: topKeywords,
+      missingInTitle: missing,
+      tip: `高互动标题常包含: ${topKeywords.join(', ')}。当前标题缺失: ${missing.join(', ')}，可考虑加入。`
+    }
+  },
+
+  // ── Smart Tag Suggestion (方案 D.2) ─────────────────────────────
+  //
+  // Analyze content text, extract key topics, and map to platform tags.
+  // Uses simple keyword extraction + cross-reference with search trends.
+
+  /**
+   * Extract unique Chinese + English keywords from content text.
+   * @param {string} text
+   * @param {number} [maxKeywords=8]
+   * @returns {string[]}
+   *
+   * ⚠️ 这里**刻意没有**改用 tokenizeContentWords（标题用的 CJK 相邻二元组），不是遗漏：
+   * 本函数的输入是**整篇正文**、判据是**单文档内词频**（服务 suggestTags / findReferences /
+   * getOptimalTime），长串 CJK 在这里通常是词或短语，展开成二元组会把「人工智能」拆成
+   * 「人工 / 工智 / 智能」这类碎片喂给标签推荐。而 tokenizeContentWords 服务的是
+   * **短标题 + 跨标题重叠**，两个口径不可互换。
+   * 收敛为单一分词器属独立行为变更，须同时重跑 tag-suggest 与 getOptimalTime 的既有断言；
+   * 登记在 01-docs/PRD-TITLE-ASSISTANT-RELEVANCE-2026-09-28.md §11.5。
+   */
+  _extractKeywords (text, maxKeywords = 8) {
+    if (!text || text.length < 3) return []
+
+    // Remove HTML tags, URLs, special chars
+    const clean = text.replace(/<[^>]*>/g, ' ')
+                      .replace(/https?:\/\/\S+/g, '')
+                      .replace(/[@#]\S+/g, '')
+
+    // Split into words: CJK characters + English words
+    const cjk = clean.match(/[一-鿿㐀-䶿豈-﫿]{2,}/g) || []
+    const en = clean.toLowerCase()
+                   .replace(/[^a-z0-9\s-]/g, ' ')
+                   .split(/[\s,-]+/)
+                   .filter(w => w.length > 2 && w.length < 20)
+
+    // Count frequency
+    const freq = {}
+    for (const w of [...cjk, ...en]) {
+      freq[w] = (freq[w] || 0) + 1
+    }
+
+    // Filter stop words
+    const stopWords = new Set(['this', 'that', 'and', 'the', 'for', 'with', 'from',
+      'what', 'have', 'been', 'about', 'which', 'their', 'will', 'would', 'could',
+      'should', 'more', 'some', 'than', 'also', 'very', 'just', 'like', 'make',
+      'been', 'being', 'does', 'done', 'going', 'thing', 'things',
+      // Chinese
+      '可以', '没有', '一个', '我们', '他们', '这个', '那个', '什么', '时候',
+      '因为', '所以', '但是', '如果', '虽然', '怎么', '如何', '已经', '不是',
+      '就是', '可能', '需要', '不会', '非常', '还是', '只是', '自己',
+    ])
+
+    const sorted = Object.entries(freq)
+      .filter(([w]) => !stopWords.has(w))
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, maxKeywords)
+      .map(([w]) => w)
+
+    return sorted
+  },
+
+ /**
+   * 智能标签建议编排入口：LLM 可用时调用 tag-suggest 编排（LLM 生成 + 热门库校准 + 合规过滤 + 平台裁剪），
+   * 否则回退到本地摘词（fallback-extractor）。
+   * @param {string} content — Article content (title + body)
+   * @param {object} [opts]
+   * @param {string[]} [opts.platforms] — Platforms to suggest tags for
+   * @returns {object} { keywords, trafficTags, relatedTerms, byPlatform, byPlatformDetail, source, calibrated, matchedTopics }
+  */
+  async suggestTags (content, opts = {}) {
+    const platforms = (opts.platforms && opts.platforms.length > 0)
+      ? opts.platforms
+      : ['zhihu', 'weibo', 'xiaohongshu', 'bilibili', 'toutiao']
+
+    // 空内容直接返回空结果
+    if (!content || String(content).trim().length < 3) {
+      return {
+        keywords: [],
+        trafficTags: [],
+        relatedTerms: [],
+        byPlatform: {},
+        byPlatformDetail: {},
+        source: 'extractor',
+        calibrated: false,
+        matchedTopics: {},
+      }
+    }
+
+    // LLM 可用 → 编排入口（LLM 生成 + 热门库校准 + 合规过滤 + 平台裁剪）
+    if (this._aiGenerator && typeof this._aiGenerator.generateWithDefault === 'function') {
+      try {
+        return await suggestTagsWithLLM({
+          content: String(content),
+          platforms,
+          aiGenerator: this._aiGenerator,
+        })
+      } catch (e) {
+        // 编排失败 → 回退本地摘词
+        log.warn('TagSuggest', 'suggestTags 编排失败，回退本地摘词: ' + (e && e.message ? e.message : String(e)))
+      }
+    }
+
+    // LLM 不可用或失败 → 本地摘词回退
+    return suggestFallback(String(content), { platforms })
+  },
+
+  // ── External Reference Finder (方案 D.3) ────────────────────────
+  //
+  // Search authoritative sources for references that can be linked
+  // in the article body to increase credibility.
+
+  /**
+   * Find authoritative references/sources related to the given text.
+   * @param {string} text — Selected text or full article
+   * @param {object} [opts]
+   * @param {number} [opts.limit=5]
+   * @returns {Promise<object>} { references: [{ title, url, snippet, source, relevance }] }
+   */
+  async findReferences (text, opts = {}) {
+    const limit = opts.limit || 5
+    if (!text || text.length < 5) return { references: [], total: 0 }
+
+    // Use the text as search query
+    const result = await this.search(text, { limit, sources: ['reddit', 'hackernews', 'github'] })
+
+    // Filter for high-quality references: have URL + minimal engagement
+    const refs = (result.results || [])
+      .filter(r => r.url && r.engagement > 0.1 && r.title)
+      .slice(0, limit)
+      .map(r => ({
+        title: r.title,
+        url: r.url,
+        snippet: r.snippet || null,
+        source: r.source,
+        engagement: r.engagement,
+        relevance: Math.round(r.engagement * 20),  // 0-60 scale
+      }))
+
+    return {
+      references: refs,
+      total: refs.length,
+      query: text.slice(0, 80),
+    }
+  },
+
+  // ── Content Benchmarking (方案 D.4) ─────────────────────────────
+  //
+  // Compare article performance against similar content discovered
+  // via search. Shows "where you stand" relative to peers.
+
+  /**
+   * Get benchmark data: compare article metrics vs. similar content.
+   * @param {string} title — Article title to benchmark
+   * @param {object} [opts]
+   * @param {number} [opts.sampleSize=12]
+   * @returns {Promise<object>} Benchmark stats
+   */
+  async getBenchmark (title, opts = {}) {
+    const sampleSize = opts.sampleSize || 12
+    if (!title || title.length < 3) {
+      return { error: 'Title too short', benchmark: null }
+    }
+
+    // Search for similar content
+    const searchResult = await this.search(title, { limit: sampleSize, sources: ['reddit', 'hackernews'] })
+    const items = searchResult.results || []
+    if (items.length < 3) {
+      return { benchmark: null, message: 'Not enough similar content found for benchmarking' }
+    }
+
+    // Compute stats
+    const engagements = items.map(r => r.engagement).filter(e => e > 0)
+    const upvotesList = items.map(r => r.upvotes || 0)
+    const commentsList = items.map(r => r.comments || 0)
+
+    // eslint-disable-next-line no-unused-vars
+    const avg = (arr) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+    const sorted = (arr) => [...arr].sort((a, b) => a - b)
+    // eslint-disable-next-line no-unused-vars
+    const median = (arr) => {
+      if (arr.length === 0) return 0
+      const s = sorted(arr)
+      return s.length % 2 === 0 ? (s[s.length/2 - 1] + s[s.length/2]) / 2 : s[Math.floor(s.length/2)]
+    }
+    // eslint-disable-next-line no-unused-vars
+    const percentile = (arr, p) => {
+      const s = sorted(arr)
+      if (s.length === 0) return 0
+      const idx = Math.ceil(p / 100 * s.length) - 1
+      return s[Math.max(0, Math.min(idx, s.length - 1))]
+    }
+
+    const bench = {
+      sampleSize: items.length,
+      engagement: calculateStats(engagements),
+      upvotes: calculateStats(upvotesList),
+      comments: calculateStats(commentsList),
+      topSources: [...new Set(items.map(r => r.source))],
+      generatedAt: new Date().toISOString(),
+    }
+
+    return { benchmark: bench }
+  },
+
+  // ── Optimal Posting Time (方案 D.5) ─────────────────────────────
+  //
+  // Analyze search result timestamps to find peak engagement hours.
+
+  /**
+   * Analyze time distribution from search results for optimal posting time.
+   * @param {string} keyword — Topic keyword
+   * @returns {Promise<object>} Hourly distribution + recommendation
+   */
+  async getOptimalTime (keyword) {
+    if (!keyword || keyword.length < 2) {
+      return { error: 'Keyword too short', recommendation: null }
+    }
+
+    const result = await this.search(keyword, { limit: 20, sources: ['reddit', 'hackernews'] })
+    const items = result.results || []
+    if (items.length < 5) {
+      return { recommendation: null, message: 'Not enough data for time analysis' }
+    }
+
+    // Compute hourly distribution from created_utc timestamps
+    const hourDist = {}
+    for (const r of items) {
+      if (!r.created_utc) continue
+      const d = new Date(r.created_utc * 1000)
+      const hour = d.getUTCHours()
+      hourDist[hour] = (hourDist[hour] || 0) + 1
+    }
+
+    // Find peak hours weighted by engagement
+    const hourScore = {}
+    for (const r of items) {
+      if (!r.created_utc) continue
+      const d = new Date(r.created_utc * 1000)
+      const hour = d.getUTCHours()
+      hourScore[hour] = (hourScore[hour] || 0) + (r.engagement || 0.1)
+    }
+
+    // Top 3 hours by engagement-weighted score
+    const sorted = Object.entries(hourScore)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([hour, score]) => ({
+        hourUTC: parseInt(hour),
+        hourCN: (parseInt(hour) + 8) % 24,  // Beijing time
+        score: Math.round(score * 10) / 10,
+      }))
+
+    // Count data points per source
+    const bySource = {}
+    for (const r of items) {
+      bySource[r.source] = (bySource[r.source] || 0) + 1
+    }
+
+    return {
+      recommendation: sorted.length > 0 ? {
+        topHours: sorted,
+        bestHourUTC: sorted[0].hourUTC,
+        bestHourCN: sorted[0].hourCN,
+        summary: `基于 ${items.length} 条相关内容分析，最佳发布时段 UTC ${sorted[0].hourUTC}:00（北京时间 ${sorted[0].hourCN}:00）`,
+        dataPoints: items.length,
+      } : null,
+      bySource,
+    }
+  }
+}
+
+module.exports = analysisMixin

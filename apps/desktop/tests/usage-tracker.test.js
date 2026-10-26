@@ -1,0 +1,122 @@
+/**
+ * UsageTracker unit tests (desktop app usage statistics)
+ *
+ * 注意：用 __registerMock 替代 vi.mock，因为 vitest 4 下 vi.mock 的 factory
+ * 对 CJS require 不生效。__registerMock 拦截 Module.prototype.require，与 CJS 完全兼容。
+ */
+__enableElectronMock()
+
+__registerMock("fs", {
+  existsSync: vi.fn().mockReturnValue(false),
+  readFileSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  mkdirSync: vi.fn(),
+  renameSync: vi.fn(),
+})
+
+__registerMock("path", {
+  join: vi.fn(function() { return "/mock/usage-data.json"; }),
+  dirname: vi.fn(),
+})
+
+__registerMock("./logger", {
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+})
+
+describe("UsageTracker", () => {
+  var UsageTracker
+  var tracker
+
+  beforeAll(function() {
+    UsageTracker = require("../electron/services/usage-tracker")
+  })
+
+  beforeEach(function() {
+    tracker = new UsageTracker()
+    // Reset internal state
+    tracker._data = { events: [], features: {}, daily: {}, sessions: 0, since: null }
+    tracker._loaded = false
+  })
+
+  test("initializes with empty data", function() {
+    expect(tracker._data).toBeDefined()
+    expect(tracker._data.events).toEqual([])
+    expect(tracker._data.features).toEqual({})
+    expect(tracker._data.daily).toEqual({})
+    expect(tracker._data.sessions).toBe(0)
+  })
+
+  test("trackEvent records an event", function() {
+    tracker.trackEvent("publish", "click", { platform: "weibo" })
+    expect(tracker._data.events.length).toBe(1)
+    expect(tracker._data.events[0].feature).toBe("publish")
+    expect(tracker._data.events[0].action).toBe("click")
+    expect(tracker._data.events[0].detail.platform).toBe("weibo")
+    expect(tracker._data.events[0].timestamp).toBeDefined()
+  })
+
+  test("trackFeatureUsage increments counter", function() {
+    tracker.trackFeatureUsage("publish_button", "click")
+    tracker.trackFeatureUsage("publish_button", "click")
+    tracker.trackFeatureUsage("publish_button", "success")
+    expect(tracker._data.features.publish_button.click).toBe(2)
+    expect(tracker._data.features.publish_button.success).toBe(1)
+  })
+
+  test("trackDaily records per-day stats", function() {
+    var today = new Date().toISOString().split("T")[0]
+    tracker.trackDaily("articles_published", 3)
+    tracker.trackDaily("articles_published", 1)
+    expect(tracker._data.daily[today].articles_published).toBe(4)
+  })
+
+  test("getStats returns summary", function() {
+    tracker.trackFeatureUsage("publish", "click")
+    tracker.trackFeatureUsage("login", "success")
+    tracker.trackEvent("app", "start")
+    var stats = tracker.getStats()
+    expect(stats.features.publish.click).toBe(1)
+    expect(stats.features.login.success).toBe(1)
+    expect(stats.events).toBeDefined()
+  })
+
+  test("save persists data to disk", function() {
+    var fs = require("fs")
+    tracker.trackFeatureUsage("test", "click")
+    tracker.save()
+    expect(fs.writeFileSync).toHaveBeenCalled()
+    var callArg = fs.writeFileSync.mock.calls[0][1]
+    var parsed = JSON.parse(callArg)
+    expect(parsed.features.test.click).toBe(1)
+  })
+
+  test("getDailyStats returns daily breakdown", function() {
+    var today = new Date().toISOString().split("T")[0]
+    tracker.trackDaily("articles_published", 5)
+    tracker.trackDaily("platforms_used", 3)
+    var daily = tracker.getDailyStats()
+    expect(daily[today].articles_published).toBe(5)
+    expect(daily[today].platforms_used).toBe(3)
+  })
+
+  test("reset clears all data", function() {
+    tracker.trackFeatureUsage("publish", "click")
+    tracker.trackEvent("app", "start")
+    expect(tracker._data.events.length).toBeGreaterThan(0)
+    tracker.reset()
+    expect(tracker._data.events.length).toBe(0)
+    expect(Object.keys(tracker._data.features).length).toBe(0)
+  })
+
+  test("load reads from disk", function() {
+    var fs = require("fs")
+    var saved = { events: [{feature:"test",action:"load"}], features: {test:{load:1}}, daily: {}, sessions: 1, since: "2026-01-01" }
+    fs.existsSync.mockReturnValue(true)
+    fs.readFileSync.mockReturnValue(JSON.stringify(saved))
+    tracker.load()
+    expect(tracker._data.features.test.load).toBe(1)
+    expect(tracker._data.sessions).toBe(1)
+  })
+})

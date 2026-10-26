@@ -1,0 +1,54 @@
+{
+  "name": "multi-publish",
+  "version": "0.2.0",
+  "private": true,
+  "description": "多平台内容一键发布 — Monorepo",
+  "packageManager": "pnpm@11.13.1",
+  "scripts": {
+    "dev": "pnpm --filter @multi-publish/desktop dev",
+    "build": "pnpm --filter @multi-publish/desktop build",
+    "build:win": "pnpm --filter @multi-publish/desktop build:win",
+    "test": "pnpm -r --if-present run test",
+    "clean": "rm -rf apps/*/node_modules packages/*/node_modules node_modules",
+    "check:deps": "depcheck --ignore-dirs=dist,node_modules,.playwright-browsers,.ccg,.storybook,01-docs --ignores=@vitejs/*,vite,vitest,app-builder-bin,electron,@electron/asar,@jridgewell/trace-mapping,cheerio,remotion,@stryker-mutator/core,@stryker-mutator/vitest-runner,pinia,playwright,ws,@storybook/*,storybook,*.stories.*",
+    "check:circular": "madge --warning --circular apps/desktop/electron/main.js",
+    "test:rpa-selectors": "cd packages/rpa-engine && pnpm exec vitest run tests/platform-selectors.test.js tests/platform-selectors-cross-platform.test.js",
+    "test:ai-autonomous-tester": "pnpm --filter @multi-publish/ai-autonomous-tester test",
+    "test:affected": "nx affected -t test --base=origin/main --parallel=1",
+    "test:all": "nx run-many -t test --all --parallel=1",
+    "test:affected:no-desktop": "nx affected -t test --base=origin/main --parallel=1 --exclude=@multi-publish/desktop",
+    "test:all:no-desktop": "nx run-many -t test --all --parallel=1 --exclude=@multi-publish/desktop",
+    "version:sync": "node scripts/sync-version.mjs",
+    "version:bump": "node scripts/bump-version.mjs",
+    "version:check": "node scripts/release-gate.mjs",
+    "version:release": "node scripts/release.mjs"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "keywords": [
+    "multi-publish",
+    "rpa",
+    "wechat"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.25",
+    "app-builder-bin": "5.0.0-alpha.10",
+    "cheerio": "^1.2.0",
+    "electron": "^43.7.7",
+    "remotion": "4.0.484"
+  },
+  "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1",
+    "@stryker-mutator/vitest-runner": "^9.6.1",
+    "depcheck": "^1.4.7",
+    "js-yaml": "^4.3.0",
+    "madge": "^8.0.0",
+    "nx": "^20.8.4",
+    "pinia": "^3.0.0",
+    "playwright": "^1.61.1",
+    "ws": "^8.18.0"
+  }
+}

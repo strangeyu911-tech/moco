@@ -1,0 +1,388 @@
+// @ts-check
+/**
+ * Phase 3: 服务初始化（app.whenReady 后）
+ *
+ * 从 bootstrap.js runWhenReady 拆出：
+ * - usageTracker / store.init
+ * - taskQueue.setStateSaver / callbackServer.start
+ * - scheduler.restore / taskQueue.deserialize
+ * - keywordMonitor.onAlert + 持久化定时器
+ * - login status monitor / analytics providers / cloudPublisher
+ *
+ * 验收标准 BUGFIX-PLAN Bug-1: phase 文件 <= 80 行（注释/空行不计）
+ */
+const log = require('../services/logger')
+const { loadIdentityRuntimeEnv: loadDefaultIdentityRuntimeEnv } = require('../services/identity/identity-runtime-config')
+const sqliteWrapper = require('../services/sqlite-wrapper')
+
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+function errorMessage(value) {
+  return value instanceof Error ? value.message : String(value)
+}
+
+function isIdentityConfigError(error) {
+  return Boolean(error && typeof error === 'object' && (
+    error.code === 'IDENTITY_CONFIG_INVALID' || error.code === 'ENTITLEMENT_CONFIG_INVALID'
+  ))
+}
+
+/**
+ * @param {Array<() => unknown | Promise<unknown>>} cleanups
+ * @returns {Promise<void>}
+ */
+async function runCleanups(cleanups) {
+  for (let index = cleanups.length - 1; index >= 0; index -= 1) {
+    try {
+      await cleanups[index]()
+    } catch (e) {
+      log.notify('App', 'phase3-rollback-failed', { level: 'WARN', error: errorMessage(e) })
+    }
+  }
+}
+
+/**
+ * 初始化所有异步服务（app.whenReady 后调用）
+ * @param {object} deps
+ * @param {object} deps.container - DI 容器（经 getOptionalService 按需取可选服务）
+ * @param {object} deps.usageTracker - 使用量统计服务
+ * @param {object} deps.store - Store 实例
+ * @param {{init?: () => unknown}} deps.modelProviderManager - 模型服务商管理器
+ * @param {object} deps.taskQueue - 任务队列
+ * @param {object} deps.callbackServer - 回调服务器
+ * @param {object} deps.scheduler - 调度器
+ * @param {object} deps.keywordMonitor - 关键词监控
+ * @param {object} deps.analyticsService - 分析服务
+ * @param {{setAuthService?: (service: object|null) => void}} deps.pythonBridge - Python 后端桥接
+ * @param {new (options: {orchestratorUrl: string, store: object}) => {registerIpcHandlers(): void}} deps.CloudPublisher - 云端发布构造函数
+ * @param {Function} deps.getMainWin - 获取主窗口函数
+ * @param {Function} [deps.createIdentityService] - 用户身份服务工厂
+ * @param {Function} [deps.loadIdentityRuntimeEnv] - 身份公开运行时配置加载器
+ * @param {() => Promise<void>} [deps.waitForStoreReady] - SQLite WASM 就绪等待器（测试注入）
+ */
+async function startServices({ container, usageTracker, store, taskQueue, callbackServer, scheduler,
+  keywordMonitor, analyticsService, pythonBridge, CloudPublisher, modelProviderManager, getMainWin,
+  createIdentityService, loadIdentityRuntimeEnv, waitForStoreReady, opsCenterSync, automationScheduler }) {
+  /** @type {Array<() => unknown | Promise<unknown>>} */
+  const cleanups = []
+  let rollbackPromise = null
+  const rollback = () => {
+    if (!rollbackPromise) rollbackPromise = runCleanups(cleanups)
+    return rollbackPromise
+  }
+
+  try {
+    usageTracker.trackSession()
+
+    const sqliteReady = waitForStoreReady
+      ? waitForStoreReady()
+      : sqliteWrapper.ready
+    if (!sqliteReady || typeof sqliteReady.then !== 'function') {
+      throw new Error('SQLite WASM readiness is unavailable')
+    }
+    await sqliteReady
+
+    cleanups.push(() => { if (store.close) store.close() })
+    const storeInitialized = await store.init()
+    if (storeInitialized === false) {
+      throw new Error('Local data store failed to initialize')
+    }
+    // 启动期裁剪日计数行（change: publish-frequency-unwired-surfaces）。
+    // `prunePublishDailyCount` 自 v2 起就有实现和单测，却**从来没有生产调用点**
+    // ⇒ `publish_daily_count` 只增不减（先例：phase1 里 signalCollector 的 30 天清理，
+    // 那条注释原文就是「cleanup 需要有生产调用点」——那条清的是文件目录、不依赖存储就绪，
+    // 本条清的是 sqlite 表，就绪性就是它能不能生效的唯一前提）。
+    // ⛔ 时机判据：必须在 store.init() 成功**之后**。`_ready` 只在 init() 里置真
+    // （base-store.js），未就绪时 prunePublishDailyCountAllOwners 恒返回 basis:'not_ready'
+    // 且一行都不删 —— 挂在 phase1-context 的第一版正是这样：有调用点、单测全绿、
+    // 生产永久 no-op（QM-6 自审 C-1；夹具当时无条件返回 measured，把这件事整个藏住了）。
+    // 日键一律取**守卫的** today()：写入方就是它，启动侧另算一次本地日期就是第二套口径，
+    // 差一天会表现为"昨天的行今天全被删"或"该删的一行没删"。维护是旁路，失败只留痕。
+    try {
+      const guardForRetention = container.get('publishIntervalGuard')
+      const hasStore = !!(store && typeof store.prunePublishDailyCountAllOwners === 'function')
+      const hasGuardToday = !!(guardForRetention && typeof guardForRetention.today === 'function')
+      if (hasStore && hasGuardToday) {
+        const r = store.prunePublishDailyCountAllOwners(guardForRetention.today())
+        const basis = r && r.basis ? r.basis : 'unproven'
+        // 读数一律进 meta.params：logger.notify 只把 params 里的原始值抬进落盘行，
+        // **顶层自造字段会被静默丢掉**（实测该行打印成 `PublishDailyCount startup-prune {}`）。
+        // "出声"要出的是内容而不是键名，否则 owners/removed/basis 三个数全都看不见。
+        log.notify('PublishDailyCount', 'startup-prune', {
+          params: { owners: r ? r.owners : 'n/a', removed: r ? r.removed : 'n/a', basis }
+        })
+      } else {
+        // 没接上必须是**看得见**的：静默跳过会让这条维护在某个重构后悄悄消失
+        log.notify('PublishDailyCount', 'startup-prune-skipped', {
+          level: 'WARN',
+          params: { hasStore, hasGuardToday }
+        })
+      }
+    } catch (e) {
+      log.notify('PublishDailyCount', 'startup-prune-failed', { level: 'WARN', error: String(e && e.message) })
+    }
+    if (modelProviderManager && typeof modelProviderManager.init === 'function') {
+      modelProviderManager.init()
+    }
+    cleanups.push(() => { if (taskQueue.setStateSaver) taskQueue.setStateSaver(null) })
+    taskQueue.setStateSaver((jsonStr) => {
+      if (typeof store.setUserSetting === 'function') {
+        store.setUserSetting('task_queue_state', jsonStr)
+      } else {
+        store.setSetting('task_queue_state', jsonStr)
+      }
+    })
+
+    try {
+      await callbackServer.start((data) => {
+        const win = getMainWin()
+        if (win && !win.isDestroyed()) win.webContents.send('callback:received', data)
+        if (data) store.addCallbackLog(data.type || 'unknown', data.source || data.platform, data)
+      })
+      cleanups.push(() => callbackServer.stop && callbackServer.stop())
+    } catch (e) {
+      log.notify('App', 'callback-server-start-failed', { level: 'WARN', error: errorMessage(e) })
+    }
+
+    cleanups.push(() => { if (scheduler.stopAll) scheduler.stopAll() })
+    // 自动化任务：退出时清干净全部定时器（定时器已 unref，这里保证不残留）
+    cleanups.push(() => { if (automationScheduler && automationScheduler.stopAll) automationScheduler.stopAll() })
+
+    const unsubscribeAlert = keywordMonitor.onAlert((keyword, current, previous, ratio) => {
+      const win = getMainWin()
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('notification', {
+          type: 'keyword-spike',
+          title: '[Spike] ' + keyword + ': ' + previous + ' -> ' + current + ' (' + ratio.toFixed(1) + 'x)',
+          keyword, current, previous,
+        })
+      }
+    })
+    if (typeof unsubscribeAlert === 'function') cleanups.push(unsubscribeAlert)
+
+    const keywordPersistTimer = setInterval(() => {
+      try {
+        const state = keywordMonitor.getAllHistories()
+        if (typeof store.setUserSetting === 'function') {
+          store.setUserSetting('keyword_monitor_state', JSON.stringify(state))
+        } else {
+          store.setSetting('keyword_monitor_state', JSON.stringify(state))
+        }
+      } catch (e) {
+        log.notify('App', 'keyword-monitor-persist-error', { level: 'WARN', error: errorMessage(e) })
+      }
+    }, 5 * 60 * 1000)
+    if (keywordPersistTimer.unref) keywordPersistTimer.unref()
+    cleanups.push(() => clearInterval(keywordPersistTimer))
+
+    let loginStatusMonitor = null
+    try {
+      const { createLoginStatusMonitor } = require('../services/login-status-monitor')
+      const accountManager = require('../publishers/account-manager')
+      loginStatusMonitor = createLoginStatusMonitor({
+        store, accountManager, intervalMs: 30 * 60 * 1000, getMainWin,
+      })
+      cleanups.push(() => loginStatusMonitor && loginStatusMonitor.stop && loginStatusMonitor.stop())
+      loginStatusMonitor.start()
+      log.notify('App', 'login-status-monitor-started', { params: { interval: '30min' } })
+    } catch (e) {
+      log.notify('App', 'login-status-monitor-start-failed', { level: 'WARN', error: errorMessage(e) })
+    }
+
+    try {
+      const { xiaohongshuProvider, douyinProvider } = require('../services/analytics-providers')
+      analyticsService.registerProvider('xiaohongshu', xiaohongshuProvider)
+      analyticsService.registerProvider('douyin', douyinProvider)
+      log.notify('App', 'analytics-providers-registered', { params: { providers: 'xiaohongshu,douyin' } })
+    } catch (e) {
+      log.notify('App', 'analytics-providers-register-failed', { level: 'WARN', error: errorMessage(e) })
+    }
+
+    const identityModule = require('../services/identity/identity-service-factory')
+    const identityFactory = createIdentityService || identityModule.createIdentityService
+    const resolveIdentityEnv = loadIdentityRuntimeEnv || loadDefaultIdentityRuntimeEnv
+    const identityEnv = resolveIdentityEnv({ env: process.env })
+    let identityService = null
+    try {
+      identityService = await identityFactory({ env: identityEnv, store, getMainWin })
+    } catch (error) {
+      if (isIdentityConfigError(error) || identityModule.enabled(identityEnv.IDENTITY_AUTH_REQUIRED)) throw error
+      log.notify('Identity', 'identity-service-disabled', { level: 'WARN', error: errorMessage(error) })
+    }
+    if (identityService && typeof identityService.dispose === 'function') {
+      cleanups.push(() => identityService.dispose())
+    }
+    const ownerSubjectProvider = identityService
+      ? () => {
+          const state = identityService.getState()
+          return state && state.user ? state.user.sub : null
+        }
+      : null
+    if (store && typeof store.setOwnerSubjectProvider === 'function') {
+      store.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => store.setOwnerSubjectProvider(null))
+    }
+    const accountManager = require('../publishers/account-manager')
+    if (typeof accountManager.setOwnerSubjectProvider === 'function') {
+      accountManager.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => accountManager.setOwnerSubjectProvider(null))
+    }
+    const getOptionalService = (name) => {
+      try { return container.get(name) } catch (_) { return null }
+    }
+    const commentManager = getOptionalService('commentManager')
+    const runStateStore = getOptionalService('runStateStore')
+    if (runStateStore && typeof runStateStore.setOwnerProvider === 'function') {
+      runStateStore.setOwnerProvider(ownerSubjectProvider)
+      cleanups.push(() => runStateStore.setOwnerProvider(null))
+    }
+    const batchManager = getOptionalService('batchManager')
+    let offlineManager = null
+    try { offlineManager = require('../services/offline-manager') } catch (_) { /* 离线服务可选 */ }
+    if (commentManager && typeof commentManager.setOwnerSubjectProvider === 'function') {
+      commentManager.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => commentManager.setOwnerSubjectProvider(null))
+    }
+    if (scheduler && typeof scheduler.setOwnerSubjectProvider === 'function') {
+      scheduler.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => scheduler.setOwnerSubjectProvider(null))
+    }
+    if (taskQueue && typeof taskQueue.setOwnerSubjectProvider === 'function') {
+      taskQueue.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => taskQueue.setOwnerSubjectProvider(null))
+    }
+    if (batchManager && typeof batchManager.setOwnerSubjectProvider === 'function') {
+      batchManager.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => batchManager.setOwnerSubjectProvider(null))
+    }
+    if (offlineManager && typeof offlineManager.setOwnerSubjectProvider === 'function') {
+      offlineManager.setOwnerSubjectProvider(ownerSubjectProvider)
+      cleanups.push(() => offlineManager.setOwnerSubjectProvider(null))
+    }
+
+    const restoreForOwner = (state) => {
+      if (!scheduler || typeof scheduler.restore !== 'function') return 0
+      const subject = state && state.user && state.user.sub
+      if (identityService && typeof subject !== 'string') return 0
+      const restored = identityService ? scheduler.restore(subject) : scheduler.restore()
+      if (restored > 0) log.notify('Scheduler', 'pending-tasks-restored', { params: { count: restored } })
+      // P1 修复：批量排期批次重启恢复。scheduleBatch 的定时器只在内存，
+      // 重启后 scheduled 批次无人重新武装 → 排期文章永不发布（静默数据丢失）。
+      // 与 scheduler.restore 同点位、同 owner 语义；恢复属旁路，失败不阻断启动。
+      if (batchManager && typeof batchManager.restoreScheduledBatches === 'function') {
+        try {
+          const restoredBatches = batchManager.restoreScheduledBatches(identityService ? subject : undefined)
+          if (restoredBatches > 0) log.notify('BatchManager', 'scheduled-batches-restored', { params: { count: restoredBatches } })
+        } catch (error) {
+          log.notify('BatchManager', 'scheduled-batches-restore-failed', { level: 'WARN', error: errorMessage(error) })
+        }
+      }
+      // 自动化任务启动触发（2026-10-03）：排在 scheduler.restore 与批量排期恢复之后
+      // （顺序契约见 phase3-services.test.js）。启动触发是**显式触发器**，不是
+      // 「补跑过期定时任务」——后者会打满平台限流，故意不做。失败不阻断启动。
+      if (automationScheduler && typeof automationScheduler.start === 'function') {
+        try {
+          automationScheduler.start()
+        } catch (error) {
+          log.notify('Automation', 'automation-scheduler-start-failed', { level: 'WARN', error: errorMessage(error) })
+        }
+      }
+      return restored
+    }
+    restoreForOwner(identityService && identityService.getState())
+
+    // 休眠/唤醒重算守卫（2026-10-06）：调度器把墙钟目标一次性换算成相对延时 setTimeout，
+    // 系统休眠跨越到点时刻或时钟被 NTP/人工改动后，已武装的定时器不会重算
+    // （restore 也会因 isTaskTracked 直接跳过），导致定时任务显著迟到。
+    // resume 时调用 scheduler.rearm 强制按新墙钟重新武装；旁路容错，失败不阻断启动。
+    try {
+      const { powerMonitor } = require('electron')
+      const { createResumeGuard } = require('./resume-guard')
+      const resumeGuard = createResumeGuard({
+        powerMonitor,
+        scheduler,
+        getOwnerState: () => (identityService ? identityService.getState() : undefined),
+        logger: log,
+      })
+      if (resumeGuard.attach()) {
+        cleanups.push(() => resumeGuard.detach())
+        log.notify('Scheduler', 'resume-guard-attached')
+      }
+    } catch (e) {
+      log.notify('Scheduler', 'resume-guard-attach-failed', { level: 'WARN', error: errorMessage(e) })
+    }
+
+    const savedQueueState = typeof store.getUserSetting === 'function'
+      ? store.getUserSetting('task_queue_state', null)
+      : store.getSetting('task_queue_state')
+    if (savedQueueState && taskQueue && typeof taskQueue.deserialize === 'function') {
+      const recovered = taskQueue.deserialize(savedQueueState)
+      if (recovered > 0) {
+        log.notify('App', 'tasks-recovered-from-queue', { params: { count: recovered } })
+        if (typeof store.setUserSetting === 'function') {
+          store.setUserSetting('task_queue_state', null)
+        } else {
+          store.setSetting('task_queue_state', null)
+        }
+      }
+    }
+
+    if (identityService && typeof identityService.onStateChanged === 'function') {
+      const unsubscribeIdentity = identityService.onStateChanged((state) => {
+        restoreForOwner(state)
+        if (commentManager && typeof commentManager.stopAll === 'function') {
+          Promise.resolve(commentManager.stopAll()).catch((error) => {
+            log.notify('CommentManager', 'comment-polling-stop-failed', { level: 'WARN', error: errorMessage(error) })
+          })
+        }
+        if (taskQueue && typeof taskQueue.setOwnerSubjectProvider === 'function') {
+          taskQueue.setOwnerSubjectProvider(ownerSubjectProvider)
+        }
+      })
+      if (typeof unsubscribeIdentity === 'function') cleanups.push(unsubscribeIdentity)
+    }
+    if (pythonBridge && typeof pythonBridge.setAuthService === 'function') {
+      pythonBridge.setAuthService(identityService)
+      cleanups.push(() => pythonBridge.setAuthService(null))
+    }
+    // 方案C 零配置化：注入 access token 获取器到运营中心同步服务
+    if (opsCenterSync && typeof opsCenterSync.setGetAccessToken === 'function' && identityService && typeof identityService.getAccessToken === 'function') {
+      opsCenterSync.setGetAccessToken(() => identityService.getAccessToken())
+    }
+    // 方案C 零配置：把解析出的运营中心 URL 注入同步服务（经显式注入而非改写全局 env，避免污染其他读取者）
+    if (opsCenterSync && typeof opsCenterSync.setOpsCenterUrl === 'function' && identityEnv && identityEnv.OPS_CENTER_URL) {
+      opsCenterSync.setOpsCenterUrl(identityEnv.OPS_CENTER_URL)
+    }
+    // 部署层信任锚：打包版没有这一档就必然 NO_PRODUCTION_TRUST_ANCHOR（运行时策略整份不应用）。
+    // 来源与 URL 同机制（identity-public.json / env 覆盖），是撤下「运营中心同步」表单后的唯一配置处。
+    if (opsCenterSync && typeof opsCenterSync.setRuntimePublicKey === 'function' && identityEnv && identityEnv.RUNTIME_PUBLIC_KEY) {
+      opsCenterSync.setRuntimePublicKey(identityEnv.RUNTIME_PUBLIC_KEY)
+    }
+    // 运营配置（应用菜单/公告/功能开关）落地后广播渲染端重拉：
+    // 启动那次同步晚于侧边栏首帧渲染，不广播则用户要多重启一次才看到本次改动。
+    // 载荷只带服务端同步时间，不带配置内容（读取仍走受验签保护的 IPC 路径）。
+    if (opsCenterSync && typeof opsCenterSync.setOnRuntimeUpdated === 'function') {
+      opsCenterSync.setOnRuntimeUpdated((payload) => {
+        const win = getMainWin()
+        if (!win || win.isDestroyed()) return
+        const syncedAt = (payload && typeof payload.syncedAt === 'string' && payload.syncedAt) || new Date().toISOString()
+        win.webContents.send('ops-center:runtime-updated', { syncedAt })
+      })
+    }
+
+    const cloudPublisher = new CloudPublisher({
+      orchestratorUrl: process.env.ORCHESTRATOR_URL || '',
+      store,
+      authService: identityService,
+    })
+
+    return { keywordPersistTimer, loginStatusMonitor, identityService, cloudPublisher, rollback }
+  } catch (e) {
+    await rollback()
+    throw e
+  }
+}
+
+module.exports = { startServices }

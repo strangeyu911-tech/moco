@@ -1,0 +1,252 @@
+/* ============================================
+   StageProgress — 阶段进度样式
+   从 StageProgress.vue 抽取，代码-设计分离
+   ============================================ */
+
+/* 运行进度区固定在页面内容顶部：sticky top 0，滚动时不随页面滚出视口 */
+.stage-progress {
+  width: 100%;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg, #f5f5f7);
+  padding: 10px 0;
+  margin-bottom: 10px;
+}
+
+.progress-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.progress-bar {
+  flex: 1;
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text);
+  min-width: 40px;
+}
+
+.elapsed-text {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.progress-summary {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-radius: 6px;
+}
+
+.stages-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* 阶段过多时列表内部滚动，避免 sticky 区域霸占整屏 */
+  max-height: 42vh;
+  overflow-y: auto;
+}
+
+.stage-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  transition: all 0.2s;
+}
+
+.stage-item.completed {
+  border-color: var(--status-completed-bg);
+  background: var(--status-completed-bg);
+}
+
+.stage-item.running {
+  border-color: var(--primary);
+  background: var(--primary-bg, rgba(124, 92, 191, 0.05));
+}
+
+.stage-item.failed {
+  border-color: var(--status-failed-bg);
+  background: var(--status-failed-bg);
+}
+
+.stage-item.skipped {
+  border-color: var(--status-pending-bg, #e5e7eb);
+  background: var(--status-pending-bg, #f3f4f6);
+  color: var(--text-muted, #6b7280);
+}
+
+.stage-item.waiting {
+  border-color: var(--status-waiting-bg);
+  background: var(--status-waiting-bg);
+}
+
+.stage-icon {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.stage-item.completed .stage-icon {
+  background: var(--status-completed-text);
+  color: #fff;
+}
+
+.stage-item.running .stage-icon {
+  background: var(--primary);
+  color: #fff;
+  animation: pulse 2s infinite;
+}
+
+.stage-item.failed .stage-icon {
+  background: var(--status-failed-text);
+  color: #fff;
+}
+
+.stage-item.skipped .stage-icon {
+  background: var(--text-muted, #6b7280);
+  color: #fff;
+}
+
+.stage-item.waiting .stage-icon {
+  background: var(--status-waiting-text);
+  color: #fff;
+}
+
+/* 等待用户输入（paused/检查点）时图标呼吸，提示用户当前需要操作 */
+.stage-item.waiting.paused .stage-icon {
+  animation: pulse 1.6s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.stage-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stage-name {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.stage-detail {
+  font-size: var(--font-size-xs);
+  color: var(--primary);
+  margin-top: 2px;
+}
+
+.stage-meta {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.stage-sub-progress {
+  margin-top: 4px;
+}
+
+.stage-sub-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.stage-sub-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.stage-status {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.stage-time {
+  color: var(--text-light);
+}
+
+/* 合成时间说明（2026-08-17）：整体耗时与视频时长/复杂度/推理时间的关系提示；
+   2026-08-28 起为阶段列表内的普通流内元素（列表 flex gap 提供间距） */
+.stage-time-guidance {
+  margin-top: 0;
+  padding: 10px 16px;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+
+.time-guidance-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.time-guidance-intro {
+  margin-top: 2px;
+}
+
+.time-guidance-refs {
+  margin: 4px 0 4px 18px;
+  padding: 0;
+}
+
+.time-guidance-note {
+  margin-top: 2px;
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+  .stage-item {
+    flex-wrap: wrap;
+  }
+
+  .stage-status {
+    width: 100%;
+    text-align: right;
+    margin-top: 4px;
+  }
+}

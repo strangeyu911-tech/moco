@@ -1,0 +1,375 @@
+/**
+ * tokens.css — 桌面端设计 token 唯一来源（desktop-ui-consistency）
+ *
+ * 规则（docs/frontend-interaction-spec.md §1）：
+ * - 颜色/字号/间距/圆角变量一律从这里取值；禁止在组件/视图重定义同语义变量
+ * - 主色定标 #5048E5（用户决策 2026-08-24）；暗色模式不降级为低对比灰
+ * - 阶梯基准沿用 cohere-design-system 既有值（--space-* 与 --r-*），保证零视觉回归迁移
+ *
+ * 导入顺序：必须在 element-plus 与所有旧 token 文件之前（main.js）。
+ */
+
+:root {
+  /* ---- 品牌色 ---- */
+  --color-primary: #5048E5;
+  --color-primary-hover: #603af9;
+  --color-primary-light: #eff6fb;
+  --color-on-primary: #ffffff;
+
+  /* ---- 背景与表面 ---- */
+  --color-bg-canvas: #ffffff;
+  --color-bg-card: #ffffff;
+  --color-bg-inset: #faf6f8;
+
+  /* ---- 文字 ---- */
+  --color-text-strong: #1e1b4b;
+  --color-text-primary: #1e1b4b;
+  --color-text-secondary: #707080;
+  --color-text-muted: #9898a8;
+
+  /* ---- 边框 ---- */
+  --color-border: #efefef;
+  --color-border-strong: #e8e8e8;
+
+  /* ---- 语义色 ---- */
+  --color-danger: #ef5757;
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+
+  /* ---- 无前缀别名桥接层（P4 深色可读性修复，2026-10-08）----
+   * 业务代码里流传 --text-primary / --bg / --card-bg 等无前缀别名（29+15+4+4+7+3
+   * 个文件引用），历史上从未定义 → 暗色下回退到继承值，产生「深字压深底」
+   * (1.13:1) 与「浅字压浅底」(1.09:1) 两种不可读形态（实测见
+   * 01-docs/UX-前端交互与用户体检研究方案-2026-10-07.md §3.3/§8）。
+   * 这里映射到既有 --color-* 语义槽；暗色覆盖见下方同名的主题块。
+   * ⚠ 注释里不得出现暗色块选择器的字样原串：契约测试用朴素 indexOf 定位
+   *   块起点，注释命中会让解析从本行开始（= 亮色区），dark[...] 全 undefined
+   *   —— slots/sidebar 测试因此红 5 个的实测教训（2026-10-08，P4）。
+   * 契约测试：src/styles/tokens.aliases.test.js（存在性/真覆盖/指向正确/对比度）。
+   * 引用侧收编（把 62 个文件的 var(--text-primary) 改成 var(--color-text-primary)）
+   * 属 Wave 5 token 收编批次，不在本批次内。 */
+  --text-primary: var(--color-text-primary);
+  --text-secondary: var(--color-text-secondary);
+  --bg: var(--color-bg-canvas);
+  --bg-secondary: var(--color-bg-inset);
+  --card-bg: var(--color-bg-card);
+  --cohere-green: var(--color-success);
+
+  /* ---- 字号阶梯（7 档）---- */
+  --font-size-xs: 12px;
+  --font-size-sm: 13px;
+  --font-size-base: 15px;
+  --font-size-md: 17px;
+  --font-size-lg: 20px;
+  --font-size-xl: 24px;
+  --font-size-xxl: 32px;
+
+  /* ---- 圆角阶梯（对齐既有 --r-*）---- */
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 32px;
+  --radius-full: 9999px;
+
+  /* ---- 间距阶梯（4px 基数，对齐既有 --space-*）---- */
+  --spacing-1: 4px;
+  --spacing-2: 8px;
+  --spacing-3: 12px;
+  --spacing-4: 16px;
+  --spacing-5: 20px;
+  --spacing-6: 24px;
+  --spacing-8: 32px;
+  --spacing-10: 40px;
+
+  /* ---- 阴影 elevation 阶梯与奶油表面 ----
+   * 消费方：Dashboard.vue 统计卡/迷你卡等浮起表面。
+   * 事故反哺（PR #2075 同类复发）：视图引用了从未定义的 --shadow-sm/--cream-surface，
+   * 导致整条声明失效 → 白卡白底隐形；此处为这些槽位的唯一定义来源。 */
+  --shadow-sm: 0 1px 2px rgba(30, 27, 75, 0.06), 0 1px 3px rgba(30, 27, 75, 0.10);
+  --shadow-md: 0 4px 12px rgba(30, 27, 75, 0.10);
+  --shadow-lg: 0 12px 28px rgba(30, 27, 75, 0.16);
+  --cream-surface: #faf6f8;
+
+  /* ---- 侧边栏语义槽（T0-2；消费方：styles/sidebar.css ← layouts/MpSidebar.vue）----
+   * 背景为 180deg 品牌淡紫渐变，文字分 4 档（正文 / 导航项 / 次级 / 版本号），
+   * hover 与 active 用半透明白叠加，active 文字与焦点环一律取品牌主色。
+   * 暗色值经对比度核算：在 --color-sidebar-bg-start 上均 ≥ 4.5:1（WCAG AA 正文）。 */
+  --color-sidebar-bg-start: #f4f2ff;
+  --color-sidebar-bg-end: #f0efff;
+  --color-sidebar-border: #e9e8f6;
+  --color-sidebar-divider: #d9d7ed;
+  --color-sidebar-text: #7a7d99;
+  --color-sidebar-text-secondary: #777a96;
+  --color-sidebar-text-tertiary: #8587a1;
+  --color-sidebar-text-muted: #9a9cb3;
+  --color-sidebar-text-footer: #9294ab;
+  --color-sidebar-icon: #777997;
+  --color-sidebar-border-strong: #bab9d3;
+  /* 品牌主色：hover/active 文字与焦点环统一取品牌主色（禁止侧边栏内联自造紫） */
+  --color-sidebar-accent: var(--color-primary);
+  --color-sidebar-active-text: var(--color-sidebar-accent);
+  --color-sidebar-hover-bg: rgba(255, 255, 255, .65);
+  --color-sidebar-hover-bg-strong: rgba(255, 255, 255, .68);
+  --color-sidebar-active-bg: rgba(255, 255, 255, .9);
+  --shadow-sidebar-active: 0 2px 9px rgba(99, 91, 195, .08);
+
+  /* ---- 悬浮操作浮标（回到顶部等固定于视口的操作控件）----
+   * 语义：与页面内容解耦、始终悬浮在滚动区右下角的轻量操作按钮。
+   * 依据 docs/desktop-ui-layout-spec.md §14；禁止组件内自定义同语义色值。 */
+  --color-float-surface: #ececef;
+  --color-float-surface-hover: #e0e0e5;
+  --color-float-surface-active: #d4d4dc;
+  --color-float-icon: #707080;
+  --color-float-icon-hover: #1e1b4b;
+  --color-float-tooltip-bg: #303038;
+  --color-float-tooltip-text: #ffffff;
+  --shadow-float: 0 2px 8px rgba(30, 27, 75, 0.08);
+
+  /* ---- 历史槽位收编（T1-1 结构收敛）----
+   * 承接 cohere/apple 旧 token 文件的原始色值，值冻结（零视觉回归），
+   * 旧文件一律转发到这里；这些值与品牌主色/语义色的合并或替换
+   * 由后续批次统一拍板，拍板后本区是唯一需要改动的位置。 */
+  /* cohere 系 */
+  --color-secondary: #f472b6;
+  --color-secondary-light: #fce7f3;
+  --color-danger-soft: #fef0f0;
+  --color-success-soft: #d1fae5;
+  --color-warning-soft: #fef3c7;
+  --color-canvas-translucent: rgba(255, 255, 255, 0.95);
+  --color-module-nav-text: #8b8e9a;
+  /* 批次 6（2026-09-29）：原 17 个 `--color-apple-*` 收编槽位已随别名层退役一并删除。
+   * 全部消费者已收敛到语义权威槽（accent→--color-primary、ink-*→--color-text-*、
+   * surface-*→--color-bg-*、成功/警告/错误/信息→--color-{success,warning,danger,info}-*）。
+   * 回潮由 `check-frontend-consistency.js` 的 appleAlias 检查拦截（基线 = 0）。 */
+  /* 分析分值语义色（原 ViralAnalysis.scoreColor 硬编码，T1-3a 收编） */
+  --color-score-high: #e74c3c;
+  --color-score-mid: #e67e22;
+  --color-score-low: #95a5a6;
+  /* 流水线阶段状态底色（原 AutoPipelineView 硬编码，T1-3b 收编） */
+  --color-stage-completed-bg: #e8f5e9;
+  --color-stage-running-bg: #e3f2fd;
+  --color-stage-failed-bg: #ffebee;
+  --color-stage-skipped-bg: #f5f5f5;
+  --color-stage-pending-bg: #ffffff;
+  --color-error-banner-bg: #fff3f3;
+  --color-error-banner-text: #d32f2f;
+  /* 执行日志终端色（原 AutoPipelineView 硬编码，T1-3b 收编） */
+  --color-terminal-bg: #1e1e1e;
+  --color-terminal-text: #d4d4d4;
+  --color-terminal-muted: #888888;
+  --color-terminal-error: #f44336;
+  --color-terminal-warn: #ff9800;
+  --color-notice-error: #f87171;
+  /* 采集/信息提示色（原 Collection.vue 硬编码，T1-3d 收编） */
+  --color-info-soft: #f0f7ff;
+  --color-info-text: #1976d2;
+  --color-progress-track: #e0e0e0;
+  /* 情报页来源品牌色/分值色（原 Intelligence.vue 硬编码，T1-3e 收编） */
+  --color-source-reddit: #ff4500;
+  --color-source-hn: #ff6600;
+  --color-intel-score-high: #2e7d32;
+  --color-intel-score-mid: #f57c00;
+  /* 采集页精致化槽（collection-ui-refinement 2026-10-12 收编 Collection.vue 亮色硬编码；
+   * 暗色覆盖见下方主题块同名槽。--color-warning 已在语义色区定义，此处不重复） */
+  --color-bg-page: #f7f8fa;
+  --shadow-card-hover: 0 12px 28px rgba(0, 0, 0, 0.08), 0 4px 8px rgba(0, 0, 0, 0.04);
+  --color-ribbon: linear-gradient(90deg, #ea580c 0%, #fb923c 50%, #fdba74 100%);
+  --color-ribbon-soft: #fdeee2;
+
+  /* ---- 暗色模式：主色保持品牌可辨识度（修复旧覆盖为浅灰 #e8e8ed 的缺陷）---- */
+
+  /* === 语义槽补齐（批次 2：ui-apple-token-retirement Task 2）===
+   * 迁移 `--apple-*` 消费点之前，这些维度必须先在权威文件有槽位
+   * （desktop-ui-consistency spec：「缺失槽位不得就地写字面量」）。
+   * 取值刻意与别名层 `apple-design-tokens.css` 现值逐字一致
+   * ⇒ 迁移时字重/字体族/行高/动效的渲染不变（本批次为纯新增，零视觉回归）。 */
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  --font-family-display: 'SF Pro Display', 'Inter', 'PingFang SC', system-ui, sans-serif;
+  --font-family-text: 'SF Pro Text', 'Inter', 'PingFang SC', system-ui, sans-serif;
+  --font-family-mono: 'SF Mono', 'JetBrains Mono', 'Consolas', monospace;
+
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.625;
+
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+  --duration-slow: 320ms;
+  --ease-default: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 间距补档：间距族此前止于 --spacing-10(40px)，而 history-page.css 用到 64px（批次 5 依赖） */
+  --spacing-16: 64px;
+}
+
+[data-theme="dark"] {
+  --color-bg-canvas: #1a1a1e;
+  --color-bg-card: #232329;
+
+  /* 深色走查补槽（P2）：高频背景/边框槽位——此前 dark 未覆盖导致深色模式下
+   * 内嵌背景/边框仍用浅色值（视觉突兀）。值取暗色系与 bg-card 同族。 */
+  --color-bg-inset: #1e1e23;
+  --color-border: #32323a;
+  --color-border-strong: #3d3d46;
+
+  /* 品牌色暗底亮化变体：仅用于暗色模式下的文字/描边场景（保持紫色相，替代旧蓝系 #4c8bf5/#6b8cff） */
+  --color-primary-dark-tint: #7b74ff;
+
+  /* 悬浮操作浮标：暗色下保持「比页面卡片更亮一档」的表面层级，图标用亮色保证对比度 */
+  --color-float-surface: #2c2c34;
+  --color-float-surface-hover: #383842;
+  --color-float-surface-active: #44444f;
+  --color-float-icon: #a0a0b0;
+  --color-float-icon-hover: #f0f0f5;
+  --color-float-tooltip-bg: #4a4a55;
+  --color-float-tooltip-text: #ffffff;
+  --shadow-float: 0 2px 10px rgba(0, 0, 0, 0.45);
+
+  /* 阴影/奶油表面暗色变体：暗底加深投影，cream 表面转深灰以保持层级 */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.55);
+  --cream-surface: #26262d;
+
+  /* ---- 侧边栏暗色槽位 ----
+   * 背景改深紫灰（保留品牌色相），文字整体提亮；全部文字档在 bg-start #211f2e 上 ≥ 4.5:1：
+   *   --color-sidebar-text 9.7:1 / text-secondary 9.0:1 / text-tertiary 7.8:1 / text-muted 6.9:1
+   * accent 取品牌主色的暗底亮化变体 #a5a0ff（基色 #5048E5 在深底仅 2.8:1 不达标）：
+   *   底 6.9:1 / hover 底 5.9:1 / active 底 5.5:1。
+   * active 底色改用品牌淡紫半透明叠加（而非白叠加），保证 accent 文字可读。 */
+  --color-sidebar-bg-start: #211f2e;
+  --color-sidebar-bg-end: #1b1a25;
+  --color-sidebar-border: #302e40;
+  --color-sidebar-divider: #3b3852;
+  --color-sidebar-text: #c9c7d6;
+  --color-sidebar-text-secondary: #c2c0d2;
+  --color-sidebar-text-tertiary: #b4b2c6;
+  --color-sidebar-text-muted: #a9a7bd;
+  --color-sidebar-text-footer: #b0aec4;
+  --color-sidebar-icon: #c2c0d2;
+  --color-sidebar-border-strong: #4a4761;
+  --color-sidebar-accent: #a5a0ff;
+  --color-sidebar-active-text: var(--color-sidebar-accent);
+  --color-sidebar-hover-bg: rgba(255, 255, 255, .06);
+  --color-sidebar-hover-bg-strong: rgba(255, 255, 255, .08);
+  --color-sidebar-active-bg: rgba(123, 116, 255, .18);
+  --shadow-sidebar-active: 0 2px 9px rgba(0, 0, 0, .35);
+
+  /* === 暗色文字档补齐（批次 2：ui-apple-token-retirement Task 2）===
+   * 此前 dark 块**完全没有** --color-text-* 覆盖 ⇒ 浅色深字（#1e1b4b 系）落在暗底上不可读，
+   * 而视觉门禁此前没有暗色通道（批次 1 才建），属无人看守的暗色盲区。
+   * 取值与该文件暗色 sidebar 文字档同一实测口径，在暗色卡片底（--color-bg-card = #232329）上：
+   *   strong 14.35:1 / primary 12.80:1 / secondary 7.53:1 / muted 6.7:1（全部 ≥ 4.5:1）
+   * 注意：本注释刻意不写「变量: 值;」形状 —— 契约测试用 `[^;]+;` 抽变量，
+   * 注释里出现该形状会把后面真正的定义整段吞进上一个匹配（实测踩过）。
+   * 回归锁见 src/styles/tokens.slots.test.js（含 WCAG 对比度计算断言）。 */
+  --color-text-strong: #f5f5f7;
+  --color-text-primary: #e8e8ed;
+  --color-text-secondary: #b4b2c6;
+  --color-text-muted: #a9a7bd;
+
+  /* 品牌淡底暗色变体：浅色是浅蓝底 #eff6fb，暗色改为品牌紫半透明叠加
+   * （与 --color-sidebar-active-bg 同口径），否则暗色下仍是浅色底、观感突兀 */
+  --color-primary-light: rgba(123, 116, 255, .18);
+
+  /* ---- 无前缀别名桥接层（暗色覆盖，P4 2026-10-08）----
+   * CSS 变量按作用域覆盖：同名别名在此重声明即暗色生效。
+   * 语义槽的暗色值已在上方定义（--color-text-primary 等），
+   * 此处保持纯转发形状，与亮色区同一契约（tokens.aliases.test.js）。 */
+  --text-primary: var(--color-text-primary);
+  --text-secondary: var(--color-text-secondary);
+  --bg: var(--color-bg-canvas);
+  --bg-secondary: var(--color-bg-inset);
+  --card-bg: var(--color-bg-card);
+  --cohere-green: var(--color-success);
+
+  /* 语义色暗色覆盖（P4 补齐）：--color-success 此前只在亮色区定义，
+   * 暗色下回退到亮色值 #34d399 —— 在暗色卡片底 #232329 上对比度不足，
+   * 且「主题切换后语义色不变」与 --color-text-* 的暗色处理不一致。
+   * 取值与 success 同色相（emerald 系）提亮到暗底可读：
+   * #34d399 在 #232329 上 6.4:1 已达标，保留同值是合法选择，
+   * 但必须**显式重声明**让契约测试可断言（防再次「只定义一次」静默回退）。 */
+  --color-danger: #f87171;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+
+  /* 语义色 soft 暗色覆盖（P4E 2026-10-09）：--color-*-soft 四个浅底 token
+   * 此前只有亮色定义，暗色下 Element Plus 弹层（el-message 等）读它们当底色，
+   * 亮奶油底 #fef0f0 配暗色提亮字 #f87171 实测 2.49:1（4 个视图命中）。
+   * 修复：soft 底改同色相深色变体，文字档（--color-danger 等）不动 ——
+   * 亮字 #f87171 在 #3a1d1d 上 4.6:1 达标。 */
+  --color-danger-soft: #3a1d1d;
+  --color-success-soft: #14301f;
+  --color-warning-soft: #33240c;
+  --color-info-soft: #14232e;
+
+  /* 品牌主色暗色覆盖（P4C 2026-10-09）：--color-primary 原先只在亮色区定义，
+   * 暗色下回退亮色 #5048E5 —— 在暗色画布 #1a1a1e 上 2.81:1，命中 9 个视图的
+   * .page-title（cohere-page-header 的 color: var(--primary)）。
+   * 提亮到 #8b85ff（同色相）：暗底上 6.2:1。 */
+  --color-primary: #8b85ff;
+
+  /* 采集页精致化槽暗色覆盖（collection-ui-refinement 2026-10-12）：
+   * 页面底/悬停影/顶部饰带按暗色族重取值；ribbon-soft 供 hover 边框与改写徽标底
+   * （暗色降饱和暖棕，避免亮橙刺眼）。警告文字 #fbbf24 在暗卡底 9.6:1（沿用语义色区）。 */
+  --color-bg-page: #16161d;
+  --shadow-card-hover: 0 12px 28px rgba(0, 0, 0, 0.5), 0 4px 8px rgba(0, 0, 0, 0.35);
+  --color-ribbon: linear-gradient(90deg, #9a3412 0%, #c2410c 50%, #ea580c 100%);
+  --color-ribbon-soft: #3b2a1e;
+}
+
+/* ---- P4 深色可读性系列 · 视图级 dark 覆盖（P4D 2026-10-09）----
+ * PublishHistory 的 history-tab/secondary-action 与 ProfileMenu 的登录标题/
+ * 徽章/触发按钮的硬编码亮色在暗底不可读（contrast-audit 实测）。
+ * 集中放 tokens.css（PublishHistory 登记零容差，组件内无法再放），但 tokens
+ * 经 main.js 最先注入，同特异性会被后注入的组件样式按序反超（实测 +16 退化），
+ * 故全部规则加 html 前缀抬特异性（(0,2,1)/(0,3,1) 压过 scoped 的 (0,2,0)/(0,3,0)）。
+ * 作用域契约（CCG i4）：history-tab/secondary-action/toolbar-button/icon-action
+ * 四个类名为 PublishHistory 独占（2026-10-09 全 src 检索证实，各 1 文件）；
+ * 其他视图复用同名 class 前必须改名或加前缀，否则暗色会被本区意外染色。
+ * P4E 追加：history-filters select（PublishHistory 页原生下拉收起态，
+ * #4f505a 硬编码在暗底 2.08:1；PublishHistory 登记 1394 行零容差，无法组件内加行）；
+ * media-upload-trigger（Publish 页选择图片按钮，#4d5574 在暗卡底 2.13:1；
+ * Publish 登记 1773 行零容差，同理迁出）；
+ * account-* / platform-filter-* / page-button / filter-tabs（Accounts 页 5+3 处：
+ * 工具条下拉/视图切换/过滤页签/次级按钮/平台过滤面板的硬编码亮色在暗底 1.91-2.95:1；
+ * Accounts 登记 1578 行零容差，同理迁出）。 */
+html[data-theme='dark'] .history-tab { color: var(--color-text-secondary); }
+html[data-theme='dark'] .history-tab.active { color: var(--color-text-primary); }
+html[data-theme='dark'] .secondary-action,
+html[data-theme='dark'] .toolbar-button,
+html[data-theme='dark'] .icon-action { color: var(--color-text-primary); }
+html[data-theme='dark'] .mp-profile-copy strong { color: var(--color-text-primary); }
+html[data-theme='dark'] .profile-license-badge { background: rgba(139, 133, 255, .18); color: #b6b2ff; }
+html[data-theme='dark'] .profile-license-pro { background: rgba(251, 191, 36, .16); color: #fcd34d; }
+html[data-theme='dark'] .profile-license-trial { background: rgba(56, 189, 248, .16); color: #7dd3fc; }
+html[data-theme='dark'] .mp-profile { background: rgba(35, 35, 41, .72); border-color: #3d3d46; }
+html[data-theme='dark'] .mp-profile:hover { background: rgba(44, 44, 52, .9); }
+html[data-theme='dark'] .history-filters select { color: var(--color-text-secondary); }
+html[data-theme='dark'] .media-upload-trigger { border-color: var(--color-border); color: var(--color-text-secondary); }
+/* 白字压 coral 亮橙三场景（P4E 评审 i1 修正）：--coral 主档保持 #ff8866
+ *（它同时被 ~80 处作前景文字/图标消费，前景在暗画布 7.41:1 达标；
+ * 若全局改深 #c2410c，前景场景跌到 3.35:1 引入新退化——CCG 实测推翻）。
+ * 改为只覆盖三个「白字压底」元素的底色：#c2410c 深橙底 + 白字 5.18:1。
+ * publish-mode-tab.active / cal-day.today .cal-day-num / banner-btn
+ * 三个类名为各自组件独占（全 src 检索证实），复用前须改名或加前缀。 */
+html[data-theme='dark'] .publish-mode-tab.active { background: #c2410c; border-bottom-color: #c2410c; }
+html[data-theme='dark'] .cal-day.today .cal-day-num { background: #c2410c; }
+html[data-theme='dark'] .banner-btn { background: #c2410c; }
+html[data-theme='dark'] .account-toolbar-selects select { background: var(--color-bg-inset); border-color: var(--color-border); color: var(--color-text-secondary); }
+html[data-theme='dark'] .account-view-toggle { background: var(--color-bg-inset); border-color: var(--color-border); }
+html[data-theme='dark'] .account-view-toggle button { color: var(--color-text-secondary); }
+html[data-theme='dark'] .account-view-toggle button[aria-pressed="true"] { color: var(--color-sidebar-accent); }
+html[data-theme='dark'] .filter-tabs button { color: var(--color-text-secondary); }
+html[data-theme='dark'] .filter-tabs button.active { color: var(--color-sidebar-accent); }
+html[data-theme='dark'] .page-button { color: var(--color-text-secondary); }
+html[data-theme='dark'] .platform-filter-panel button.active { background: rgba(139, 133, 255, .18); color: var(--color-sidebar-accent); }
+html[data-theme='dark'] .platform-filter-icon { background: var(--color-bg-inset); color: var(--color-sidebar-accent); }
+html[data-theme='dark'] .platform-filter-panel button strong { color: var(--color-text-secondary); }

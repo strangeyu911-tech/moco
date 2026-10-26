@@ -1,0 +1,259 @@
+---
+record: spec-purpose-tbd-gate
+task: 主规格 Purpose 去 TBD 的检测机制（Gate 12d）——判据 + 接线 + 反证 + 位置结构锁
+date: 2026-10-07
+---
+
+## 本次执行记录：Gate 12d 主规格 Purpose 检测机制（spec-purpose-tbd-gate，2026-10-07）
+
+> 分支：`spec-purpose-tbd-gate`；worktree：`D:/Data/projects/mp-worktrees/mp-spec-purpose-tbd-gate`（由 `scripts/start-mp-task.ps1` 创建，按产物复核：`worktree list` 含该路径、`rev-parse --abbrev-ref HEAD`=`spec-purpose-tbd-gate`、head 落在当时 `origin/main`、`verify-worktree-deps.js` OK 11 项）
+> 范围：🔧 `scripts/` 判据 + 🔌 `.github/workflows/quality-gate.yml` 接线 + 🗄️ `CHANGELOG.md` + 📝 OpenSpec change ⇒ **混合 PR，不走 docs-only 快速通道**
+> OpenSpec：`openspec/changes/spec-purpose-tbd-gate/`（`openspec validate --strict` 通过），capability `openspec-integration` 新增 1 条 Requirement
+
+### 动因：这是上一轮自己写下的遗留，不是新需求
+
+PR #3084 把 151 份主规格里 43 份的 `TBD - created by archiving change …` 填平，并在其执行记录里留了一行
+「缺的是检测机制，不是这一次的填写」。本轮兑现它。清点证据（当场跑）：
+`git grep -l Purpose -- scripts .github` ⇒ **0 命中** —— 门禁面上这条判据从来不存在，所以"填平"之后必然重新积累。
+
+### 门禁判据（终态七条；初版四条 + QM-6 之后三条）
+
+1. **全量**扫描 `openspec/specs/**/spec.md`（不按改动集）；违规 ⇒ rc=1 并逐条点名文件 + 原因码
+   `TBD` / `MISSING_SECTION` / `EMPTY` / `UNREADABLE`。
+2. 占位词按**语义特征**且只看正文开头（`^TBD\b`、`^TODO\b`、`^待补充`…）—— 不写"文件里出现 TBD 即红"，
+   那会把"Purpose 里正在说 TBD 这件事"判成缺陷。**并配负控**：`待办…` / `占用…` 必须放过。
+3. **两条空集出口各自抛错** + 规模下界（`DEFAULT_MIN_SPECS=50`，实测当前 151 份）。
+   下界只管"扫描域退化"，**不管**积累 —— 积累由逐份违规判据守（B5 否证后写明）。
+4. 域排除按**完整前缀**锚定：`openspec/changes/…`（提案增量，TBD 属正常生命周期）与 `openspec/specs/archive/`；
+   谓词 `isSpecFile` 与装配 `collect` 各有一条锁（F5：恒过夹具的教训）。
+5. **逐段判**：一份文件里每个 `## Purpose` 都查，违规点名"第 N 段"（B1）。
+6. 标题层级收 `##` 与 `###`，**不收** `##Purpose`（CommonMark 下那不是标题，B2 半否证）；前导 BOM 先剥（B3）。
+7. CLI 契约：畸形 `--limit` / `--min-specs` ⇒ rc=2 出声（不得静默按缺省跑，F6）；`--root` 等号式与空格式等价（F8）；
+   `--help` 存在并写明退出码口径（F7/F11）。
+
+### 反证 · 首轮 7 格（当时的套件是 15 条；终态 15 格见后面那张表）
+
+驱动：从 pristine 还原 → 基线必须 `14/14 → 15/15` 全绿 → 注入变异（断言锚点命中恰好 1 次且字节真的变了）→
+指定用例必须变红 → 逐字节还原并与备份 `===`。每条记录 `restored_byte_identical=true`；全部跑完 `git status --porcelain`
+只剩本次真实改动文件（无变异残留）。下表红条数是**首轮实跑值**；套件扩到 23 条后同一批变异的红条数变为
+M1=9 / M2=6 / M5=2 / M7=2，终态数字以「反证（终态 15 格，驱动 v3）」那张表为准。
+
+| 变异 | 拆掉的是什么 | 结果 |
+|------|-------------|------|
+| M1 `evaluatePurpose` 恒判合规 | 整条判据（no-op） | 红 4 条（含 TBD 档）⇒ PASS |
+| M2 正文提取退回带 `m` 的多行正则 | 逐行扫描器 | 红 2 条（含"真实仓库不得判 EMPTY"）⇒ PASS |
+| M3 "扫描域为空"改 `return ok:true` | 第二条空集出口 | **首跑 NOT_RED** ⇒ 见下 |
+| M4 `DEFAULT_MIN_SPECS` 改 0 | 规模下界 | 红 1 条 ⇒ PASS |
+| M5 把整块 step 复制到 `classify` 之前 | 接线位置前提 | 红 1 条 ⇒ PASS |
+| M6 删 `.gitignore` 的 `!scripts/check-spec-purpose.js` | 脚本入库前提 | 红 1 条 ⇒ PASS |
+| M7 从 step 里摘掉 `node --test` 点名 | "测试被 CI 跑过" | **首跑 ANCHOR_NOT_FOUND** ⇒ 见下 |
+
+两条驱动自身的坑（都是探针问题，不是代码安全）：
+
+- **M3 首跑 `NOT_RED`**：当时只有"目录不存在"这一条空集出口有测试，于是把 `check()` 里
+  `扫描域为空 ⇒ 抛` 改成 `return ok:true` 的变异照样全绿。补一条"目录存在但零 spec.md"的锁后，
+  同一变异立刻变红。**口径：一条判据有多个退化出口时，每个出口都要有自己的锁**，否则它就是装饰。
+- **M7 首跑 `ANCHOR_NOT_FOUND`**：needle 手拼成 `'…test.js\n'`，而 workflow 文件是 CRLF ⇒ 命中 0 次。
+  改为**从文件运行时取行**（`split('\n')` 后按 trim 比对）后成立。与 M3 那条同一教训：锚点必须抄自实现/文件，不能凭记忆。
+
+### 本轮抓住的一个自身缺陷（若上线即成噪声）
+
+第一版判据用带 `m` 的多行正则取正文，`$` 在多行模式下匹配**空行行尾**，而 `## Purpose` 与正文之间按惯例就有空行
+⇒ **15 份已写好 Purpose 的规格被判 EMPTY**（`openspec/specs/creator-monitor/spec.md`、`i18n-content-sync`、
+`session-worktree-isolation`、8 份 `story2video-*` 等）。发现路径是"先在真实仓库跑一次判据"而不是跑测试 ——
+测试夹具全是"标题行后紧跟内容"的形状，对这一档**结构性免疫**。
+修法是实现换成逐行扫描（代码围栏内的 `#` 不当标题），并补一条**真实文件形状**的回归锁。
+后果评估：若按第一版上线，Gate 12d 第一天就红 15 条噪声，被教给下一个人的动作是"绕开门禁"，比没有门禁更糟。
+
+### 门禁表
+
+| 门禁 | 状态 | 证据（当场实跑） |
+|------|------|------------------|
+| 变更类型与隔离 | PASS | `start-mp-task.ps1 -TaskName spec-purpose-tbd-gate` 按产物复核（见开头引文）；共享根保持 main，仅 2 个别的会话的 untracked 文件未动 |
+| TDD 红→绿 | PASS | RED：`Cannot find module './check-spec-purpose.js'` / `MODULE_NOT_FOUND` / `tests 1 pass 0 fail 1`；GREEN：初版 `15 / 15 / 0`，QM-6 后终态 `23 / 23 / 0` |
+| 判据在真实仓库 | PASS | `node scripts/check-spec-purpose.js` → `扫描 151 份主规格，违规 0` + `OK` |
+| 测试接线 | PASS | 新测试与判据同 step 点名在 `changes` job 的 Gate 12d；`check-unwired-tests.js` 检查域 65→**66** 且报「全部已接线」 |
+| CI 结构 | PASS | 四条结构锁（提取器自证 / changes job 内 / classify 之后 / 不得同时进 static-gates）；`check-step-failfast.js` 6 个多测试步骤仍全 fail-fast |
+| CI 流水线（真跑证据） | PASS | attempt 1：run `37639606609` / job `112854988214` `QG Changes` completed/success，step [8] Gate 12d completed/success；日志正文 `# tests 23 / # pass 23 / # fail 0` + `[spec-purpose] 扫描 151 份主规格…违规 0`（逐字见下节）。attempt 1 整体是 failure —— 唯一红格 `QG Desktop Shards (1/2)` 与本 PR 无关（定性见后），`gh run rerun --failed` 后 attempt 2 为 `19 pass / 0 fail / 1 skipping`，auto-merge 随即落地 |
+| OpenSpec | PASS | `openspec validate spec-purpose-tbd-gate --strict` → `Change 'spec-purpose-tbd-gate' is valid` |
+| 行尾对账 | PASS | `git diff --numstat` 与 `--ignore-cr-at-eol --numstat` 同口径（详见提交）|
+| QM-1 打包 | N/A | 未触 `apps/desktop/electron/` 与 `packages/rpa-engine/`；改动是 CI 门禁 + 文档 |
+| QM-4 视觉 | N/A | 未触任何 `.vue` / 样式 / 布局 |
+| QM-6 双模型评审 | PASS | 见下节「QM-6 发现处置」：23 条，逐条修 / 否证，两条反例已落文档 |
+| 远程同步 | PASS | PR #3099 已 squash 合并，merge SHA `28f9d5143a3c90f07b3046121860394904bf2c9c`（committer 时间 `2026-10-07T15:51:56Z`），取证：`git log origin/main --grep='(#3099)$' --format=%H\|%cI`；`git ls-remote origin refs/heads/spec-purpose-tbd-gate` 返回 **0 行**（远端分支已随合并删除）。main 上的落地按行级包含复核（squash 后分支 head 不是 main 的祖先，`--is-ancestor` 判据在这里必然为假）：`git grep -c "Gate 12d" origin/main -- .github/workflows/quality-gate.yml` = 2、`git cat-file -e origin/main:scripts/check-spec-purpose.js` 存在、`git grep -c "check-spec-purpose" origin/main -- .gitignore` = 1、`git grep -a -c "created by archiving change" origin/main -- openspec/specs` **无输出**（0 份） |
+
+### CI 上这条门禁真的跑过了（逐字日志，非"作业名对上了"）
+
+判据接到 CI 不等于它在跑 —— 本仓吃过「登记为反证已实测变红、实际从未执行」的亏。故按
+**step 自己的 conclusion + 该 step 的日志正文**两级取证（run `37639606609` / job `112854988214`
+`QG Changes` = `completed/success`，head `ec260b8d6`）：
+
+```
+step [8] "Gate 12d - Spec Purpose presence (changes job)" -> completed/success
+（步骤清单里它前后的 Gate 12c / Gate 2c3 同样 completed/success，编号 7/8/9 连续）
+
+1001 ##[group]Run node --test scripts/check-spec-purpose.test.js
+1002 node --test scripts/check-spec-purpose.test.js
+1003 node scripts/check-spec-purpose.js
+1004 shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+1146 # tests 23
+1148 # pass 23
+1149 # fail 0
+1153 # duration_ms 285.939388
+1154 [spec-purpose] 扫描 151 份主规格（openspec/specs/**/spec.md），违规 0
+1155 OK: 所有主规格的 Purpose 均已填写（无 TBD / 无空段 / 无缺段）
+```
+
+三条各自的用处：`1001` 证明**两条命令都在同一个 step 正文里被执行**（不是只跑了测试）；
+`1146/1148/1149` 证明 23 条锁在 runner 上真跑且全绿；`1154/1155` 是判据自己打的现场数字 ——
+"CI 上扫到 151 份、违规 0"，与本机一致，说明 Linux 侧（`path.sep='/'`、无 CRLF 工作副本）行为相同。
+日志取法：`gh api --allow-escape-sequences repos/<o>/<r>/actions/jobs/<id>/logs`（1,590 行 / 123 KB），
+剥 ANSI 后按 `##[group]` 定位 —— 本 job 的 step **没有** `##[group]…Gate 12d` 这种带名字的分组标记，
+只有 `##[group]Run <脚本首行>`，所以按 step 名 grep 日志会得到 0 命中；那不能读成"没跑"
+（`sp-job-log.js` 就因此打印了 `start=-1`，靠行号 1001 的正文认出来）。
+
+### attempt 1 那一格红的定性（环境型，不是本 PR 引入）
+
+`gh pr checks` 在 R31 报 `fail=1`，同时 `QG Desktop Shards (2/2)` 还在跑 —— 按既有口径这不构成结论
+（见「终止条件必须是 fail>0 **且** pending==0」），所以先定性再决定动作：
+
+1. **是真失败还是 cancelled**：REST `commits/<sha>/check-runs` 里
+   `QG Desktop Shards (1/2) status=completed conclusion=failure`（不是 cancelled），
+   job `112855223860` 的失败步是 step [7] `Desktop tests shard 1/2`，唯一红用例
+   `electron/tests/test_scheduler_parity.test.js > scheduler 模拟器与真实 governor 对拍`。
+2. **是不是我改出来的**：本 PR 的 10 个文件全是 `scripts/`、`.github/workflows/quality-gate.yml`、
+   `.gitignore`、`CHANGELOG.md` 与 `openspec/`，**不碰** `apps/desktop/`、scheduler 与 python 任一侧；
+   同一 job 在同一天的 main 上（run `37629794933` / head `f5b18dab7`，13:36Z）是 success。
+3. **失败形状指向环境**：`scripts/compare-scheduler-models.js:253` 抛
+   `Error: python simulator failed:` —— **冒号后是空的**。该处写的是 `(res.stderr || res.stdout)`，
+   两者皆空且 `status !== 0` 只可能是 `spawnSync('python', …)` 的 `status=null` 两型之一
+   （PATH 上取不到 `python`，或 30s timeout 被 SIGTERM），而不是模拟器算出错。
+   ⚠️ 顺带记一条**别人的**可诊断性缺口（不在本 PR 范围，不改）：该 throw 把 `res.error` 与 `res.signal`
+   全丢了，所以"环境缺 python"和"超时"在日志里长得一模一样；`search/issues` 现无 open 单提到它（两项 TOTAL=0）。
+4. **动作**：确认 run 已 `completed` 才 `gh run rerun --failed`（在跑时它根本不会执行），
+   并**只以回读为准**：`status=in_progress attempt=2` ⇒ 重跑真的发生了。
+   attempt 2 结果 `19 pass / 0 fail / 1 skipping` ⇒ 第 3 步的环境型判断成立，auto-merge 落地。
+
+⇒ 口径复用：**红格先分「真失败 / cancelled / 环境型 / 本 PR 引入」四档**，判别式分别是
+`conclusion`、同 job 在 main 上的近期结论、错误文案里"有没有拿到任何子进程输出"、以及本 PR diff 的文件集
+是否覆盖被测面。只看 `gh pr checks` 的 `fail` 计数会同时踩 cancelled 与 pending 两个坑。
+
+### QM-6 发现处置（23 条：后端 11 含 2 CRITICAL，工程 12 含 3 MAJOR）
+
+通道：CC Switch `:15721` 实测 DOWN（`Get-NetTCPConnection -LocalPort 15721 -State Listen` 无输出）⇒ 按既有替代通道
+`opencode run`，两轴分别 `opencode/nemotron-3-ultra-free`（后端）与 `opencode/ling-3.1-flash-free`（工程）。
+**评审对象钉 `68c4010d9`**（= 首提交 + 合并 `origin/main bc1e75210` 后的 head）。
+原件当时落在该 worktree 的 gitignored `.tmp/qm6/`（`out-backend.txt` 19,528 B、`out-frontend.txt` 剥 ANSI 后 11,013 B），
+**那不是长期坐标** —— 它随 worktree 收尾即消失，本记录也不要求任何人去找它：两条轴的 severity、正文、
+以及逐条修 / 否证的依据，已全部转写进下面这张表，后续核对一律以本表为准。
+判成败只看产物里的 JSON 正文，不看 rc（该通道有 rc=0 + 空 stdout 的先例）。
+
+| 编号 | 轴 / severity | 发现 | 处置 | 依据 |
+|------|--------------|------|------|------|
+| B1 | 后 / CRITICAL | 只查第一个 `## Purpose`，第二段 TBD 静默放过 | **修**：`purposeBodiesOf` 收全部段 + 逐段判，违规点名「第 N 段」 | 自查边界探针 `d_double => OK(null)` 先于评审命中同一洞；M8 反证红 1 |
+| B2 | 后 / CRITICAL | `##Purpose`、`### Purpose` 不被识别 | **半修半否证**：`###` 收（M14 反证）；`##Purpose` **不收** —— CommonMark 要求 `#` 序列后跟空格/制表符或行尾，那不是标题，报缺段是正确判定。现状量测 151 份逐字都是 `## Purpose`（`NO_HEAD=0 / MULTI_HEAD=0`） | `D:/tmp/sp-measure-heads.js` |
+| B3 | 后 / MAJOR | 前导 BOM 未剥 | **修** + 两条成对用例。**M9 首跑 `NOT_RED`**：样本 `BOM+H1+## Purpose` 时 BOM 只污染 H1，判据不看 H1 ⇒ 变异 no-op。改为 BOM 压在标题行上才打出真路径；并钉住「BOM 在 H1 前不受影响」防止夸大。现状 151 份 BOM=0 ⇒ **预防性加固** | 反证驱动 v3 M9 |
+| B4 | 后 / MAJOR | 「`split(/\r?\n/)` 把 `\r` 留在行里，CRLF 双处理脆弱」 | **否证**：`/\r?\n/` 把 `\r` 当分隔符**消费掉**；实测 CRLF / 混合行尾三档 `contains_CR=false`；再量测 151 份 spec.md 的孤立 CR = **0** | `D:/tmp/sp-crlf-probe.js` + 字节级扫描 |
+| B5 | 后 / MAJOR | 规模下界给"假信心"：可「加 100 份 TBD、删 100 份好的」而通过 | **否证**：违规是**逐份**判的，与总数无关 —— 加 100 份 TBD 当场红 100 条。下界只管"扫描域退化"，已把职责边界写进常量旁注释（不改名、不动 M4 锚点） | 读 `check()` 的 bad 聚合路径 |
+| B6 | 后 / MAJOR | 结构锁用 `indexOf` 取首次命中，注释里的同名串能把位置判到注释上 | **修**：按 step 语义标题定位 → 命令必须落在**该 step 正文** → 注释行剥离；另加「提取器自证」用例证明"注释不算接线"这件事本身可红 | M10 反证红 1 |
+| B7 | 后 / MAJOR | step 定位正则写死 6 空格缩进；建议改 `js-yaml` | **接受脆弱性、拒绝处方**：`changes` job 的 steps 实测只有 `actions/checkout` + 门禁命令，**没有 Install deps**（`has_install_step=false`），`require('js-yaml')` 会在 CI 当场 `MODULE_NOT_FOUND`；仓内三把 js-yaml workflow 锁全跑在有依赖的 static-gates（`quality-gate.yml:424`）。改为缩进无关的轻量 step 扫描。工程轴独立给出同一结论 ⇒ 两轴互证 | `yaml.load` 枚举 changes job |
+| B8 | 后 / MINOR | 中文占位词无词边界（`^待定` 命中「待定项」） | **不改**：现状量测 0 命中；加限定词会把「待补充」单独成行放过，是用误杀换漏判。理由写进 `PLACEHOLDER_RES` 注释（AGENTS.md 要求枚举黑名单要么给泛化规则、要么给理由，本处是**有理由的例外**） | 违规 0 即该证据 |
+| B9 | 后 / MINOR | 排除用路径段名，`openspec/specs/changes/spec.md` 会被静默排除 | **修**：按完整前缀锚定 + 谓词层直接断言（`isSpecFile` 双向）+ 夹具层「名为 changes 的能力留 TBD 必须红」。现状 `ls openspec/specs` 无同名目录 ⇒ 收紧不改变今日结果 | M13 反证红 1 |
+| B10 | 后 / INFO | 探针故障与违规共用 rc=1 | **不改**，与 B11/F11 合并处理：`parseArgs` 已把 **rc=2 占为用法错误**，拆不动；把口径写进 `--help` 与文件头 | 见 F11 |
+| B11 | 后 / INFO | proposal 写「14 条」而实为 15 | **修**：现统一为 **23 条**，四处（proposal / tasks / CHANGELOG / 记录）同 PR 对齐 | `grep -n 14 proposal.md` |
+| F1 | 工 / MAJOR | 占位词表缺负控，阳性样本全取自枚举集本身 | **修**：`待办…` / `占用…` 必须放过；且把「以 `占位` 起头的合法名词短语**会被误杀**」钉成断言（写代价，不假装不会发生）+ M15 证明负控不是放宽判据换来的 | 新用例首跑**当场命中**了这个洞 |
+| F2 | 工 / MAJOR | proposal「14 条」 | 同 B11 | — |
+| F3 | 工 / MAJOR | 「两条接线结构锁」vs「三条」口径分裂 | **修**：终态为四条锁，四处文档统一 | `grep -n 结构锁` |
+| F4 | 工 / MINOR | `check()` 对同一文件调两次 `purposeBodyOf` | **修**：`violationsOf` 一次提取同时产出原因与明细 | — |
+| F5 | 工 / MINOR | 「changes 目录不得入域」是恒过夹具：walk 起点根本到不了那里，删掉排除分支照样绿 | **修**：拆成谓词层（直接调 `isSpecFile`，正反双向）与装配层（`check` 的 `total`）两层，各锁各的 | 本轮自查再次确认：这是「装饰性断言」的测试层形态 |
+| F6 | 工 / MINOR | `--limit=abc` → `NaN` → `slice(0,NaN)=[]`，违规明细**整页静默消失**而 rc 仍 1 | **修**：`--limit` / `--min-specs` 必须是有限非负整数，否则 rc=2 出声；`check()` 侧同样拒绝坏值而非静默回落。并加正向对照证明 `--limit` 真在截断（否则"NaN 让它失效"只是推测） | M12 反证红 1 |
+| F7 | 工 / MINOR | 无 `--help`，而三个同族判据都有 | **修**：`--help` 出用法并 rc=0 | — |
+| F8 | 工 / MINOR | `--root` 只认等号式，最近的同族 `check-doc-abs-paths.js` 因实测事故两式都收 | **修**：等号式与空格式等价，并断言两式**产出同一结果**（否则"支持了"只是表情） | — |
+| F9 | 工 / MINOR | 三个锚点散在用例里；且指出 YAML 解析不会更安全 | **修**：锚点集中登记到 `ANCHOR` 一处；标题不写死门禁编号（改编号不该让锁变红） | 与 B7 互证 |
+| F10 | 工 / MINOR | `assert.ok(Array.isArray(emptied))` 是恒真断言 | **修**：改为 `deepEqual(emptied.map(f), [])`，让它有独占红出口 | — |
+| F11 | 工 / MINOR | 退出码语义与同族不一致（同族用法错=2、违规=1） | **修（文档化）**：把「0 / 1（违规或判据故障，文案带 `FAIL(closed)`）/ 2（用法错误）」写进 `--help` 与文件头，保持现状不拆 —— 与 B10 同一处 | — |
+| F12 | 工 / INFO | 正面确认：collect / check / evaluatePurpose / isSpecFile 分层清楚，加第二条判据只需改一处 | 采纳为分层约束写进注释 | — |
+
+**评审没提出、被新增 CLI 用例抓到的那条更贵**：`process.exit(main())` 而 `main(argv)` 无缺省 ⇒
+`parseArgs(undefined)` 按零参数运行 ⇒ **所有命令行选项静默失效**（`--help` 也照常扫全仓并 rc=0）。
+前 7 格反证对此全部失明（它们都不经 CLI）。⇒ 口径：**给一个脚本加"参数化行为"时，反证必须有一条从进程入口打进去**，
+只测导出的函数等于没测 CLI 层（与既有「反证没红的第四种成因：被测代码不在这次执行的调用链上」同源）。
+
+### 反证（终态 15 格，驱动 v3）
+
+| 变异 | 拆掉的是什么 | 结果 |
+|------|-------------|------|
+| M1 `evaluatePurpose` 恒判合规 | 整条判据（no-op） | 红 9 ⇒ PASS |
+| M2 正文提取退回带 `m` 的多行正则 | 逐行扫描器 | 红 6 ⇒ PASS |
+| M3 "扫描域为空"改 `return ok:true` | 第二条空集出口 | 首跑 NOT_RED ⇒ 补锁后红 1 |
+| M4 `DEFAULT_MIN_SPECS` 改 0 | 规模下界 | 红 1 ⇒ PASS |
+| M5 整块 step 搬到 `classify` 之前 | 接线位置前提 | 红 2 ⇒ PASS |
+| M6 删 `.gitignore` negation | 脚本入库前提 | 红 1 ⇒ PASS |
+| M7 摘掉 step 里 `node --test` 点名 | "测试被 CI 跑过" | 首跑 ANCHOR_NOT_FOUND ⇒ 改运行时取行后红 2 |
+| M8 `purposeBodiesOf` 只返回第一段 | B1 修的洞 | 红 1 ⇒ PASS |
+| M9 不剥前导 BOM | B3 修的洞 | **首跑 NOT_RED**（样本没打到路径）⇒ 红 1 |
+| M10 接线锁不再剥注释 | B6 修的洞 | 红 1 ⇒ PASS |
+| M11 入口不转发 argv | 整个 CLI 层 | 红 2 ⇒ PASS |
+| M12 畸形数值静默按缺省 | F6 修的洞 | 红 1 ⇒ PASS |
+| M13 排除退回路径段名 | B9 修的洞 | 红 1 ⇒ PASS |
+| M14 标题层级退回只认 `##` | B2 修的半边 | 红 1 ⇒ PASS |
+| M15 占位词表清空 | 证明负控不是放宽判据 | 红 14 ⇒ PASS |
+
+驱动四步不变：pristine 还原 → 基线必须全绿 → 注入（锚点命中恰好 1 次 + 断言字节真的变了 + 断言写后确实变了）→
+指定用例必须变红 → 逐字节还原并与备份 `===`。终态 `VERDICT=ALL_PASS`，15 格 `restored_byte_identical: true`，
+跑完 `git status --porcelain` 只剩 2 个 M 档（判据 + 测试），无变异残留。
+
+### 遗留（不假装已闭合）
+
+- 判据只管 **Purpose 段的有无/占位**，不管内容质量：一句"定义 X 的行为契约"式 Purpose 也判过。
+  质量审计需要另一条判据（例如要求 Purpose 至少引用一条 Requirement 标题），本轮不做。
+- **占位词表的已知边界**（QM-6 B8/F1 后如实写）：① 未登记词（`TBA`、`稍后补`、`XXX`）放过，已由用例钉住"不得声称能拦"；
+  ② 以 `占位` 二字起头的**合法**名词短语（如「占位符替换契约」）会被误杀 —— 现状 151 份里 0 命中，代价被钉成断言；
+  真撞上时的正解是改写那句 Purpose，**不是**给词表加限定词（那会把真占位放过）。
+- `## Purpose` 只认 `##` / `###` 且 `#` 后必须有空白：`##Purpose` 判缺段是**有意的**（CommonMark 下那不是标题）。
+- BOM 处理属**预防性加固**：现状量测 151 份 BOM=0、孤立 CR=0，不得被读成"救下了存量"。
+- `openspec archive` 自身仍会先写 TBD 再靠门禁拦 —— 更彻底的做法是在归档命令里强制补写，
+  但那属上游 openspec CLI 行为，本仓不 fork 它；当前顺序（先归档、CI 立刻红）已能把账留在台面上。
+- 归档本 change 后，它会给自己新增的主规格写 TBD —— 这正是本门禁的活体测试场景，
+  归档时必须确认产出的 `openspec/specs/openspec-integration/spec.md` Purpose 已填（tasks 5.4 已记）。
+- **`tasks.md` 的 5.3/5.4 复选框留待归档 PR**：回填 PR 若同时改 `openspec/changes/**/tasks.md`
+  就不再是「纯回填」（`check-pr-exec-record.js` 的定义要求变更集**全部**是载体文件），会被判
+  「未携带执行记录」而红。本记录即该次交付的现场（合并事实、CI 逐字取证、红格定性），
+  勾选状态与事实之间的差异到此为止：读到 `tasks.md` 未勾 5.3 时，以本节为准。
+- 流程面的一条方法论遗留（本轮最贵的一课）：**给脚本加参数化行为时，反证必须有一条从进程入口打进去**。
+  `process.exit(main())` 丢 argv 那个缺陷，前 7 格反证全部失明 —— 它们只调导出函数，从不经过 CLI。
+
+## 我这条线索引入过一次回归，以及自家 CI 为什么没拦住（2026-10-08 追记）
+
+**回归**：归档 PR #3114 给真源 `openspec/specs/openspec-integration/spec.md` 加了第 12 条 Requirement
+（「主规格的 Purpose 完整性必须有门禁」），却没同步它的 vendored 契约镜像
+`.quality-rhythm/integrations/openspec/spec-contract.md` ⇒ `scripts/quality-rhythm-spec-mirror.test.js`
+的「镜像不得自行发明或漏掉 Requirement」变红。
+
+**CI 当时拦不住的原因（三条都是实测，不是推测）**：
+
+| 观测 | 取值 |
+|------|------|
+| 那条锁跑在哪个 job | `static-gates`，job 级 `if: needs.changes.outputs.docs-only != 'true'`（用 `node -e` 解析 workflow 逐 job 扫 `run` 正文，唯一落点就是这里，`quality-gate.yml:252`） |
+| #3114 当时的 check 结论 | `QG Changes=pass`、**`QG Static=skipping`**、`Gate Result=pass` ⇒ PR 侧全绿并合并 |
+| main 侧后果 | push 事件跑全量：run `37716816985` @ `b8ed51da1` = `completed/failure`，`QG Static` 失败步 = step 8 `Gate 2b - Desktop dev scripts (node --test)`，日志正文 `not ok 2 - 镜像不得自行发明或漏掉 Requirement` —— 卡住当时所有 open PR 的 QG Static |
+
+**谁修的**：不是本会话。别的会话已在 #3116（`7c62f3e3d`，主题即「同步 vendored 契约镜像漏掉的第 12 条
+Requirement（解掉 main 上卡住全部 open PR 的 QG Static 红）」）修好。我是**复核后**才写这句，不是照抄：
+真源该 Requirement 计数 = 1、镜像计数 = 1、`node --test scripts/quality-rhythm-spec-mirror.test.js` ⇒ `5 / 5 / 0 fail`。
+我自己那条 `fix-spec-contract-mirror` 分支因此删除（无提交，未推远端），不重复别人的落地。
+
+**为什么这仍算我的**：AGENTS.md「门禁断言随实现迁移同步」要求"改真源必须同 PR 同步住锁着旧前提的镜像/基线"，
+而 `openspec-integration` 这条真源恰好有一个 vendored 镜像 —— 我做归档时只想著"主规格要有这条契约"，
+**没查"还有谁在抄这份契约"**。⇒ 口径：动 `openspec/specs/<cap>/spec.md` 之前，先
+`git grep -l "<其中一条 Requirement 标题>"` 全仓找镜像/副本，不要只在 `openspec/` 内部找。
+
+**留下的系统性缺口（本记录只登记、未修，需另行决定）**：这条锁的输入包含 `openspec/specs/**`，
+而 `openspec/**` 在 docs-only 白名单里 ⇒ 按 AGENTS.md「进白名单前提锁」（同族先例 #2718 账本 JSON /
+#2745 执行记录 / #3000 文档绝对路径 / #3099 本门禁自身），锁本身却只待在会被短路的 `static-gates`。
+后果就是上表：纯文档 PR 可以合法地把这条契约改漂而 PR 侧全绿，红只在 main 上爆，而 main 一红同时卡住全部 open PR。
+修法很小且机械 —— 在 `quality-gate.yml` 的 `changes` job 里把
+`node --test scripts/quality-rhythm-spec-mirror.test.js` 也点一次名（`static-gates` 那份保留；
+两处跑同一条锁不构成交叉判定，只构成"docs-only PR 也拦得住"）。没和本记录的措辞修正放进同一个 PR 的原因：
+那会让那个 PR 变成混合 PR（改 `.github/workflows/`）从而走全套重型 CI，与「纯载体销账」通道不同，
+留待确认后单独一 PR。
