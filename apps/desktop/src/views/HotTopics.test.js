@@ -34,10 +34,13 @@ vi.mock('@/api/publisher', () => ({
   aiRewrite: vi.fn(),
   draftSave: vi.fn(),
   storeGetSetting: vi.fn(),
+  pipelineList: vi.fn(),
   pipelineStartOrchestrated: vi.fn(),
   pipelineGetRunContext: vi.fn(),
   pipelineCancelRun: vi.fn(),
   onPipelineUpdate: vi.fn(() => vi.fn()),
+  modelProviderGetDefault: vi.fn(),
+  aiGenerateGenVideoTitle: vi.fn(),
 }))
 
 vi.mock('@/composables/useNotify', () => ({
@@ -53,7 +56,7 @@ import i18n from '@/i18n'
 import { hotTopicsFetch } from '@/api/hot-topics'
 import { hotTopicsGetCache } from '@/api/hot-topics'
 import { hotTopicsFavoriteList, hotTopicsFavoriteRemove } from '@/api/hot-topics'
-import { aiRewrite, draftSave, storeGetSetting, pipelineStartOrchestrated, pipelineGetRunContext, pipelineCancelRun } from '@/api/publisher'
+import { aiRewrite, draftSave, storeGetSetting, pipelineList, pipelineStartOrchestrated, pipelineGetRunContext, pipelineCancelRun, modelProviderGetDefault, aiGenerateGenVideoTitle } from '@/api/publisher'
 import { pipelineBackgroundToastVisible, hidePipelineBackgroundToast } from '@/stores/pipeline-background-toast'
 import { readFileSync } from 'node:fs'
 
@@ -61,6 +64,17 @@ const mockTopics = [
   { id: 'zhihu:1', topic: 'AI大模型最新突破进展', channel: 'zhihu', category: 'tech', rank: 1, hotValue: 12000000, url: null, fetchedAt: '2026-09-11T00:00:00Z' },
   { id: 'toutiao:1', topic: 'A股大涨沪指重返3000点', channel: 'toutiao', category: 'finance', rank: 1, hotValue: 456789, url: null, fetchedAt: '2026-09-11T00:00:00Z' },
   { id: 'baidu:1', topic: '普通日常记录', channel: 'baidu', category: 'general', rank: 1, hotValue: null, url: null, fetchedAt: '2026-09-11T00:00:00Z' },
+]
+
+// hot-topics-pipeline-picker（2026-10-17）：主进程 pipelineList 夹具（与顺序/available 语义一致）
+const mockPipelineList = [
+  { name: 'story2video-compose', available: true },
+  { name: 'animated-explainer', available: true },
+  { name: 'talking-head', available: true },
+  { name: 'cinematic', available: true },
+  { name: 'animation', available: true },
+  { name: 'framework-smoke', available: true },
+  { name: 'film-engineering', available: true },
 ]
 
 function mountPage() {
@@ -77,7 +91,15 @@ describe('HotTopics.vue', () => {
     hotTopicsGetCache.mockResolvedValue({ code: 0, data: { topics: [], fetchedAt: 0, channelStats: {} } })
     // 默认无收藏：收藏 tab 用例各自覆盖该实现
     hotTopicsFavoriteList.mockResolvedValue({ code: 0, data: [] })
-    document.body.innerHTML = '' // 清理 Teleport 到 body 的弹窗/按钮残留，隔离用例
+    // 默认流水线清单（选择器用例按需覆盖失败/空清单分支）
+    pipelineList.mockResolvedValue({ code: 0, data: mockPipelineList })
+    // fix-hot-topics-genvideo-title：默认有可用文字推理模型 + AI 标题成功
+    // （无模型/失败分支由专用用例覆盖）
+    modelProviderGetDefault.mockResolvedValue({ code: 0, data: { id: 'openai', name: 'OpenAI' } })
+    aiGenerateGenVideoTitle.mockResolvedValue({ code: 0, data: { success: true, title: '打工人醒醒！AI又抢活了' } })
+    // 清理 Teleport 到 body 的弹窗/按钮残留，隔离用例
+    // 不用 innerHTML：CCG 安全门禁判高危（XSS）；改用逐节点移除
+    while (document.body.firstChild) document.body.removeChild(document.body.firstChild)
   })
 
   it('renders topic list after fetch', async () => {
@@ -631,7 +653,9 @@ describe('HotTopics.vue', () => {
     await flushPromises()
     expect(wrapper.vm.genVideoPhase).toBe('completed')
 
-    // 【去发布】→ /publish 视频模式预填充（title/content/tags 来自 publish 配置）
+    // 【去发布】→ /publish 视频模式预填充（content/tags 来自 publish 配置）
+    // fix-hot-topics-genvideo-title：title 现由 AI 爆款标题覆盖（不再是 publish.title/正文切片），
+    // content/tags 仍走 buildPublishFromProject 的既有提取语义。
     pushSpy.mockClear()
     document.body.querySelector('[data-testid="hot-topics-gen-video-publish"]').dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await flushPromises()
@@ -639,7 +663,7 @@ describe('HotTopics.vue', () => {
     expect(publishTarget).toBeTruthy()
     expect(publishTarget.query.type).toBe('video')
     expect(decodeURIComponent(String(publishTarget.query.video_path))).toBe('D:/videos/out.mp4')
-    expect(decodeURIComponent(String(publishTarget.query.title))).toBe('发布标题')
+    expect(decodeURIComponent(String(publishTarget.query.title))).toBe('打工人醒醒！AI又抢活了')
     expect(decodeURIComponent(String(publishTarget.query.content))).toBe('发布正文')
     expect(decodeURIComponent(String(publishTarget.query.tags))).toBe('AI')
 
@@ -685,10 +709,13 @@ describe('HotTopics.vue', () => {
     expect(publishTarget).toBeTruthy()
     expect(publishTarget.query.type).toBe('video')
     expect(decodeURIComponent(String(publishTarget.query.video_path))).toBe('D:/videos/out.mp4')
-    // 关键：不携带空标题/空正文（否则等于伪造了一个"有标题但为空"的项目）
-    expect(publishTarget.query.title).toBeUndefined()
+    // 关键：不携带空正文/空标签（否则等于伪造了一个"有正文但为空"的项目）
     expect(publishTarget.query.content).toBeUndefined()
     expect(publishTarget.query.tags).toBeUndefined()
+    // fix-hot-topics-genvideo-title：run-only 也带标题（AI 标题成功时来自 AI）
+    expect(decodeURIComponent(String(publishTarget.query.title))).toBe('打工人醒醒！AI又抢活了')
+    expect(publishTarget.query.title_source).toBe('ai')
+    expect(publishTarget.query.title_reason).toBeUndefined()
 
     wrapper.unmount()
     el.remove()
@@ -970,6 +997,194 @@ describe('HotTopics.vue', () => {
     ])
     expect(wrapper.vm.genVideoStages.find(s => s.name === 'rewrite_copy').status).toBe('completed')
   })
+
+  // ─── hot-topics-pipeline-picker（2026-10-17）：行内下箭头 → 全流水线下拉 → 选择即启动 ───
+
+  /** 打开某行的流水线选择面板（面板在行内渲染，非 Teleport） */
+  async function openPipelineMenu(wrapper, topicId = 'zhihu:1') {
+    const arrow = wrapper.find(`[data-testid="hot-topic-gen-video-picker-${topicId}"]`)
+    expect(arrow.exists()).toBe(true)
+    await arrow.trigger('click')
+    await flushPromises()
+  }
+
+  it('renders a pipeline picker arrow on every topic row and lists all pipelines with reasons', async () => {
+    hotTopicsFetch.mockResolvedValue({ code: 0, data: { topics: mockTopics, fetchedAt: Date.now(), channelStats: {} } })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.findAll('[data-testid^="hot-topic-gen-video-picker-"]')).toHaveLength(3)
+    await openPipelineMenu(wrapper)
+
+    // 主进程清单全量列出（可执行前、禁用后）
+    const items = wrapper.findAll('[data-testid^="hot-topic-gen-video-pipeline-option-zhihu:1-"]')
+    expect(items).toHaveLength(mockPipelineList.length)
+    const defaultItem = wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-story2video-compose"]')
+    expect(defaultItem.text()).toContain('hotTopics.genVideoPipelineDefaultBadge')
+    // 媒体型 / 内部 / 专属页面都保留可见但禁用，并给出原因
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-animated-explainer"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-cinematic"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-cinematic"]').text())
+      .toContain('hotTopics.genVideoPipelineNeedsMedia')
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-framework-smoke"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-film-engineering"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('picking a text-driven pipeline starts it with dynamic stages and shows the pipeline label', async () => {
+    hotTopicsFetch.mockResolvedValue({ code: 0, data: { topics: mockTopics, fetchedAt: Date.now(), channelStats: {} } })
+    aiRewrite.mockResolvedValue({ code: 0, data: { success: true, result: '改写后的视频文案内容' } })
+    draftSave.mockResolvedValue({ code: 0 })
+    storeGetSetting.mockResolvedValue(null)
+    pipelineStartOrchestrated.mockResolvedValue({ code: 0, data: { success: true, runId: 'run-animated-1' } })
+    pipelineGetRunContext.mockResolvedValue({ code: 0, data: { runId: 'run-animated-1', status: { status: 'running', progress: 10 } } })
+
+    const wrapper = mountPage()
+    await flushPromises()
+    await openPipelineMenu(wrapper)
+    await wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-animated-explainer"]').trigger('click')
+    await flushPromises()
+
+    expect(pipelineStartOrchestrated).toHaveBeenCalledWith('animated-explainer', expect.objectContaining({
+      text: '改写后的视频文案内容',
+      inputMode: 'text',
+      checkpointPolicy: 'none',
+      autoAdvance: true,
+      background: true,
+      resolution: '720x1280',
+      aspectRatio: '9:16',
+      fps: 30,
+      format: 'mp4',
+    }))
+    // 非 S2V 流水线：阶段 = rewrite_copy + 该流水线真实阶段（不再是固定 8 阶段）
+    expect(wrapper.vm.genVideoPipelineName).toBe('animated-explainer')
+    expect(wrapper.vm.genVideoStages.map(s => s.name)).toEqual([
+      'rewrite_copy', 'research', 'proposal', 'script', 'scenes', 'assets', 'editing', 'compose', 'publish',
+    ])
+    // 弹窗显示当前流水线（UiModal Teleport 到 body）
+    const label = document.body.querySelector('[data-testid="hot-topics-gen-video-pipeline"]')
+    expect(label).toBeTruthy()
+    expect(label.textContent).toContain('hotTopics.genVideoPipelineLabel')
+    // i18n 测试桩下 getPipelineName 回退到流水线 id；真实 locale 下为「动画解说」等名称
+    expect(label.textContent).toContain('animated-explainer')
+  })
+
+  it('main generate button still starts the default story2video pipeline', async () => {
+    hotTopicsFetch.mockResolvedValue({ code: 0, data: { topics: mockTopics, fetchedAt: Date.now(), channelStats: {} } })
+    aiRewrite.mockResolvedValue({ code: 0, data: { success: true, result: '默认流水线文案' } })
+    draftSave.mockResolvedValue({ code: 0 })
+    storeGetSetting.mockResolvedValue(null)
+    pipelineStartOrchestrated.mockResolvedValue({ code: 0, data: { success: true, runId: 'run-default-1' } })
+    pipelineGetRunContext.mockResolvedValue({ code: 0, data: { runId: 'run-default-1', status: { status: 'running', progress: 10 } } })
+
+    const wrapper = mountPage()
+    await flushPromises()
+    await wrapper.find('[data-testid="hot-topic-generate-video-zhihu:1"]').trigger('click')
+    await flushPromises()
+
+    expect(pipelineStartOrchestrated).toHaveBeenCalledWith('story2video-compose', expect.objectContaining({
+      text: '默认流水线文案',
+      story2videoTextConfig: expect.objectContaining({ mode: 'text', prompt: '默认流水线文案' }),
+    }))
+    expect(wrapper.vm.genVideoPipelineName).toBe('story2video-compose')
+    expect(wrapper.vm.genVideoStages).toHaveLength(8)
+  })
+
+  it('disabled pipeline options never start a generation flow', async () => {
+    hotTopicsFetch.mockResolvedValue({ code: 0, data: { topics: mockTopics, fetchedAt: Date.now(), channelStats: {} } })
+    const wrapper = mountPage()
+    await flushPromises()
+    await openPipelineMenu(wrapper)
+
+    await wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-cinematic"]').trigger('click')
+    await flushPromises()
+
+    expect(aiRewrite).not.toHaveBeenCalled()
+    expect(pipelineStartOrchestrated).not.toHaveBeenCalled()
+    expect(wrapper.vm.genVideoModalOpen).toBe(false)
+    // 面板保持打开，用户可继续选择其它流水线
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-menu-zhihu:1"]').exists()).toBe(true)
+  })
+
+  it('pipeline list failure keeps the picker usable via fallback and does not block the main button', async () => {
+    hotTopicsFetch.mockResolvedValue({ code: 0, data: { topics: mockTopics, fetchedAt: Date.now(), channelStats: {} } })
+    pipelineList.mockResolvedValueOnce({ code: -1, message: 'Backend offline' })
+    aiRewrite.mockResolvedValue({ code: 0, data: { success: true, result: '回退路径文案' } })
+    draftSave.mockResolvedValue({ code: 0 })
+    storeGetSetting.mockResolvedValue(null)
+    pipelineStartOrchestrated.mockResolvedValue({ code: 0, data: { success: true, runId: 'run-fallback-1' } })
+    pipelineGetRunContext.mockResolvedValue({ code: 0, data: { runId: 'run-fallback-1', status: { status: 'running', progress: 5 } } })
+
+    const wrapper = mountPage()
+    await flushPromises()
+    await openPipelineMenu(wrapper)
+    expect(wrapper.find('[data-testid="hot-topic-gen-video-pipeline-error-zhihu:1"]').exists()).toBe(true)
+    // 回退项（故事讲述）仍可点，并走默认 S2V 启动
+    await wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-story2video-compose"]').trigger('click')
+    await flushPromises()
+    expect(pipelineStartOrchestrated).toHaveBeenCalledWith('story2video-compose', expect.any(Object))
+
+    // 主按钮不依赖流水线清单：清单失败后仍能正常发起默认编排
+    // （先脱离在途编排释放 busy——弹窗在途时 busy 守卫按设计拦住第二次编排）
+    wrapper.vm.handleGenVideoClose()
+    await flushPromises()
+    pipelineStartOrchestrated.mockClear()
+    await wrapper.find('[data-testid="hot-topic-generate-video-toutiao:1"]').trigger('click')
+    await flushPromises()
+    expect(pipelineStartOrchestrated).toHaveBeenCalledTimes(1)
+  })
+
+  it('non-story2video completion extracts the video from context.render and publishes with video_path only', async () => {
+    hotTopicsFetch.mockResolvedValue({ code: 0, data: { topics: mockTopics, fetchedAt: Date.now(), channelStats: {} } })
+    aiRewrite.mockResolvedValue({ code: 0, data: { success: true, result: '动画流水线文案' } })
+    draftSave.mockResolvedValue({ code: 0 })
+    storeGetSetting.mockResolvedValue(null)
+    pipelineStartOrchestrated.mockResolvedValue({ code: 0, data: { success: true, runId: 'run-anim-done' } })
+    pipelineGetRunContext.mockResolvedValue({ code: 0, data: {
+      runId: 'run-anim-done',
+      status: { status: 'completed', progress: 100, stages: [
+        { name: 'concept', status: 'completed' }, { name: 'render', status: 'completed' },
+      ] },
+      // 非 S2V 流水线：成片落在 render 阶段，且没有 story2videoProject
+      context: { render: { videoPath: 'D:/videos/animated.mp4' } },
+    } })
+
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const wrapper = mount(HotTopics, {
+      attachTo: el,
+      global: { plugins: [i18n], stubs: { 'el-alert': true, 'el-select': true, 'el-option': true, 'el-progress': true, 'el-skeleton': true } },
+    })
+    await flushPromises()
+    await openPipelineMenu(wrapper)
+    await wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-zhihu:1-animation"]').trigger('click')
+    await flushPromises()
+    await new Promise(r => setTimeout(r, 50))
+    await flushPromises()
+
+    expect(wrapper.vm.genVideoPhase).toBe('completed')
+    expect(wrapper.vm.genVideoCompletedVideoPath).toBe('D:/videos/animated.mp4')
+    expect(wrapper.vm.genVideoCompletedProjectId).toBe('')
+    const viewBtn = document.body.querySelector('[data-testid="hot-topics-gen-video-view"]')
+    const publishBtn = document.body.querySelector('[data-testid="hot-topics-gen-video-publish"]')
+    expect(viewBtn.disabled).toBe(false)
+    expect(publishBtn.disabled).toBe(false)
+
+    pushSpy.mockClear()
+    publishBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    const publishTarget = pushSpy.mock.calls.map(c => c[0]).find(v => v && v.path === '/publish')
+    expect(publishTarget).toBeTruthy()
+    expect(publishTarget.query.type).toBe('video')
+    expect(decodeURIComponent(String(publishTarget.query.video_path))).toBe('D:/videos/animated.mp4')
+    // fix-hot-topics-genvideo-title：run-only 仍不得注入空 content/tags，
+    // 但标题必须有值（AI 标题优先，失败降级原始选题）。
+    expect(publishTarget.query.content).toBeUndefined()
+    expect(decodeURIComponent(String(publishTarget.query.title))).toBe('打工人醒醒！AI又抢活了')
+    expect(publishTarget.query.title_source).toBe('ai')
+
+    wrapper.unmount()
+    el.remove()
+  })
 })
 
 // ─── 收藏选题 tab ───
@@ -1000,7 +1215,8 @@ describe('HotTopics 收藏选题 tab', () => {
     pushSpy.mockClear()
     hotTopicsGetCache.mockResolvedValue({ code: 0, data: { topics: [], fetchedAt: 0, channelStats: {} } })
     hotTopicsFavoriteList.mockResolvedValue({ code: 0, data: [] })
-    document.body.innerHTML = ''
+    pipelineList.mockResolvedValue({ code: 0, data: mockPipelineList })
+    while (document.body.firstChild) document.body.removeChild(document.body.firstChild)
   })
 
   // 根因回归保护：子组件必须自带 scoped 引入共用的列表样式表，否则行布局会再次塌成一行
@@ -1063,6 +1279,25 @@ describe('HotTopics 收藏选题 tab', () => {
     expect(wrapper.vm.genVideoModalOpen).toBe(true)
   })
 
+  // hot-topics-pipeline-picker（2026-10-17）：收藏行复用同一选择器，选流水线即启动
+  it('favorites row exposes the pipeline picker and starts the chosen pipeline', async () => {
+    aiRewrite.mockResolvedValue({ code: 0, data: { success: true, result: '收藏选题改写文案' } })
+    draftSave.mockResolvedValue({ code: 0 })
+    storeGetSetting.mockResolvedValue(null)
+    pipelineStartOrchestrated.mockResolvedValue({ code: 0, data: { success: true, runId: 'run-fav-animated' } })
+    pipelineGetRunContext.mockResolvedValue({ code: 0, data: { runId: 'run-fav-animated', status: { status: 'running', progress: 10 } } })
+
+    const wrapper = await mountFavoritesTab()
+    expect(wrapper.findAll('[data-testid^="hot-topic-favorite-gen-video-picker-"]')).toHaveLength(2)
+    await wrapper.find('[data-testid="hot-topic-favorite-gen-video-picker-toutiao:1"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('[data-testid="hot-topic-gen-video-pipeline-option-toutiao:1-animated-explainer"]').trigger('click')
+    await flushPromises()
+
+    expect(pipelineStartOrchestrated).toHaveBeenCalledWith('animated-explainer', expect.objectContaining({ text: '收藏选题改写文案' }))
+    expect(wrapper.vm.genVideoPipelineName).toBe('animated-explainer')
+  })
+
   it('generate-video disabled while another favorites-row orchestration is busy', async () => {
     aiRewrite.mockImplementation(() => new Promise(() => {}))
     const wrapper = await mountFavoritesTab()
@@ -1117,7 +1352,7 @@ describe('HotTopics heat ranking UI', () => {
     vi.clearAllMocks()
     hotTopicsGetCache.mockResolvedValue({ code: 0, data: { topics: [], fetchedAt: 0, channelStats: {} } })
     hotTopicsFavoriteList.mockResolvedValue({ code: 0, data: [] })
-    document.body.innerHTML = ''
+    while (document.body.firstChild) document.body.removeChild(document.body.firstChild)
   })
 
   async function mountWith(topics) {

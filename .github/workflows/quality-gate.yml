@@ -12,7 +12,6 @@ on:
       - '.editorconfig'
       - '.ccg/**'
       - '.claude/**'
-      - '.hermes/**'
       - '.agents/**'
       - '.quality-rhythm/**'
       - 'openspec/**'
@@ -63,6 +62,8 @@ jobs:
           # 账本 JSON 在 docs-only 白名单里 ⇒ 校验它的门禁不能只待在会被短路的 static-gates。
           # 放在非 PR 早退之前，所以 main push 那一档同样覆盖。
           node --test scripts/check-gate-record-debt.test.js
+          # 引导文案按钮名同步锁的自测（与被测判据同进 changes job，2026-10-17 change: collected-results-fix）
+          node --test scripts/check-locale-button-name-sync.test.js
           # 冻结判据按档拦：PR 档收口成"可见"。动因是 2026-10-16 实测 run 38781654774 ——
           # pull_request 检出的是 main⊕本分支的合并预览，主干每几分钟长一块，PR 档"等于基线"必红。
           # main push 那一档照旧拦，所以锁没被拆松，只是装回它真能成立的位置。
@@ -70,6 +71,10 @@ jobs:
           if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then CARRIER_MODE=visible; fi
           echo "[gate-record-debt] carrier_mode=$CARRIER_MODE event=${GITHUB_EVENT_NAME:-<unset>}"
           node scripts/check-gate-record-debt.js --carrier-mode="$CARRIER_MODE"
+          # 引导文案里引用的按钮名必须与 locale 逐字一致（2026-10-17，change: collected-results-fix）。
+          # 动因：PRD §4.3 阶段引导在文案里手写了按钮名，按钮改名而引导没跟会让用户被指去
+          # 点一个不存在的按钮 —— 此前无判据覆盖。登记表形态（非启发式），详见脚本 REGISTRY。
+          node scripts/check-locale-button-name-sync.js
           # 主干上真实存在过 6 个带着 git 冲突标记的文件（4 篇 stash pop 冲突被整块提交、
           # 2 篇 rebase 只删了左侧七个尖括号那一侧），而此前没有任何判据在看这件事：
           # check-text-encoding-integrity 管控制字节、numstat 管行尾，都对标记免疫。
@@ -82,6 +87,19 @@ jobs:
           # CCG 安全扫描器自身的回归保护：扫描器一旦回退成「静默 0 文件绿灯」
           # 或把 fixtures 当真实高危，verify-security 的结论就不可信了。
           node --test .ccg/skills/tools/verify-security/scripts/security_scanner.test.js
+          # 合并账本单一取源的回归锁（change: gate-record-sync-derived-status）。
+          # 为什么放这里：本 job 无 job 级 if（docs-only 不短路），且这段在非 PR 早退之前 ⇒ PR 与 push 两档都跑。
+          # 派生收口全部依赖这个模块，它错一次影响的是**所有**记录的收口结论，而且失败形态多为静默
+          # （quotepath 开着 ⇒ 非 ASCII 路径键对不上 ⇒ 那条记录永远派生不出；rename 被检测 ⇒ 归属指错提交）。
+          # 6 条变异反证已实测各自红在指名用例（MU-A…MU-F），摘掉任一条口径都不是"少测一项"而是"测了个错的"。
+          node --test scripts/lib/merge-ledger.test.js
+          # 扫描域单一实现的回归锁（#3876 建域、本次把第二处消费者 check-debt-budget 收敛到同一份）。
+          # ① 它测的是"域算得对不对"这一层，两个消费者各自的锁测不到；② 它内含一条"消费者套件必须整份真的跑了"
+          #    的计数锁 —— check-debt-budget.js 原来在文件末尾无条件 main()（会 process.exit），
+          #    任何 require 它的测试都会在导入期被杀掉，而 node:test 把"文件退出 0"报成 pass 1。
+          # 落在这里的理由与 merge-ledger 同：本 job 不被 docs-only 短路，且在非 PR 早退之前。
+          node --test scripts/lib/git-domain.test.js
+          node --test scripts/check-debt-budget.test.js
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "docs-only=false" >> "$GITHUB_OUTPUT"
             echo "docs-only=false (non-PR event: full run)"
@@ -157,6 +175,35 @@ jobs:
         shell: bash
         run: node --test scripts/lib/ccg-gate-security-filter.test.js
 
+      # --- Gate 2c6：竞品缺陷「同型风险」四条静态锁 ---
+      # 动因（2026-10-17）：逆向衍生文档 `derived/竞品缺陷同型风险清单.md` 从竞品 8 个 CRITICAL 抽出 12 类
+      # 同型风险，核到本仓后发现「当前是对的，但没有测试会阻止后来者把它改坏」：
+      #   L1 转义表完整性（竞品 C1：字符类含 `/` 但 map 无 `/` ⇒ 静默替换成 "undefined"）
+      #   L2 while(true) 必有出口（竞品 C2：无界重试 ⇒ Promise 永不 settle）
+      #   L3 catch 不得重调被包裹函数（竞品 X-C1：Promise 永不 settle ⇒ 流程死锁）
+      #   L4 组件内 setInterval 必须配 clearInterval（竞品 X-20 型：定时器不 dispose）
+      # 落点必须在 changes 作业：docs-only PR 会把 static-gates 整个短路（与 Gate 2c2/2c3/2c4/2c5 同一先例）。
+      # 被测模块与测试只 require node 内置，符合本作业无 Install deps 的约束。
+      - name: "Gate 2c6 - Same-type risk locks (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/same-type-risk-locks.test.js
+          node --test scripts/same-type-risk-locks-r2.test.js
+          node --test scripts/same-type-risk-locks-r3.test.js
+          node --test scripts/image-mime.test.js
+          # 共享掩码库自身的回归锁（2026-10-18）：八条锁全部建立在 maskNonCode 之上，
+          # 它错一次就等于八条锁一起瞎。本轮实测它确实瞎过：源码面 311 个文件含
+          # 「正则字面量内出现引号」，其中 164 个掩码被打穿（最坏可见率 0.03），
+          # 八条锁在其上几乎没有覆盖面。本行必须先于上面四条理解（它们全依赖本库）。
+          node --test scripts/lib/code-mask.test.js
+          # 掩码覆盖 A/B 工具自身的锁（2026-10-18）：它证明「判据能看见」这件事本身可信；
+          # 其中一例专测「候选掩得更多必须被判回归」—— 那是这条取证手段的元判据。
+          node --test scripts/lib/mask-coverage-ab.test.js
+          # LLM 改写缓存有界化的回归锁（2026-10-18）：R11 审计面把这两个 Map 判为
+          # 「真实无淘汰缓存」（key = 原始 prompt SHA-256 无界 + 主进程常驻 ⇒ 单调增长）。
+          # 锁的是插入序上限真的在、两个 Map 共用同一常量、且缓存收益未被"修没"。
+          node --test scripts/story2video-llm-cache-bound.test.js
+
       # --- Gate 2c4：CCG 判定器（ccg-review-decider）的判据回归锁 ---
       # 动因（2026-10-15）：该脚本此前**零测试覆盖**（grep 只命中一条注释），
       # 于是两个判据缺陷长期无人发现：
@@ -169,6 +216,16 @@ jobs:
       - name: "Gate 2c4 - CCG decider regression lock (changes job)"
         shell: bash
         run: node --test scripts/ccg-review-decider.test.js
+
+      # --- Gate 2c6：QM-6 评审后端对的单一真源 ---
+      # 动因（2026-10-18）：后端对在仓里被抄成六份字面量，于是"换 critic"有三种旋钮
+      # 全部静默失效而评审照跑、status 照闭环。本锁守解析优先级、两个读取方的逐字对账，
+      # 以及"请求值 vs 实际执行者"这条对账判据的本体。
+      # 落点必须在 changes 作业：scripts/** 在 docs-only 白名单内，放 static-gates 等于
+      # 给判据自己关掉校验（与 Gate 2c2 / 2c3 / 2c4 同一先例）。只 require node 内置模块。
+      - name: "Gate 2c6 - QM-6 review backend single source (changes job)"
+        shell: bash
+        run: node --test scripts/lib/ccg-review-backends.test.js
 
       # --- Gate 2c3：执行记录的 QM-5 行集棘轮 ---
       # 动因（本会话实测）：PR #3477 的记录在多次改写中把「防止再次发生（QM-5 ⑤）」的**行标题吞掉**、
@@ -201,6 +258,17 @@ jobs:
         run: |
           node --test scripts/check-no-brand-residue.test.js
           node scripts/check-no-brand-residue.js
+
+      # --- Gate 12f：跨仓 sidecar 对账判据自测（与 Gate 12 同族接线到 changes job）---
+      # 为什么住 changes 而不是 static-gates：判据本体只 require node 内置模块
+      # （本 job 无 Install deps 也能跑），而它的价值恰恰是「每个 PR 都跑」——
+      # 规则表/向量/金标的改动经常与 openspec/changes/** 文档同批出现，
+      # 放进 static-gates 会被 docs-only 短路，于是「数据漂了」这件事没有判据会跑。
+      # 本步只跑**判据自身的检出能力**（含 0/1/2 三档退出码与 LF 归一化口径）；
+      # 跨仓实跑在 sidecar-parity.yml（需要 clone 另一个仓库，不适合挂在每个 PR 上）。
+      - name: "Gate 12f - Sidecar parity checker self-test (changes job, #2745 同族)"
+        shell: bash
+        run: node --test scripts/check-sidecar-parity.test.js
 
       # --- Gate 12c：平台分类转换器回归锁（与 Gate 12 同族接线到 changes job）---
       # 为什么必须住 changes 而不是 static-gates：
@@ -335,6 +403,42 @@ jobs:
           node scripts/check-precommit-spawn-budget.js scripts/hooks/pre-commit
           node --test scripts/check-precommit-spawn-budget.test.js
 
+      # --- Gate 2b4：「分支内容已进主干」的机械判据回归锁 ---
+      # 动因（2026-10-16 实测）：这条判据此前只以 AGENTS.md 的散文存在，每轮清理由会话临时手写探针执行；
+      # 本轮真实发生过一次「按旧文字判出差量 52/10/5 行，仍把分支删了」——散文挡不住临场自觉，所以给它执行体。
+      # 落点必须是 changes 作业（同 Gate 2b2/2b3 口径：static-gates 带 docs-only 门槛，守门判据落在会被自己
+      # 防的那道短路里的作业，等于给自己关掉校验）。本作业没有 Install deps ⇒ 判据只能 require node 内置模块。
+      - name: "Gate 2b4 - Branch-merged criterion (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/check-branch-merged.test.js
+
+      # --- Gate 2b7：全仓 CI 作业超时常量的取证对账（2026-10-20 起覆盖全部 24 格） ---
+      # 编 2b7 而不是 2b5：#3724（未合并）占用 "Gate 2b5 - CCG evidence anchor"，2b6 已被收敛探针占用，
+      # 同号会在 squash 后撞成两步同名（`check-unwired-tests.js` 的"同名 basename 必须写全相对路径"会读成一条）。
+      # 动因：`timeout-minutes` 这类**无人看管的预算常量**撞死过两趟 main push，丢的是证据不是绿勾。
+      # 2026-10-20 扩面：全仓实测 24 格，此前只有 QG Coverage 一格有人看 ⇒ 加**清单棘轮**
+      # （新增的裸常量、登记项消失都当场红）+ seeded 宽限期（样本还不足的格子限期升级，不是永久豁免）。
+      # 落点同样必须是 changes 作业（判据本体要求 runner 上不装依赖 ⇒ 只用 node 内置模块）。
+      - name: "Gate 2b7 - Gate timeout registry (changes job)"
+        shell: bash
+        run: |
+          node scripts/check-coverage-budget.js
+          node --test scripts/check-coverage-budget.test.js
+
+      # --- Gate 2b6：CCG 收敛出口可达性探针 ---
+      # 编 2b6 而不是 2b5：#3724（未合并）已占用 "Gate 2b5 - CCG evidence anchor"，
+      # 两条合并顺序未知，同号会在 squash 后撞成两步同名（同名 basename 判据会读成一条）。
+      # 落点必须是 changes 作业：它防的是"vendor 引擎行为漂移"，与运行时代码无关，
+      # 放 static-gates 会被 docs-only=true 短路 ⇒ 判据本体对自己的载体关掉校验。
+      # 诚实边界：GitHub runner 上没有 ~/.claude/skills/adversarial-review-loop，
+      # 所以 CI 跑的是「缺引擎 ⇒ rc=2 且点名探针失明」那一档；ladder 读数断言在本机那一档执行。
+      # 两档都必须有产物 —— 缺引擎不 skip、不判绿（见 scripts/ccg-convergence-probe.test.js 头注）。
+      - name: "Gate 2b6 - CCG convergence-exit probe (changes job)"
+        shell: bash
+        run: |
+          node --test scripts/ccg-convergence-probe.test.js
+
       # --- Gate 2c3：CHANGELOG.md「只可增长」棘轮 ---
       # 动因（实测）：b531bdfe7（PR #2884，一个 ai-taste 功能 PR）把 CHANGELOG.md 从
       # 7,474,293 B / 1,133 条整份替换成 9,155 B / 2 条，**丢掉 1,131 条并全绿合入**。
@@ -432,6 +536,14 @@ jobs:
           # 01-docs 忽略规则回归锁（#2792 复盘：「01-docs 递归 .md」全量忽略曾让正式文档
           # 静默不入库，PRD 链接 404；见 apps/desktop/scripts/gitignore-docs.test.js 头注释）
           node --test apps/desktop/scripts/gitignore-docs.test.js
+          # PR-2 §7.1（camofox 依赖接入）与 §7.5（构建期非回环监听断言）各有一个测试文件，
+          # 此前**从未被 CI 执行**：vitest 的 include 是白名单、不含 scripts/**（见
+          # apps/desktop/vitest.config.js 注释"未登记的测试文件一个都不会跑"），而
+          # scripts/check-unwired-tests.js 的 WORKSPACE_COVERED 把整个 apps/ 子树挡在测试域外
+          # （#85 起判据的域取自 git，排除发生在"测试域"这一步，不是靠遍历没走到）
+          # ⇒ 既不被执行、也不被接线棘轮发现（2026-10-16 实测；本目录 7 个兄弟文件都是逐个
+          # 点名接线的，故这里同样显式点名，不做通配）。
+          node --test apps/desktop/scripts/fetch-camofox.test.js apps/desktop/scripts/check-camofox-listen.test.js
           node --test scripts/sync-platform-config.test.js
           node --test scripts/compare-scheduler-models.test.js
           # 会话隔离入口脚本的结构锁：native stderr 捕获不得处在 EAP=Stop 作用域内
@@ -498,6 +610,14 @@ jobs:
           # 判据本体也要在每次 PR 上真被执行一次（--dry-run 不起 vitest，秒级）：
           # 否则 CLI 只有本地手动跑过，会烂成"工具还在、扫描域已经漂"那种装饰性存量。
           node scripts/check-clock-shift-oracle.js --dry-run
+          # 阶段 5.3 / 5.4 两条新门禁（ux-audit-phase34，2026-10-19）。落点选本步骤的理由与上面
+          # check-workflow-structure 完全同一条：**本步骤整体是 shell: bash，任一非零即中止**；
+          # 接进 Gate 3（默认 pwsh、多条命令只有最后一条的 $LASTEXITCODE 决定成败）等于接进装饰门禁。
+          # 判据本体也在每次 PR 上真跑（秒级，纯静态扫 src），否则只会烂成"本地手动跑过一次"的存量。
+          node --test scripts/check-ui-wired.test.js
+          node scripts/check-ui-wired.js
+          node --test scripts/check-field-consumed.test.js
+          node scripts/check-field-consumed.js
 
       # --- Gate 2c: 测试收集接线棘轮 + 此前从未被 CI 收集的锁 ---
       # 本仓不自动收集 scripts/ 与 .github/scripts/ 下的测试（vitest 只管 workspace，
@@ -513,7 +633,17 @@ jobs:
           # start-app 启动链契约：WMI 脱离 + 存活断言 + 双向斜杠匹配（2026-10-16，
           # 用户三次看不到应用，根因是启动链被 agent 会话连坐杀）
           node --test scripts/sync-app.test.js
+          # 锚点热备份新鲜度判据（anchor-backup-latest，2026-10-18）：该 lint 原按目录名
+          # 「字符串降序」选最新快照，而锚点里还有 `seed-*` 基线目录，'s' > '2' ⇒ 基线
+          # 永远胜出、每次都报「25.9 天前」，连刚写完快照的那次也这么报。恒黄的门禁等于
+          # 没人看的门禁（与「装饰性门禁」同型）。锁是行为级的：真起 powershell 打临时
+          # 夹具，判「新快照胜出 / 真陈旧仍报 / 无时间戳快照不得谎报新鲜」三条。
+          node --test scripts/mp-anchor-health.test.js
           node --test scripts/qm1-child-env.test.js
+          # QM-1 打包验证脚本的路径解析锁（fix-qm1-verify-path）：脚本住在仓库根 scripts/，
+          # 产物不在脚本目录。#2985 引入起把 __dirname 当应用目录 ⇒ 脚本从未跑通，
+          # 而 AGENTS 把它当判据真源引用（装饰性门禁同型）。接线锁断言真机脚本必须用解析器。
+          node --test scripts/qm1-paths.test.js
           node --test .github/scripts/check-ipc-bridge.test.js
           node --test scripts/detect-unwired-exports.test.js
           node --test scripts/ensure-desktop-deps.test.js
@@ -1215,7 +1345,17 @@ jobs:
     runs-on: windows-latest
     needs: [changes]
     if: needs.changes.outputs.docs-only != 'true'
-    timeout-minutes: 40
+    # 40 → 60（2026-10-18）：40 这一档实测撞死过两趟 main push（run 39037127191 = PR #3836 的收口证据、
+    # run 39084091986），后果不是"跑挂"而是 main 侧证据永久丢失；同一窗口里成功样本的尾部是 39.4/39.5/39.7，
+    # 也就是**贴着天花板过线**。
+    # 60 → 65（2026-10-19 复测）：60 这一档**没有**被杀过（cancelled 最大 38.9），但真实耗时涨了 ——
+    # 干净窗口（120 趟，在飞 9 趟按「不是漏样」排除）里 success 53 条、尾部 40.6/40.7/40.8/41/41.3/**43.3**，
+    # ceil(43.3 × 1.5) = 65 > 60 ⇒ 60 当时已低于本仓自己那条 ×1.5 规则。窗口同时从 60 扩到 120，
+    # 因为 60 趟窗口里 success 只剩 16 条（< MIN_SAMPLES 20，"样本不够下结论"而不是"预算够用"）。
+    # 数值与依据不写在注释里当散文——由 scripts/gate-timeout-registry.json（24 格唯一真源，
+    # 经 scripts/lib/gate-timeout-registry.js 加载校验）单点持有，scripts/check-coverage-budget.js 每次 PR 对账
+    # （timeout ≥ ceil(floor × SAFETY_MULTIPLIER)、样本量下界、采集日过期、注册值与本行同源、贴脸警报、清单棘轮）。
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1382,13 +1522,76 @@ jobs:
               Write-Host "Running dark pixel suite (to produce the dark renders for Gate 7b)..."
               pnpm.cmd run test:visual:pixel:dark
               $darkExit = $LASTEXITCODE
-              Write-Host "[GATE-7] suite exits: pixel=$pixelExit views=$viewsExit views-supplement=$viewsSuppExit dark=$darkExit"
+
+              # ⛔ 补齐 PR 侧覆盖缺口（2026-10-17，visual-gate-full-coverage）。
+              # 105 例视觉用例的分布是：views 37 + supplementary-views 19 在**本 job** 跑；
+              # workflows 31 + supplementary-workflows 18（合计 **49 例**）此前**只**在
+              # `visual-test.yml` 的 `run-all-visual` 里跑，而那个 workflow 不在 PR 上触发
+              # ⇒ 这 49 例在 PR 侧**完全没有覆盖**（不是"被吞"，是根本没跑）。
+              # 为什么不直接把 `run-all-visual` 整只搬进来：会把已跑过的 56 例再跑一遍、
+              # 且重复付 Playwright 安装 / build:vue / 起 Vite 的准备成本。本 job 这三样都已就绪，
+              # 只补跑缺的两套是成本最低、覆盖最全的接法（CI 侧新增耗时以实跑为准，未预先声称）。
+              # 退出码照旧两条都打出来：「套件崩了」不得伪装成「本次没产图」。
+              Write-Host "Running workflow suites (to cover the 49 cases only visual-test.yml used to run)..."
+              pnpm.cmd run test:workflow
+              $workflowsExit = $LASTEXITCODE
+              pnpm.cmd run test:workflow:supplement
+              $workflowsSuppExit = $LASTEXITCODE
+
+              Write-Host "[GATE-7] suite exits: pixel=$pixelExit views=$viewsExit views-supplement=$viewsSuppExit dark=$darkExit workflows=$workflowsExit workflows-supplement=$workflowsSuppExit"
+
+              # ⛔ 校验型失败必须阻断（2026-10-17，visual-checks-must-block）。
+              # 上面 1334-1342 的注释说「views 两套的比较结果不另设门禁」，理由是 Gate 7b 的
+              # 「基线 == 本次渲染，0 px」严格强于它们自己的 6% 阈值 —— 但那**只对像素域成立**。
+              # 这两套实际跑的是 runViewTest：截图 + 逐条 `checks` 选择器断言，**不做像素比对**，
+              # 所以 Gate 7b 对它们**没有任何判定面**。
+              # 实测后果（判据取产物，非推断）：main 上 `collection-confirm-dialog` 断言失败
+              #（页面区块标题 / 删除入口消失）在 Gate 7 里只留一行日志
+              # `suite exits: ... views-supplement=1`，QG Visual 照常 pass；唯一红的地方是
+              # `visual-test.yml` —— 而它不在 PR 上跑、也不是 required 上下文，于是连红 60+ 次。
+              # 判据取「两轮都红」：选择器断言本身是确定性的，但为不让偶发采集抖动变成所有 PR 的
+              # 常量红，非零就当场重跑一次，两次都非零才阻断（与 Gate 7b 的两轮甄别同一哲学）。
+              $checksFailSuites = @()
+              if ($viewsExit -ne 0) {
+                Write-Host "[GATE-7] views 套件 rc=$viewsExit —— 按两轮甄别重跑一次"
+                pnpm.cmd run test:visual
+                $viewsRetryExit = $LASTEXITCODE
+                Write-Host "[GATE-7] views 重跑 rc=$viewsRetryExit"
+                if ($viewsRetryExit -ne 0) { $checksFailSuites += 'views' }
+              }
+              if ($viewsSuppExit -ne 0) {
+                Write-Host "[GATE-7] views-supplement 套件 rc=$viewsSuppExit —— 按两轮甄别重跑一次"
+                pnpm.cmd run test:visual:supplement
+                $viewsSuppRetryExit = $LASTEXITCODE
+                Write-Host "[GATE-7] views-supplement 重跑 rc=$viewsSuppRetryExit"
+                if ($viewsSuppRetryExit -ne 0) { $checksFailSuites += 'views-supplement' }
+              }
+              # 2026-10-17 补齐的两套同样走「两轮甄别再阻断」——它们是同一类确定性断言
+              #（`runWorkflowTest`：截图 + checks），此前在 PR 侧**根本没跑**，谈不上拦不拦。
+              if ($workflowsExit -ne 0) {
+                Write-Host "[GATE-7] workflows 套件 rc=$workflowsExit —— 按两轮甄别重跑一次"
+                pnpm.cmd run test:workflow
+                $workflowsRetryExit = $LASTEXITCODE
+                Write-Host "[GATE-7] workflows 重跑 rc=$workflowsRetryExit"
+                if ($workflowsRetryExit -ne 0) { $checksFailSuites += 'workflows' }
+              }
+              if ($workflowsSuppExit -ne 0) {
+                Write-Host "[GATE-7] workflows-supplement 套件 rc=$workflowsSuppExit —— 按两轮甄别重跑一次"
+                pnpm.cmd run test:workflow:supplement
+                $workflowsSuppRetryExit = $LASTEXITCODE
+                Write-Host "[GATE-7] workflows-supplement 重跑 rc=$workflowsSuppRetryExit"
+                if ($workflowsSuppRetryExit -ne 0) { $checksFailSuites += 'workflows-supplement' }
+              }
 
               # 退出码 3 = 有视图**从未渲染出来**（就绪超时）：确定性的路由/选择器故障，
               # Gate 7b 的两轮 flake 甄别对它不适用，必须在本步骤当场拦。
-              # 退出码 1 = 像素/校验类失败，照旧只留痕、交给 Gate 7b —— 把它也接成阻断，
-              # 会把历史上确实存在的采集抖动变成所有 PR 的常量红（#2914 同 sha 两次 attempt
-              # 一档红一档绿即现场；Gate 7b 的两轮机制正是为此而生）。
+              # 退出码 1 的处置按**套件类别**分流（2026-10-17 修正，原先一律"只留痕"是漏判）：
+              #   · `pixel` / `dark`（像素域）→ 只留痕，交给 Gate 7b 的两轮甄别。理由成立：
+              #     Gate 7b 判「基线 == 本次渲染，0 px」严格强于 6% 阈值，且像素采集确有抖动
+              #     （#2914 同 sha 两次 attempt 一档红一档绿即现场）。
+              #   · `views` / `views-supplement`（**校验域**：runViewTest 的 checks 断言，不做像素比对）
+              #     → 上面已按两轮甄别接成阻断。Gate 7b 对它们**没有任何判定面**，
+              #     一律"只留痕"等于这两个套件的失败永远没有阻断面。
               $notReadySuites = @()
               if ($pixelExit -eq 3) { $notReadySuites += 'pixel' }
               if ($viewsExit -eq 3) { $notReadySuites += 'views' }
@@ -1413,21 +1616,44 @@ jobs:
             }
           }
 
+          # 判定值先一次算好、步骤结尾显式 exit（2026-10-19，branch: ux-audit-phase34）。
+          # 动因是现场而不是推断：PR #3992 的 QG Visual 报红，而该步骤日志末行是
+          # 末行是"[GATE-7] 全部通过"那条 Write-Host —— 原先四条分支之外**没有任何 exit**，通过路径走到
+          # 步骤末尾就结束；pwsh 步骤的退出码取自**最后一条原生命令**的残留 $LASTEXITCODE，而本
+          # 步骤 finally 里清理 dev server 的 `taskkill /PID ... /T /F` 在进程已退出时返回非零，
+          # 于是"全部通过"被一个清理动作判了红。
+          # 优先级与改动前逐字一致：就绪超时(3) > 像素域($pixelExit) > 校验型断言(1) > agent 报告。
+          # 改成 if/elseif 单链是为了把"判定"与"退出"分开：判定一次算完，出口只有一个，
+          # 通过路径不会再依赖任何原生命令的余值。
+          # 不参与本判定的既有语义未变：$darkExit 与各套件退出码仍是留痕（深色对比度由 Gate 7c 单独判；
+          # 校验域两轮甄别已把非零收进 $checksFailSuites，那才是判定面）。
+          $gateVerdict = 0
           if ($suitesNotReady -ne '') {
             Write-Host "[GATE-7] FATAL: 视图从未渲染出来（就绪超时）— 套件: $suitesNotReady"
             Write-Host "[GATE-7] 这不是像素抖动：路由或就绪选择器指错了节点，两轮采集甄别救不了它。"
             Write-Host "[GATE-7] 排障入口：套件日志的 [VISUAL-READY] 行点名了具体视图。"
-            exit 3
-          }
-          if ($pixelExit -ne 0) {
+            $gateVerdict = 3
+          } elseif ($pixelExit -ne 0) {
             Write-Host "[GATE-7] Pixel diff failed - see artifacts for details"
-            exit $pixelExit
-          }
-          if ($judgeExit -ne 0) {
+            $gateVerdict = $pixelExit
+          } elseif ($checksFailSuites -and $checksFailSuites.Count -gt 0) {
+            # 校验型断言两轮均失败 ⇒ 阻断。这一格是 2026-10-17 之前**完全缺失**的判定面
+            #（详见上面 $checksFailSuites 处的注释）：页面区块 / 删除入口这类 UI 契约破坏
+            # 既不进像素域、也就不会被 Gate 7b 判到，只能靠这里拦。
+            Write-Host "[GATE-7] FATAL: 校验型断言两次均失败 — 套件: $($checksFailSuites -join ',')"
+            Write-Host "[GATE-7] 这不是像素抖动：runViewTest 的 checks 是「页面区块/入口是否存在」的确定性断言。"
+            Write-Host "[GATE-7] 排障入口：该套件日志里点名了失败用例与缺失的 check 名。"
+            $gateVerdict = 1
+          } elseif ($judgeExit -ne 0) {
             Write-Host "[GATE-7] Agent visual report generation failed"
-            exit $judgeExit
+            $gateVerdict = $judgeExit
+          }
+          if ($gateVerdict -ne 0) {
+            exit $gateVerdict
           }
           Write-Host "[GATE-7] All visual tests passed"
+          # 显式 0：通过路径的退出码必须来自本判据，而不是 finally 里 taskkill 的残留值。
+          exit 0
 
       # Gate 7c：深色模式文字对比度（2026-10-07，Wave 0.4）。
       #

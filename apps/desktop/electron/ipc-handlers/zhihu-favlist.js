@@ -21,6 +21,8 @@ const ZhihuFavlistService = require('../services/zhihu-favlist-service')
 const BatchRateController = require('../services/batch-rate-controller')
 const { classifyZhihuUrl, buildUnifiedFavItems, normalizeFavItem } = require('../services/zhihu-fav-core')
 const credential = require('../services/zhihu-credential')
+// 改写 payload 注入桌面「模型设置」默认 llm（Python /aggregation/rewrite 只读 env 会误报 LLM_KEY_MISSING）
+const { applyLlmToBody } = require('../services/llm-runtime-config')
 
 /** 进行中批量任务的取消标记（单例：同类型任务同时只允许一个） */
 const activeBatches = { collect: null, rewrite: null, favBatch: null }
@@ -55,7 +57,7 @@ function rememberEntryMeta (url, meta) {
  * }} deps
  */
 function registerHandlers (ipcMain, deps) {
-  const { store, urlCollector, pythonBridge, log, rateControllerFactory } = deps
+  const { store, urlCollector, pythonBridge, log, rateControllerFactory, modelProviderManager } = deps
   const logger = log || { info: () => {}, warn: () => {}, error: () => {}, notify: () => {} }
   const svc = new ZhihuFavlistService({ log: logger })
   // rateControllerFactory：测试注入快速控制器（跳过真实 8s 延迟）；生产用默认参数
@@ -142,13 +144,16 @@ function registerHandlers (ipcMain, deps) {
     try {
       if (!arg || !Array.isArray(arg.contents)) return { code: -2, message: '缺少内容列表' }
       if (activeBatches.rewrite) return { code: -3, message: '已有批量改写任务进行中' }
+      const resolved = applyLlmToBody({}, modelProviderManager, logger)
+      if (resolved.shortCircuit) return resolved.shortCircuit
+      const llm = resolved.body.llm
       const signal = { cancelled: false }
       activeBatches.rewrite = signal
       const ctrl = makeController({ baseIntervalMs: 3000, jitterMs: 2000 })
       const r = await ctrl.run(arg.contents, async (item) => {
-        const res = await pythonBridge.requestBackend('POST', '/aggregation/rewrite', {
-          content: item.content, style: arg.style || '轻松易懂', length: arg.length || 'keep',
-        })
+        const body = { content: item.content, style: arg.style || '轻松易懂', length: arg.length || 'keep' }
+        if (llm) body.llm = llm
+        const res = await pythonBridge.requestBackend('POST', '/aggregation/rewrite', body)
         const ok = res && res.result_content
         return { ok: Boolean(ok), data: res, retryable: false }
       }, {
@@ -215,14 +220,55 @@ function registerHandlers (ipcMain, deps) {
   }
 
   /**
-   * 单条改写：成功返回改写稿字符串；失败/空返回 null（调用方回退原文）。
+   * 单条改写：成功返回改写稿字符串；失败返回 { error }（调用方回退原文）。
+   *
+   * 失败原因可诊断（2026-10-17，change: collected-results-fix）：
+   * 旧版调用方 `catch {}` 把真实异常吞掉，用户只看到「改写失败用原文」却不知道是
+   * Python 后端没起（ECONNREFUSED）、接口 500 还是返回了空结果 —— 三种情况对应三种
+   * 用户该做的事（起后端 / 看日志 / 换风格重试）。因此把失败原因以字符串形式抛给调用方：
+   *   - 成功：返回改写稿（error 为 undefined）
+   *   - 接口异常：error = 异常 message（截断 200 字符）
+   *   - 返回空 result_content：error = 明确的「空结果」说明
+   *
+   * 两道护栏（QM-6 评审 #1/#6，2026-10-17）：
+   *   ① 非 Error 抛出值（字符串/对象）也要有可读摘要，不能产出 "[object Object]"；
+   *   ② 摘要里的内网端点（127.* / localhost / 内网 IP:端口）替换为通用说法 ——
+   *      完整原文仍在 log.warn，UI 不暴露内部拓扑。
+   *
+   * 2026-10-18（fav-force-recollect 自评）：脱敏逻辑抽成 sanitizeDiagText 供采集失败
+   * 的 reason 复用 —— reason 同样直传 UI（进度行 + 结果徽标），暴露面与 rewriteError 同级。
    */
-  async function rewriteOne (pythonBridge, content, style) {
-    const res = await pythonBridge.requestBackend('POST', '/aggregation/rewrite', {
-      content, style: style || '轻松易懂', length: 'keep',
-    })
+  /**
+   * 诊断文本脱敏 + 截断：内网 IP/localhost 端点替换为通用说法，保留可读性。
+   * @param {string} text
+   * @returns {string} ≤200 字符
+   */
+  function sanitizeDiagText (text) {
+    return String(text)
+      .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?/g, '后端服务')
+      .replace(/\blocalhost(?::\d+)?/gi, '后端服务')
+      .slice(0, 200)
+  }
+
+  function summarizeRewriteError (e) {
+    let msg
+    if (e && typeof e === 'object' && typeof e.message === 'string' && e.message) msg = e.message
+    else if (typeof e === 'string') msg = e
+    else { try { msg = JSON.stringify(e) } catch { msg = String(e) } }
+    // 内网端点脱敏 + 截断（单一实现见 sanitizeDiagText）
+    return sanitizeDiagText(msg)
+  }
+
+  async function rewriteOne (pythonBridge, content, style, llm) {
+    let res
+    try {
+      const body = { content, style: style || '轻松易懂', length: 'keep', ...(llm ? { llm } : {}) }
+      res = await pythonBridge.requestBackend('POST', '/aggregation/rewrite', body)
+    } catch (e) {
+      return { error: summarizeRewriteError(e) }
+    }
     const out = res && typeof res.result_content === 'string' ? res.result_content.trim() : ''
-    return out || null
+    return out || { error: '改写接口返回空结果（result_content 为空），请查看后端日志或换个改写风格重试' }
   }
 
   ipcMain.handle('zhihu-fav-batch:run', async (event, arg) => {
@@ -238,6 +284,8 @@ function registerHandlers (ipcMain, deps) {
       const signal = { cancelled: false }
       activeBatches.favBatch = signal
       const { urlCollector, pythonBridge, imageLocalizer } = deps
+      // 默认 llm 只解析一次；解析不到不阻断采集编排（改写失败仍回退原文）
+      const rewriteLlm = applyLlmToBody({}, modelProviderManager, logger).body.llm
       const forceRecollect = arg.forceRecollect === true
       // QM-6 M4 修复：消费渲染层传来的 collectedUrls（collected_items 的 sourceUrl 全集），
       // 与进程内 knownEntryMeta 取并集——knownEntryMeta 重启即失，跨会话去重靠它兜底
@@ -289,20 +337,30 @@ function registerHandlers (ipcMain, deps) {
           return { ok: true, duplicate: true }
         }
         // ── 采集 ──
+        // forceRefresh：勾「包含已采集（强制重采）」时必须绕过 L6 内容缓存，否则缓存命中返回
+        // 空壳 → 下层判 unsubstantive → 表现为「勾了也没用」（2026-10-18，fav-force-recollect）。
         let result
         try {
-          result = await urlCollector.collect(url, { manual: false })
+          result = await urlCollector.collect(url, { manual: false, forceRefresh: forceRecollect })
         } catch (e) {
           stats.failed++
-          sendProgress(event, { phase: 'done', index: idx, total, url, kind, result: { ok: false, error: 'collect-throw' } })
+          const throwReason = e && e.message ? sanitizeDiagText(e.message) : '采集过程抛出异常'
+          sendProgress(event, { phase: 'done', index: idx, total, url, kind, result: { ok: false, error: 'collect-throw', reason: throwReason } })
           return { ok: false, error: e && e.message ? e.message : String(e), retryable: false }
         }
         if (!result || result.success !== true || !isSubstantive(result)) {
           // cache_hit 返回 {success:true, title:'', content:''} 也在此判失败（防空壳，PRD §3.3.4）
           stats.failed++
-          const reason = result && result.reason === 'cache_hit' ? '重复缓存命中' : '内容不可提取'
-          sendProgress(event, { phase: 'done', index: idx, total, url, kind, result: { ok: false, error: 'unsubstantive' } })
-          return { ok: false, error: reason, retryable: false }
+          // 失败原因必须可归因（2026-10-18，fav-force-recollect）：done 事件此前只有 code
+          // （unsubstantive），渲染层无从解释，用户只看到「完成」却没有结果。
+          // 优先级：缓存命中说明 > 采集器自带 error > 泛化兜底。
+          const reason = result && result.reason === 'cache_hit'
+            ? '重复缓存命中（内容缓存已有该 URL；勾「包含已采集（强制重采）」可绕缓存重采）'
+            : (result && typeof result.error === 'string' && result.error.trim()
+                ? sanitizeDiagText(result.error.trim())
+                : '内容不可提取')
+          sendProgress(event, { phase: 'done', index: idx, total, url, kind, result: { ok: false, error: 'unsubstantive', reason } })
+          return { ok: false, error: reason, reason, retryable: false }
         }
         // ── 图片本地化（C1：注入 localizer 且 imageLocalization!==false 时启用；失败回退原链）──
         const images = []
@@ -316,11 +374,17 @@ function registerHandlers (ipcMain, deps) {
           }
         }
         // ── 自动改写（D2：失败/空结果回退原文，条目标注）──
-        let rewritten
+        // 失败原因不再吞掉（2026-10-17）：rewriteOne 以 { error } 形态带出原因摘要，
+        // 落条目 rewriteError + done 事件，进度行与结果区才能显示「为什么失败」。
+        let rewritten = null
+        let rewriteError
         try {
-          rewritten = await rewriteOne(pythonBridge, result.content, arg.rewriteStyle)
-        } catch {
-          rewritten = null
+          const r1 = await rewriteOne(pythonBridge, result.content, arg.rewriteStyle, rewriteLlm)
+          if (r1 && r1.error) rewriteError = r1.error
+          else if (typeof r1 === 'string' && r1) rewritten = r1
+        } catch (e) {
+          // 兜底：rewriteOne 自身不该抛，但真抛了也不能让整条采集挂掉（同 summarize 规则）
+          rewriteError = summarizeRewriteError(e)
         }
         let rewrittenContent
         let rewriteFailed = false
@@ -329,6 +393,7 @@ function registerHandlers (ipcMain, deps) {
         } else {
           rewriteFailed = true
           stats.rewriteFailed++
+          if (rewriteError) log.warn('[zhihu-fav-batch] rewrite failed for ' + url + ': ' + rewriteError)
         }
         // ── 入库（forceRecollect 覆盖保留原 id/createdAt）──
         const prev = knownEntryMeta.get(url)
@@ -352,13 +417,14 @@ function registerHandlers (ipcMain, deps) {
           imageFallbacks,
           rewrittenContent,
           rewriteFailed,
+          rewriteError: rewriteError || undefined,
           batchId: typeof arg.batchId === 'string' ? arg.batchId : undefined,
         })
         stats.completed++
         // ── done 边界 ──
         sendProgress(event, {
           phase: 'done', index: idx, total, url, kind,
-          result: { ok: true, rewriteFailed, images: images.length, fallbacks: imageFallbacks.length },
+          result: { ok: true, rewriteFailed, rewriteError: rewriteError || undefined, images: images.length, fallbacks: imageFallbacks.length },
         })
         return { ok: true, data: items[items.length - 1], rewriteFailed }
       }, {

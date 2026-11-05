@@ -1,0 +1,14 @@
+{
+  "id": "video-history-card-enhance",
+  "title": "视频创作历史记录任务卡片增强",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "frontend",
+  "currentPhase": "completed",
+  "nextAction": "已完成，由 video-history-card-detail task 在 PR #1048 中交付",
+  "createdAt": "2026-08-20T10:16:00Z",
+  "completedAt": "2026-08-20T10:30:00Z",
+  "supersededBy": "video-history-card-detail",
+  "branch": "codex/video-history-card-enhance"
+}

@@ -1,0 +1,12 @@
+{
+  "id": "account-page-quality-fix",
+  "title": "账号管理页10项质量修复",
+  "status": "completed",
+  "complexity": "L",
+  "risk": "high",
+  "domain": "frontend+backend",
+  "currentPhase": "completed",
+  "nextAction": "归档",
+  "createdAt": "2026-09-04T08:55:45Z",
+  "branch": "fix/account-page-quality"
+}

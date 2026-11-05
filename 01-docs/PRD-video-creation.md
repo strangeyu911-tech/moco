@@ -130,6 +130,8 @@ Windows 安装环境中的 Python、依赖、服务启动和真实接口验收�
 
 | 日期 | 范围 | 核心内容 | 主文档 |
 |------|------|----------|--------|
+| 2026-10-18 | 克隆音色本地样本完整性核验 + 生成前置守卫 | 故事讲述「声音」：`listClones` 对每条克隆做本地样本磁盘对账（失效标记 `invalidReason=invalid_voice_id 或 sample_storage_missing`），既有「已失效，请重新克隆」通道自动生效；新增只读 `getCloneVoiceStatus` 供生成前置守卫；`generate_assets` 在任何图片/视频/旁白调用前 fail fast（`VOICE_CLONE_UNAVAILABLE`），运行期全部 TTS 因克隆音色不可用时聚合为单条可操作提示；`summarizeAssetFailures` 相同错误去重 + 场景区间。详见 `01-docs/PRD-S2V-VOICE-CLONE-INTEGRITY-2026-10-18.md` 与总 PRD §7.1.16.4 | 总 PRD 7.1.16.4 / OpenSpec story2video-voice-clone-integrity |
+| 2026-10-18 | 语音模型由程序与运营决定（去除「语音模型」下拉） | 故事讲述/图片轮播「声音选项」不再渲染「语音模型」下拉：用户只选**能力提供方**，具体 Model ID 由程序按运营中心配置的默许模型解析（`resolveVoiceModelForProvider`，四级口径与主进程 `resolveProviderDefaultModel` 逐项等价并用跨层一致性测试锁住）；运营中心 `capability_models` 从「仅多模态」扩展到**全类别**（单能力服务商按自身类别一项），新增「能力默认模型总览」卡片与 `GET /api/v1/model-presets/capability-overview` 端点，保存时校验能力默认模型必须 ∈ 模型列表；启动迁移为存量单能力预设幂等回填 `capability_models[category] = default_model`；`s2vConfig.voiceModel` 字段保留（IPC/运行快照仍需要）但不再由用户编辑，历史快照陈旧值静默归一。详见 `01-docs/PRD-S2V-VOICE-MODEL-PROGRAM-RESOLVED-2026-10-18.md` | PRD-S2V-VOICE-MODEL-PROGRAM-RESOLVED / S2V-PIPELINE-PAGE-UX §4.3.1 |
 | 2026-10-17 | 流水线进度浮层统一 + 四按钮完成出口 | 视频创作页与热门选题页的流水线进度浮层改成同一套 footer（`UiButton` 单一来源），固定【查看】【去发布】【后台运行】【取消】四个按钮；【查看】【去发布】初始灰显，仅本次 run 成功并取得成片后解锁；**成功后浮层保持打开、不再自动跳转结果页**（取代 2026-08-21 的「完成即跳转」口径），由用户显式选择出口：【查看】→ `/create?view=history` 并定位「已完成」标签，【去发布】→ `/publish` 视频模式预填充（`buildPublishFromProject` + `publishDataToQuery`，run-only 记录退化为只带 `video_path`）。后台运行/取消语义不变（不调 `pipelineCancel`、检查点禁止后台化）。详见 `01-docs/PRD-VIDEO-PIPELINE-PROGRESS-MODAL-2026-10-17.md` | PRD-PIPELINE-MODAL / OpenSpec unify-video-pipeline-progress-modal |
 | 2026-08-24 | 克隆音色跨运行恢复 + 图片轮播编码预算 | 供应商侧失效克隆音色重克隆成功后，只在当前用户、当前 provider/model 的本地目录中以新 ID 替换旧 ID；仍指向旧 ID 的偏好同步迁移，迁移故障不阻断本次旁白重试。图片轮播 zoompan 单段编码预算纳入 workScale² 工作画布成本，2x→1.5x→1x 每次降档独立重算。PR #1143。详见本节 3.1.4.2、3.1.36 | PRD 3.1.4.2 / 3.1.36 / story2video-voice-recovery |
 | 2026-08-21 | 流水线启动前台跟踪 + 独立历史页「已中断」对齐 |
@@ -597,7 +599,7 @@ locale key；未知内部 ID 只能安全回退为原始 ID，不能以 slug 标
 | 层级 | 权威实现 | 输出与降级合同 |
 |------|----------|----------------|
 | 场景层 | `smart-sentence-splitter` 8002 | 正常响应的 `scenes` 是图片、视频提示词和逐场景 TTS 的唯一边界；Multi-Publish 不得再次改写。仅 `ECONNREFUSED`、`ETIMEDOUT`、`ECONNRESET`、服务未运行等不可用错误可使用本地场景降级；业务错误或缺失 `scenes` 的非法响应必须失败 |
-| 字幕层 | `smart-sentence-splitter` 8002（`config.subtitle`）+ 本地 v1.2.3 镜像 | 每个场景的 `text` 独立切分，目标每页 8-15 字；**词边界感知（v1.2.3）**：无标点切分/平衡切分优先不劈词（`扶余国`/`电视剧`/`复杂`/`空白一片`/`蒙古`/`江南`/`包税人`/`大汗` 等），`no_cut_bigrams` 项按任意长度短语解释，`subtitle_min_chars/subtitle_max_chars/subtitle_timing` 经 stage-executor 透传为 8002 `config.subtitle.min_chars_per_block/max_chars_per_block/time_calculation_method`；8002 在线字幕在归一化层必须先通过顺序连续覆盖与短语边界质量门，未通过时该场景整体回退本地并记录 `fallbackReason`；保护短语完整优先于 `max_chars` 超长配置；三端（Python/TS/JS）逐字一致；字幕不得跨越场景，按顺序拼接后必须等于该场景规范化文本；**语义引导词（v1.2.4）**：`已经`/`依然` 等成词副词优先在副词前切分，5-6 字语义短尾在共享向量 `short_block_exceptions` 声明 |
+| 字幕层 | `smart-sentence-splitter` 8002（`config.subtitle`）+ 本地 v1.2.3 镜像 | 每个场景的 `text` 独立切分，目标每页 8-15 字；**词边界感知（v1.2.3）**：无标点切分/平衡切分优先不劈词（`扶余国`/`电视剧`/`复杂`/`空白一片`/`蒙古`/`江南`/`包税人`/`大汗` 等），`no_cut_bigrams` 项按任意长度短语解释，`subtitle_min_chars/subtitle_max_chars/subtitle_timing` 经 stage-executor 透传为 8002 `config.subtitle.min_chars_per_block/max_chars_per_block/time_calculation_method`；8002 在线字幕在归一化层必须先通过顺序连续覆盖与短语边界质量门，未通过时该场景整体回退本地并记录 `fallbackReason`；保护短语完整优先于 `max_chars` 超长配置；三端（Python/TS/JS）逐字一致；字幕不得跨越场景，按顺序拼接后必须等于该场景规范化文本；**语义引导词（v1.2.4）**：`已经`/`依然` 等成词副词优先在副词前切分，5-6 字语义短尾在共享向量 `short_block_exceptions` 声明；**短语边界（v1.3）**：无标点长块硬切优先落在规则表 `word_split.phrase_boundary.pairs` 登记的显式成对短语右边界（块以 `left` 逐字结尾且下一字符命中 `next`），仅单侧命中不构成边界；与优先级标点等价、在 Step 3 累积阶段兑现（不等 MAX 兜底退化为算术裸切）；头块允许放宽到 `min_chars - min_head_relax`（默认 2），放宽块须显式声明 `short_block_exceptions`；规则表缺省该段时行为与 v1.2 一致 |
 | 可观测性 | 运行结果与项目清单 | 每个场景持久化 `sceneSource`、`subtitleSource`、`degraded`、`fallbackReason`、`subtitleBlocks` 和 `subtitleTimeline`；`tier_used=tier3_rule` 仍表示经过 8002，只是 sidecar 内部选择规则层，不等于本地降级 |
 
 Story2Video 的 `target_duration/base_words_per_second/speech_rate/min_words/max_words` 必须转换为
@@ -1873,11 +1875,18 @@ SettingsDialog 关闭（App.vue @close）
 **合同**：
 
 1. **库存储**：主进程 `services/story2video-bgm-library.js`，库目录 `userData/story2video-bgm/`，索引 `library.json` 临时文件 + rename 原子写；条目字段 `{ id, name, path, createdAt }`；该目录加入 `getAllowedMediaRoots()` 白名单（`story2video-paths.js`），compose 的 `resolveReadableMediaFile(path, { kind: 'bgm' })` 校验可过。
-2. **IPC**：`story2video:bgm-library-list / add / rename / delete` 四个通道，均走 `withSenderCheck` + 参数校验（id/name 空串拒绝）；`add` 复用媒体导入的路径解析与受控目录复制语义（Windows 占用 ≤3 次有界重试），失败透传细分提示（格式 / 大小 / 不可读 / 路径未解析）。
-3. **权限**：四通道加入 PUBLIC_CHANNELS（未登录可用，与媒体导入一致）；preload 暴露 `story2videoBgmLibraryList/Add/Rename/Delete`，`Add` 复用 `resolveFilePath`。
-4. **UI（CreateView.vue）**：BGM 配置区改为 `<select data-testid="s2v-bgm-select">`——空选项「不使用背景音乐」+ 素材库条目 + 历史路径兼容选项（未入库时显示「已选音频（未入库）」）；「管理背景音乐」按钮打开素材库弹窗（UiModal，Teleport to body）：添加（隐藏 file input，成功后自动选中并清空 input 支持连续选择）、行内重命名（Enter 保存 / Esc 取消）、删除（二次确认弹窗，删除当前选中项时回退为「不使用背景音乐」）。
+2. **IPC**：`story2video:bgm-library-list / add / rename / delete` 四个通道，均走 `withSenderCheck` + 参数校验（id/name 空串拒绝）；`add` 复用媒体导入的路径解析与受控目录复制语义（Windows 占用 ≤3 次有界重试），失败透传细分提示（格式 / 大小 / 不可读 / 路径未解析）。**2026-10-17 增补**：新增只读核验通道 `story2video:bgm-library-status`（入参 `{ filePath }`，非空且 ≤4096），返回 `{ path, exists, readable, size, extension, inLibrary, libraryItemId, reason }`；判定顺序为入参 → 绝对路径 → 扩展名（stat 之前拒绝）→ `lstat` → 类型 → 空文件/超 15MB → 允许媒体根 → `resolveReadableMediaFile` 复核 → 库内命中，`reason ∈ ok|invalid_argument|format_unsupported|missing|not_a_file|size_exceeded|not_allowed|unreadable`。
+3. **权限**：五通道（含 status）加入 PUBLIC_CHANNELS（未登录可用，与媒体导入一致）；preload 暴露 `story2videoBgmLibraryList/Add/Rename/Delete/Status`，`Add` 复用 `resolveFilePath`。
+4. **UI（CreateView.vue / S2vConfigPanels.vue）**：BGM 配置区位于「声音」折叠分组（2026-10-17 自「画面」归位），为 `<select data-testid="s2v-bgm-select">`——空选项「不使用背景音乐」+ 素材库条目 + 历史路径兼容选项；历史选项按主进程只读核验结果切换文案（未入库/未入库但文件可用/文件已丢失/无法使用），下方状态区提供【加入素材库】（可用时）/【清除背景音乐选择】（丢失或不可用时）/【重新检查】（无法核验时）；「管理背景音乐」按钮打开素材库弹窗（UiModal，Teleport to body）：添加（隐藏 file input，成功后自动选中并清空 input 支持连续选择）、行内重命名（Enter 保存 / Esc 取消）、删除（二次确认弹窗，删除当前选中项时回退为「不使用背景音乐」）。
 5. **i18n**：所有用户可见文案 zh/en 成对新增 `create.story2video.bgmLibrary.*` 与 `story2video.bgm_library_*`。
 6. **验收**：添加 → 列表 +1 且自动选中；重命名 → 列表刷新且退出编辑态；删除 → 列表 -1，删除选中项时 `bgmPath` 回退空；历史 BGM 路径不在库时保留为独立选项、入库后不再显示；服务层单测（16 例）+ 渲染端用例 + preload/IPC 测试全部通过。
+
+**2026-10-17 增补（s2v-bgm-legacy-repair：分组归位 + 历史音频存在性修复）**
+
+7. **分组归属**：「背景音乐」与「背景音乐音量」必须位于「声音」折叠区（音色 ID 之后、音色克隆面板之前），「画面」折叠区不得再包含二者；optionKey `voice.bgm` / `voice.bgmVolume` 与 `data-testid` 保持不变；`S2V_SUMMARY_FIELDS.voice` 纳入 `bgmPath` / `bgmVolume`，`s2vSectionSummary('voice')` 追加背景音乐片段（库内曲名 / 历史音频 / 文件已丢失 / 不可用 / 无背景音乐）。
+8. **历史路径状态与修复**：渲染层状态机 `idle/checking/available/missing/unusable/unknown`；`available` 提供【加入素材库】（复用 `bgm-library-add`，成功后自动选中库内新路径并复位状态）；`missing`/`unusable` 提供【清除背景音乐选择】（`bgmPath=''` 并复位）；`unknown` 提供【重新检查】且失败开放。历史 `bgmPath` 在用户显式操作前不清空、不改写；核验请求带代际，旧响应不得覆盖新路径。
+9. **启动门禁**：`missing`/`unusable` 时 `canStartPipeline=false`，`pipelineBlockedReason` 依次给 `blockedReason.bgmLost` / `bgmUnusable`；`handleStartPipeline` 在有历史路径时先 `await` 一次核验；`unknown` 永不阻断。compose 的 `bgmSkipped` 降级语义保留为最后防线。
+10. **验收增补**：面板测试断言分组归属与三种状态渲染；壳测试断言 missing 阻断+清除恢复、adopt 后自动选中、unknown 不阻断、声音摘要含 BGM；服务层 `inspectPath` 判定矩阵 8 例、IPC 2 例、preload/权限 1 例、composable 6 例；locale zh/en 成对且无新增硬编码中文。完整合同见 `01-docs/PRD-S2V-BGM-VOICE-SECTION-LEGACY-REPAIR-2026-10-17.md`。
 
 ### 3.1.26 视频任务编辑页场景多素材选择与再次合成（2026-08-14；2026-08-20 布局与交互修订）
 
@@ -2892,7 +2901,131 @@ story2video-compose 的创作配置使用五个可折叠区：基础、外观、
 - StageProgress时间格式："X分Y秒" 或 "Y秒"
 
 
-### 3.1.30 电影工程（film-engineering）流水线合并（2026-08-18）
+### 3.1.31 视频提示词中文翻译与提示词区交互重构（2026-10-19）
+
+> **范围**：视频详情页（成品编辑页 / ResultView）分段提示词区。补齐视频提示词的中文翻译、把翻译块改为与对应提示词上下紧邻、并把分段可编辑主体改为默认折叠。
+> **分支**：`s2v-video-prompt-translation`。
+> **关联**：openspec change `s2v-video-prompt-translation`（proposal + specs/story2video-prompt-translation/spec.md）；执行记录 `openspec/records/s2v-video-prompt-translation.md`。
+
+#### 1) 背景（两条独立的根因）
+
+**用户诉求（2026-10-19，附截图）**：成品编辑页每个视频分段的提示词优化区里，只有图片提示词带中文翻译，视频提示词没有；且整个区域内容太多，视觉体验不好。
+
+- **根因 A — 翻译缺失**：图片提示词的翻译链路自 3.1.28 建立（`translatePromptsForLocale` → compose 并行任务 `story2video_prompt_translation_compose` → 按场景 index 回填 `promptTranslation` → 随分段持久化）。视频提示词（`videoPrompt`）是 3.1.29 才新增的字段，其生成链路（流水线 `optimizeVideoScenePrompts`）与「重新生成视频优化词」（`regenerateScenePrompt` kind=video）**从未接入翻译能力**。
+- **根因 B — 信息密度**：结果页唯一的翻译块被放在「画面提示词 textarea + 视频优化词 textarea + 两枚重新生成按钮」**之后**，与它描述的提示词隔了一整个区块；10+ 分段时首屏被 textarea/表单淹没。
+
+#### 2) 流程（数据流）
+
+```
+用户在成品编辑页展开某分段，点击「重新生成视频优化词」
+  ├─ 1. 渲染端 regenerateScenePrompt(segmentId, 'video')
+  │     └─ segmentsDirty 时先 saveSegments（既有 W3 语义）
+  ├─ 2. 主进程 regenerateScenePrompt(projectId, segmentId, 'video')
+  │     ├─ serviceBus.optimizeVideoPrompt(seed, { index, max_length: 40000 })
+  │     ├─ extractOptimizedVideoPrompt 校验（fail-closed：引擎 error + 回显原文不改分段）
+  │     ├─ segment.videoPrompt = safeText(optimizedText, 40000)
+  │     ├─ segment.videoPromptTranslation = null          ← 先清（旧译文失效）
+  │     └─ translateVideoPromptForLocale(aiGenerator, nextVideoPrompt, uiLocale, log)
+  │           ├─ uiLocale === 'en'            → 返回 null（不翻译）
+  │           ├─ aiGenerator 不可用           → 返回 null（fail-open）
+  │           ├─ LLM 抛错/超时/非法内容      → 返回 null（fail-open）
+  │           ├─ 译文 === 原文                → 返回 null（不展示冗余）
+  │           └─ 成功                        → 译文（≤2000 字符）
+  │     └─ 仅当译文非 null 时才写回 segment.videoPromptTranslation
+  ├─ 3. 持久化：_upsertProject（dirty=true）+ 清理未引用文件
+  └─ 4. 渲染端回写 project/segments + refreshSegmentImageUrls + 成功通知
+        └─ 「视频优化词」textarea 下方渲染只读中文翻译块
+```
+
+#### 3) 数据校验
+
+| 项 | 规则 |
+|----|------|
+| `segment.videoPromptTranslation` | `string \| null`，≤2000 字符（与 `promptTranslation` 落库上限一致）；`safeText(value, 2000)` 收敛，非字符串一律 `''` → `null` |
+| 译文有效性 | 非空、trim 后非空、且 trim 后**不等于**视频提示词原文；命中 JSON 对象文本（`/^\{["']\d/`）或代码块标记（`json`）不作为译文 |
+| `videoPrompt` 本体 | ≤40000 字符（既有 3.1.29.5 契约不变） |
+| `uiLocale` | 取 `project.story2videoTextConfig.config.optimize.uiLocale` → `project.options.uiLocale` → 缺省 `'zh'`；仅接受 `/^[A-Za-z-]{1,16}$/`，其余回落缺省 |
+| `updateSegments` 白名单 | **不含** `videoPromptTranslation`：渲染端保存分段时携带该字段一律丢弃，保留服务端译文（防前端伪造） |
+| compose 回填 | compose 输出不含该字段（`normalizeComposeScenes` 白名单），按稳定 source index 从 fallback 分段回填；compose 值优先、空白回退 fallback、两者皆空为 null（与 `videoPrompt`/`promptTranslation` 同源治理） |
+| 旧项目兼容 | 无 `videoPromptTranslation` 字段时正常加载，`safeText(undefined) → ''` → null，不报错 |
+
+#### 4) 功能逻辑
+
+| 功能 | 逻辑 |
+|------|------|
+| **视频提示词中文翻译生成** | 复用 `translatePromptsForLocale`（批量调用、严格 JSON 系统提示、markdown fence 剥离、平衡 JSON 提取、逐行兜底、HTML/marker 包装防御全部继承），**不写第二份翻译实现**。单条调用（batch size 1） |
+| **fail-open** | 翻译链路任何一步失败都只导致 `videoPromptTranslation = null`；`videoPrompt` 本体、`status='completed'`、错误通知语义全部不受影响 |
+| **陈旧译文治理** | 重写 `videoPrompt` 时先置 null 再按结果写回，翻译失败不留上一轮译文（与图片提示词 `promptTranslation` 语义一致） |
+| **图片分支隔离** | `kind === 'image'` 完全不触碰 `videoPromptTranslation`，且不发起任何 LLM 调用 |
+| **提示词/翻译成对** | 图片提示词 textarea 下方紧邻图片翻译块；视频优化词 textarea 下方紧邻视频翻译块。两块各带归属标签区分 |
+| **en 界面** | 两个翻译块均不展示可见译文（`showPromptTranslation` / `showVideoPromptTranslation` 返回 false），保留占位文案 |
+
+#### 5) 交互逻辑
+
+| 交互 | 逻辑 |
+|------|------|
+| **默认折叠** | 分段卡片默认紧凑态：只渲染分段序号、状态徽标、政策标记、素材区概览与展开开关。可编辑主体（旁白文字/字幕/提示词/翻译/语音设置/操作按钮）**不渲染**（`v-if`，非 `v-show`） |
+| **展开开关** | 分段头部「展开编辑 / 收起编辑」按钮（`data-testid="segment-editor-toggle"`，`aria-expanded` 同步）；图标 ▸ / ▾ |
+| **展开态互斥** | `expandedSegmentId` 单值状态：展开分段 B 时分段 A 自动收起；再次点击当前分段收起为紧凑态 |
+| **删除展开分段** | `removeSegment` 时若被删分段正处于展开态，`expandedSegmentId` 置空，避免残留指向已删除 id 的展开态 |
+| **失败不收起** | 「重新生成提示词」失败只发通知，不改 `expandedSegmentId`，用户停留原地可立即重试 |
+| **未保存守卫** | 折叠/展开不触发 dirty（纯 UI 态），离开守卫语义不变 |
+
+#### 6) 显示项与提示文字
+
+| 场景 | 文案（zh / en） |
+|------|-----------------|
+| 展开开关（收起态） | 展开编辑 / Expand editor |
+| 展开开关（展开态） | 收起编辑 / Collapse editor |
+| 图片翻译块标签 | 图片提示词中文翻译 / Image prompt translation |
+| 视频翻译块标签 | 视频提示词中文翻译 / Video prompt translation |
+| 翻译块无译文占位 | 未生成 / Not generated（复用 `sceneMaterial.emptySlot`） |
+
+> 翻译块为只读展示，不可编辑、不可复制按钮（选中复制由浏览器原生行为承担）。
+
+#### 7) UI/UE 方案选型（用户点名要求分析）
+
+对「内容太多」评估了 4 类常见处理，结论如下（详细理由见执行记录 §交互方案选型）：
+
+| 方案 | 结论 | 理由 |
+|------|------|------|
+| 提示词与翻译**左右分栏**（同一行） | ❌ 不采纳 | 中英文都是**长文本**（英文 480 字符 / 中文 130 字符）。左右分栏把每侧可用宽度砍到 ≈50%，英文提示词在 500px 栏宽下要滚 6-8 行，中文侧大量留白——阅读与编辑体验双输。左右分栏只适合「短键值对」 |
+| 翻译**默认隐藏 + hover/点击 tooltip** | ❌ 不采纳 | 翻译是需要**静读**的长文本，tooltip 的窄宽度与易消失性和它冲突；「不可复现的临时浮层」不符合桌面端信息查阅习惯 |
+| **默认折叠 + 点击展开** | ✅ 采用 | 「详情区块过长」的标准解（Progressive Disclosure）。首屏只留分段序号/状态/素材区概览，编辑区按需展开；配合**展开态互斥**进一步压低视觉噪音。本项目已有同族实现可对齐（`QuickCollectPanel` 查看提示词、`BatchCollectPanel` 分组面板、`FilmAutoPanel` el-collapse 高级区） |
+| 翻译与提示词**上下紧邻成对** | ✅ 采用 | 保持每侧全宽（长文本不被砍），并用弱化样式（左边框 + 次级底色 + 只读）与可编辑 textarea 形成层级差 |
+
+#### 8) 测试要求
+
+| 层 | 用例 |
+|----|------|
+| 单元（渲染端） | ①图片/视频翻译块成对且标签区分；②翻译块 DOM 位置紧邻对应 textarea（`compareDocumentPosition`）；③无译文时占位文案；④en 界面两个 `show*Translation` 判定返回 false；⑤重新生成图片后旧图片译文被后端清空（占位）；⑥重新生成视频后旧视频译文被清空（占位）；⑦默认折叠不渲染编辑主体；⑧展开态互斥；⑨失败不收起；⑩删除展开分段后收起 |
+| 单元（主进程） | ①video 成功产出译文并断言 LLM 调用形态（type='llm'、系统提示含「简体中文」与「JSON」）；②重写后旧译文被清空；③LLM 抛错时 `videoPromptTranslation=null` 且 `videoPrompt`/`status` 不受影响；④LLM 返回 markdown 包装 + 示例时取到真实译文而非包装文本；⑤image 分支不写 `videoPromptTranslation` 且不发起 LLM 调用；⑥`updateSegments` 丢弃 `videoPromptTranslation` |
+| 兼容 | 旧项目（无 `videoPromptTranslation`）正常加载并显示占位 |
+
+#### 9) 已知限制
+
+1. **存量项目无 `videoPromptTranslation`**：2026-10-19 之前生成的项目该字段为 null，视频提示词旁显示占位文案。只在用户点「重新生成视频优化词」后补齐第一份译文——**未做存量批量回填**（需遍历 N 个项目的 LLM 批量翻译，成本与失败面都不适合塞进本次 UI 修复）。
+2. **locale 来源固化于任务创建时**：主进程无 `navigator`，`_resolveUiLocale` 取 `optimize.uiLocale` → `options.uiLocale` → 缺省 `zh`。用户在任务创建后切换界面语言，新生成的视频译文仍按任务创建时的语言。与图片提示词翻译同源（流水线 optimize 阶段也是提交时固化 `uiLocale`），非本次新引入的不一致。
+3. **流水线自动路径未覆盖**：本次只覆盖「重新生成视频优化词」交互入口。若后续要在成片生成时同步产出视频译文，应扩展 `prompt_translations_pending` 机制而非复制逻辑。
+
+#### 10) 实现落位（2026-10-20 随 #4064 组件化调整）
+
+本节行为契约不变，但承载文件在 `#4064`（`PRD-S2V-RESULT-VIEW-PERF`）之后整体迁移——原实现内联在
+`apps/desktop/src/views/ResultView.vue` 的分段区，`#4064` 把分段区抽成两个组件，故本特性随之落位：
+
+| 关注点 | 文件 | 说明 |
+|--------|------|------|
+| 提示词/翻译成对渲染 + 折叠开关 | `apps/desktop/src/views/video-creation/ResultSegmentCard.vue` | 图片翻译块紧邻图片提示词 textarea、视频翻译块紧邻视频优化词 textarea；`expanded` 为受控 prop，卡头渲染「展开编辑/收起编辑」开关（`data-testid="segment-editor-toggle"`，`aria-expanded` 同步） |
+| 展开态唯一真源（互斥 + 删除收起） | `apps/desktop/src/views/video-creation/ResultSegmentEditor.vue` | `data.expandedSegmentId` 单值状态；`toggleSegmentEditor()` 幂等互斥；`onRemoveSegment()` 在删除被展开分段时置空 |
+| 折叠范围 | 同上（模板结构） | 只折叠**文本编辑主体**（旁白/字幕/图片提示词+翻译/视频优化词+翻译/语音设置/操作按钮）；**缩略图与四素材槽保持可见**，因为那是「这一镜有什么」的扫读信息，不属于用户抱怨的超长表单 |
+| 宿主接线 | `apps/desktop/src/views/ResultView.vue` | 只保留 `<ResultSegmentEditor>` 的 props/emits 接线，不再持有分段级 UI 状态 |
+| 主进程翻译能力 | `electron/services/story2video-stages.js`、`story2video-project-service.js` | 未受组件化影响，契约同 §3.1.31 第 2)–4) 小节 |
+
+对应测试也按组件拆分：`ResultSegmentCard.test.js`（成对渲染/占位/en 判据/折叠态与 `expanded` 两态）、
+`ResultSegmentEditor.test.js`（默认全折叠/只展开一个/互斥/幂等/删除收起）、
+`ResultView.test.js`（宿主级接线：原有涉及主体内控件的用例补了「先展开」一步）。
+
+
 
 > **范围**：新增「影视工程（Hell Grind）」流水线，包含独立页面 `/film-engineering`、film-kit 资产库、IPC 服务与 i18n 注册。
 > **分支**：`codex/film-engineering-hell-grind` → 合入 `codex/video-creation-ui`。

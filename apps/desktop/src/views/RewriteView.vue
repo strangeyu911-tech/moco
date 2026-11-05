@@ -89,7 +89,7 @@
               :key="m.value"
               :class="['mode-chip', { active: rewriteMode === m.value }]"
               :disabled="rewriting"
-              @click="rewriteMode = m.value"
+              @click="onModeChipClick(m.value)"
             >{{ m.label }}</button>
           </div>
         </div>
@@ -102,6 +102,8 @@
             <WordCountRangeInput
               v-model:min="wordCountMin"
               v-model:max="wordCountMax"
+              @update:min="markWordCountManuallySet"
+              @update:max="markWordCountManuallySet"
               :min-placeholder="t('rewritePage.wordCountMinPlaceholder')"
               :max-placeholder="t('rewritePage.wordCountMaxPlaceholder')"
               :unit="t('rewritePage.wordCountUnit')"
@@ -120,6 +122,52 @@
               <option value="wechat_mp">{{ t('rewriteEngine.platformWechatMp') }}</option>
               <option value="bilibili">{{ t('rewriteEngine.platformBilibili') }}</option>
               <option value="zhihu">{{ t('rewriteEngine.platformZhihu') }}</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- 行业 / 目的 / 语气：三个短字段并排 -->
+        <!-- 存在意义（rewrite-default-strategy-fix）：改写页此前只发 platform，industry/purpose/tone
+             根本不下发 ⇒ StrategyMatcher 拿到空输入 ⇒ 五维全拿基础分并列 ⇒ 退化为取数组首项。
+             补上这三个真实输入，匹配器才有可匹配的信号（对应 PRD R1）。 -->
+        <div class="config-grid config-grid--three">
+          <div class="config-row">
+            <label class="cohere-form-label">{{ t('rewriteEngine.industryLabel') }}</label>
+            <select v-model="industry" class="cohere-input config-select" :disabled="rewriting">
+              <option value="">{{ t('rewriteEngine.industryGeneral') }}</option>
+              <option value="technology">{{ t('rewriteEngine.industryTechnology') }}</option>
+              <option value="ecommerce">{{ t('rewriteEngine.industryEcommerce') }}</option>
+              <option value="education">{{ t('rewriteEngine.industryEducation') }}</option>
+              <option value="finance">{{ t('rewriteEngine.industryFinance') }}</option>
+              <option value="lifestyle">{{ t('rewriteEngine.industryLifestyle') }}</option>
+              <option value="beauty">{{ t('rewriteEngine.industryBeauty') }}</option>
+              <option value="entertainment">{{ t('rewriteEngine.industryEntertainment') }}</option>
+              <option value="ip-building">{{ t('rewriteEngine.industryIpBuilding') }}</option>
+            </select>
+          </div>
+
+          <div class="config-row">
+            <label class="cohere-form-label">{{ t('rewriteEngine.purposeLabel') }}</label>
+            <select v-model="purpose" class="cohere-input config-select" :disabled="rewriting">
+              <option value="">{{ t('rewriteEngine.purposeGeneral') }}</option>
+              <option value="engagement">{{ t('rewriteEngine.purposeEngagement') }}</option>
+              <option value="conversion">{{ t('rewriteEngine.purposeConversion') }}</option>
+              <option value="follower-growth">{{ t('rewriteEngine.purposeFollowerGrowth') }}</option>
+              <option value="authority-building">{{ t('rewriteEngine.purposeAuthority') }}</option>
+              <option value="sales">{{ t('rewriteEngine.purposeSales') }}</option>
+            </select>
+          </div>
+
+          <div class="config-row">
+            <label class="cohere-form-label">{{ t('rewriteEngine.toneLabel') }}</label>
+            <select v-model="tone" class="cohere-input config-select" :disabled="rewriting">
+              <option value="">{{ t('rewriteEngine.toneGeneral') }}</option>
+              <option value="casual">{{ t('rewriteEngine.toneCasual') }}</option>
+              <option value="storytelling">{{ t('rewriteEngine.toneStorytelling') }}</option>
+              <option value="emotional">{{ t('rewriteEngine.toneEmotional') }}</option>
+              <option value="persuasive">{{ t('rewriteEngine.tonePersuasive') }}</option>
+              <option value="humorous">{{ t('rewriteEngine.toneHumorous') }}</option>
+              <option value="formal">{{ t('rewriteEngine.toneFormal') }}</option>
             </select>
           </div>
         </div>
@@ -157,12 +205,36 @@
       <!-- 改写结果区 -->
       <div v-if="rewriteResult" ref="rewriteResultCardEl" class="cohere-card rewrite-result-card">
         <div class="cohere-section-title">{{ t('rewritePage.resultSection') }}</div>
+        <!-- 输出截断可见化（rewrite-limits-50000，2026-10-19）：引擎因字数区间/策略上限
+             砍尾时必须让用户知道，不再静默丢内容 -->
+        <div
+          v-if="outputTruncatedInfo"
+          class="rewrite-output-truncated-banner"
+          data-testid="rewrite-output-truncated"
+        >
+          ⚠️ {{ t('rewritePage.outputTruncated', { length: outputTruncatedInfo.length, max: outputTruncatedInfo.max }) }}
+        </div>
+        <!-- 模型侧截断可见化（rewrite-segment-and-finish-reason 第二刀）：provider 的
+             finish_reason 表示输出被模型自身上限截断，与上面「引擎按字数区间砍尾」是两种
+             不同的限制，文案必须分型（上面那条建议「调大字数控制」，对模型上限无效） -->
+        <div
+          v-if="modelTruncatedInfo"
+          class="rewrite-output-truncated-banner rewrite-model-truncated-banner"
+          data-testid="rewrite-model-truncated"
+        >
+          ⚠️ {{ t('rewritePage.outputTruncatedByModel', { length: modelTruncatedInfo.length }) }}
+        </div>
         <div class="rewrite-result-meta" v-if="rewriteMeta">
           <span>{{ t('rewritePage.metaStrategy') }}：{{ rewriteMeta.strategyName }}</span>
           <span>{{ t('rewritePage.metaAiTaste') }}：{{ rewriteMeta.aiTastePct }}</span>
           <!-- 字数概览按模式分派用词：选题创作的输入是「主题种子」而非待改写正文，
                标成「原文」会把种子误读为需保留语义的原文（设计评审 Q5，与评分口径同一概念陷阱） -->
           <span>{{ t(rewriteMeta.mode === 'create' ? 'rewritePage.metaLengthFromTopic' : 'rewritePage.metaLength', { original: rewriteMeta.originalLength, result: rewriteMeta.resultLength }) }}</span>
+          <!-- 分段改写（rewrite-segment-and-finish-reason 第二刀）：>阈值输入由引擎分 N 段，
+               展示段数让「耗时/费用为什么变高」可见 -->
+          <span v-if="rewriteMeta.segmentCount > 1" data-testid="rewrite-segmented-meta">
+            {{ t('rewritePage.segmentedMeta', { count: rewriteMeta.segmentCount }) }}
+          </span>
         </div>
         <!-- 改写质量评估报告（content-quality-eval 桌面端闭环）
              视觉：用左侧强调条表达结论等级，替代原先「卡片内再套一个带边框的卡片」 -->
@@ -237,6 +309,14 @@
           <button class="cohere-btn-secondary" data-testid="btn-video-create" @click="goToVideoCreate">
             {{ t('rewritePage.goVideo') }}
           </button>
+          <button
+            v-if="podcast.activeChannelId.value && rewriteResult.trim()"
+            class="cohere-btn-secondary"
+            data-testid="btn-podcast-script-entry"
+            @click="openScriptEntry"
+          >
+            {{ t('podcast.episode.entry') }}
+          </button>
           <button class="cohere-btn-primary" @click="goToPublish">
             {{ t('rewritePage.goPublish') }}
           </button>
@@ -251,6 +331,15 @@
       @close="showPublishModal = false"
       @publish-article="onPublishArticle"
       @publish-video="onPublishVideo"
+    />
+
+    <!-- 文本出期浮层：按需挂载、常驻不卸载（关闭不取消发布，§7.10.3.4 交互行） -->
+    <PodcastScriptEntry
+      v-if="scriptEntry.openedOnce"
+      v-model:visible="scriptEntry.visible"
+      :channel-id="podcast.activeChannelId.value"
+      :script="scriptEntry.script"
+      :title="scriptEntry.title"
     />
   </div>
 </template>
@@ -272,13 +361,17 @@ import { takeViralSignalHandoff, hasActionableEngagement } from '@/utils/viral-s
 import { writeClipboard } from '@/utils/clipboard'
 import { extractRewriteHistoryId, attachRewriteLineage } from '@/utils/rewrite-lineage'
 import PublishDestinationModal from '@/components/PublishDestinationModal.vue'
+import PodcastScriptEntry from '@/components/PodcastScriptEntry.vue'
+import { usePodcastChannel } from '@/composables/usePodcastChannel'
 import RewriteStrategyPicker from '@/components/RewriteStrategyPicker.vue'
 import WordCountRangeInput from '@/components/WordCountRangeInput.vue'
+import { deriveDefaultMode, deriveWordCountRange } from '@/utils/rewrite-defaults'
+import { REWRITE_ENGINE_MAX_OUTPUT_CHARS, REWRITE_ENGINE_MAX_INPUT_CHARS, countRewriteChars, shouldSegmentRewrite } from '@/utils/rewrite-engine-limits'
 
 const router = useRouter()
 const route = useRoute()
 const { t } = useI18n()
-const { notifySuccess, notifyError, notifyWarning } = useNotify()
+const { notifySuccess, notifyError, notifyWarning, notifyInfo } = useNotify()
 const { ensureLogin } = useLoginGate()
 
 // ── 状态 ──
@@ -291,6 +384,12 @@ const rewriteResultCardEl = ref(null)
 // 改写结果标题（2026-09-18）：引擎从改写结果提炼 ≤20 字标题，纯文字展示
 const rewriteTitle = ref('')
 const rewriteMeta = ref(null)
+// 输出截断可见化（rewrite-limits-50000，2026-10-19）：引擎 outputTruncated=true 时
+// {length: 实际输出字数, max: 生效上限}；未截断为 null。数据源见 result 消费分支。
+const outputTruncatedInfo = ref(null)
+// 模型侧截断可见化（rewrite-segment-and-finish-reason 第二刀）：引擎 modelTruncated=true
+// （provider finish_reason=length/max_tokens）时 {length}；与上面引擎截断分型展示。
+const modelTruncatedInfo = ref(null)
 // content-quality-eval 桌面端闭环：改写质量评估报告（RewriteQualityEvaluator 结果）
 const rewriteQuality = ref(null)
 // P2 隐式反馈：本次改写引用的知识条目（保存/发布=采纳 / 再次改写=弃用）
@@ -313,10 +412,22 @@ const viralEngagement = ref(null)
 const useViralLibrary = ref(true)
 const usePersonalExperience = ref(false)
 const rewriteMode = ref('create')
+// 用户是否手动切换过改写模式：手动选择优先于按输入形态的自动推导。
+// 未手动切换时，startRewrite 会按当前正文形态推导（成稿→imitate，选题→create），
+// 避免把一篇成稿当选题种子交给 create 模式（实测导致事实密度几乎全丢）。
+let modeManuallySet = false
 const platform = ref('')
-// 字数区间控制（默认 800-2000）
+// 行业 / 目的 / 语气（rewrite-default-strategy-fix）：此前改写页完全不下发这三项，
+// 匹配器只能拿到空输入 ⇒ 全体并列退化为数组首项。补上后用户显式意图可真正参与匹配。
+// 默认空串 = 「通用/未指定」，绝不猜测用户行业——猜出来的值是假事实，比缺失更糟。
+const industry = ref('')
+const purpose = ref('')
+const tone = ref('')
+// 字数区间控制（默认 800-2000；长文成稿在改写前按原文长度自适应，避免被硬截断）
 const wordCountMin = ref(800)
 const wordCountMax = ref(2000)
+// 字数区间是否已被用户手动编辑：手动值优先于自适应推导
+let wordCountManuallySet = false
 
 // 策略选择（2026-09-15 改为默认「手动选择」展开下拉，降低发现成本；未选时仍传 null 走引擎自动匹配）
 // 注：AiWriterPanel / Collection 采集页保持默认 auto，不受影响
@@ -347,6 +458,9 @@ const REWRITE_PAGE_PLATFORMS = ['douyin', 'xiaohongshu', 'wechat_mp', 'bilibili'
 function consumeLibraryHandoff () {
   const handoff = takeRewriteHandoff()
   if (!handoff || typeof handoff.content !== 'string' || !handoff.content.trim()) return
+  // 交接是显式入口，mode 由本函数确定 ⇒ 必须置「已手动」，
+  // 否则 startRewrite 的按输入形态推导会把它覆盖掉（实测把 imitate 改成 create）。
+  modeManuallySet = true
   rewriteMode.value = 'imitate'
   content.value = handoff.content
   if (REWRITE_PAGE_PLATFORMS.includes(handoff.platform)) platform.value = handoff.platform
@@ -467,7 +581,13 @@ async function refreshStrategyPreview() {
   if (rewriting.value) return
   const seq = ++previewSeq
   try {
-    const res = await aiGetRecommendedStrategies({ platform: platform.value || undefined })
+    // 预览必须与 startRewrite 下发同一套 userSettings，否则预览名与实际命中策略会漂移
+    const res = await aiGetRecommendedStrategies({
+      platform: platform.value || undefined,
+      industry: industry.value || undefined,
+      purpose: purpose.value || undefined,
+      tone: tone.value || undefined,
+    }, content.value.trim())
     if (seq !== previewSeq) return // 已有更新的请求，丢弃本次过期结果
     if (res && res.code === 0 && Array.isArray(res.data) && res.data.length > 0) {
       previewStrategyName.value = res.data[0].name || '--'
@@ -479,8 +599,25 @@ async function refreshStrategyPreview() {
   }
 }
 
-// 目标平台变化 → 预览随新 userSettings 刷新（refreshStrategyPreview 内含竞态守卫）
-watch(platform, refreshStrategyPreview)
+// 目标平台/行业/目的/语气变化 → 预览随新 userSettings 刷新（refreshStrategyPreview 内含竞态守卫）
+// rewrite-default-strategy-fix：行业/目的/语气同样参与匹配，变化也需刷新预览。
+// ⚠ content 必须一起监听（CCG 深度审查 i3）：启发式兜底依赖原文形态，
+//   只监听设置项会导致「粘贴长文但没动下拉」时预览名不刷新，
+//   而实际改写会用新的 content 重新匹配 ⇒ 预览名与实际命中策略漂移。
+// ⚠ content 走 300ms 防抖（CCG 二轮 i3）：正文逐字输入会高频触发预览请求，
+//   previewSeq 只保证「过期结果不渲染」，拦不住请求本身。下拉选择是离散低频
+//   动作可即时刷新；正文连续键入合并到停顿后一次，交互上无感知差异。
+let contentPreviewTimer = null
+function scheduleContentPreview() {
+  if (contentPreviewTimer) clearTimeout(contentPreviewTimer)
+  contentPreviewTimer = setTimeout(() => {
+    contentPreviewTimer = null
+    refreshStrategyPreview()
+  }, 300)
+}
+onUnmounted(() => { if (contentPreviewTimer) clearTimeout(contentPreviewTimer) })
+watch([platform, industry, purpose, tone], refreshStrategyPreview)
+watch(content, scheduleContentPreview)
 
 // 改写结果被用户编辑（textarea v-model）→ 已存草稿内容过期：置空 id，下次操作按当前内容重存
 // （saveToDraft 成功后 savedDraftId 更新，此处仅在内容再次变化时失效，不构成循环）
@@ -521,6 +658,8 @@ onMounted(() => {
   }
   const topic = typeof route.query.topic === 'string' ? route.query.topic.trim() : ''
   if (topic) {
+    // 选题带入是显式入口，mode 由本分支确定 ⇒ 置「已手动」，防止被形态推导覆盖
+    modeManuallySet = true
     rewriteMode.value = 'create'
     // 选题带入：不再有 ≥20 字符限制（2026-09-12 移除最少字数）
     content.value = topic
@@ -551,9 +690,41 @@ const canStartRewrite = computed(() => {
 // ── 字数区间校验（共享 composable，与 Collection 页一致）──
 const { error: wordCountError } = useWordCountValidation(wordCountMin, wordCountMax, (key) => t('rewritePage.' + key))
 
+/** P1-E 评审 W-1：移除标题参考 chip 时同步清空爆款信号（信号与标题同源，语义一致） */
 // ── 方法 ──
 
-/** P1-E 评审 W-1：移除标题参考 chip 时同步清空爆款信号（信号与标题同源，语义一致） */
+/**
+ * 用户手动点选改写模式：置位「已手动」标志，此后不再被自动推导覆盖。
+ * 用户显式选择永远优先于启发式——这是本次修复的边界，不得反过来。
+ */
+function onModeChipClick(value) {
+  modeManuallySet = true
+  rewriteMode.value = value
+}
+
+/**
+ * 字数区间被用户编辑：置位「已手动」标志，此后不再自适应覆盖。
+ */
+function markWordCountManuallySet() {
+  wordCountManuallySet = true
+}
+
+/**
+ * 改写前按当前正文推导默认参数（仅当用户未手动设置时）。
+ *
+ * mode：成稿→imitate（保留原文），选题种子→create（从种子生全文）。
+ * 字数：长文按原文长度自适应，避免硬截 60%。
+ */
+function applyInputDerivedDefaults(trimmed) {
+  if (!modeManuallySet) {
+    rewriteMode.value = deriveDefaultMode(trimmed)
+  }
+  if (!wordCountManuallySet) {
+    const range = deriveWordCountRange(trimmed)
+    wordCountMin.value = range.min
+    wordCountMax.value = range.max
+  }
+}
 function clearTitleHint() {
   titleHint.value = ''
   viralAngles.value = []
@@ -572,8 +743,21 @@ async function startRewrite() {
   contentError.value = ''
   if (!(await ensureLogin({ message: t('rewritePage.needLogin') }))) return
 
+  // 按输入形态推导默认参数（用户手动设置过则不覆盖）
+  applyInputDerivedDefaults(trimmed)
+  // 推导后可能修正区间，需重新校验（长文自适应会把上限抬高，不会引入非法区间）
+  if (wordCountError.value) return
+
   rewriting.value = true
   rewriteError.value = ''
+  // 分段改写事前提示（rewrite-segment-and-finish-reason 第二刀）：超过阈值时引擎会分 N 段
+  // 串行改写（耗时与费用 ×N、期间其他 AI 功能可能变慢、段间一致性可能有折损）。
+  // 这些代价必须在**开始前**告知——失败或变慢的用户预期成本远高于一句提示。
+  if (shouldSegmentRewrite(trimmed)) {
+    notifyInfo('rewritePage.rewriteSegmented', {
+      params: { length: countRewriteChars(trimmed), max: REWRITE_ENGINE_MAX_INPUT_CHARS },
+    })
+  }
   // 交接一次性语义（审查 W-1）：无论本次改写成败都消费掉交接载荷，
   // 防止失败后残留的 fromKey 被后续无关改写静默覆盖文案库记录
   const handoffForRun = libraryHandoff.value
@@ -589,6 +773,10 @@ async function startRewrite() {
   // CCG 评审修复：新改写开始前重置质量报告，避免上一次改写（无 quality）的旧报告残留
   rewriteQuality.value = null
   viralInfo.value = null
+  // 截断可见化两态复位（rewrite-segment-and-finish-reason）：上一次的截断横幅不得
+  // 残留到这一次（否则用户会把「上次被截断」读成「这次也被截断」）
+  outputTruncatedInfo.value = null
+  modelTruncatedInfo.value = null
   // 归因链：上一次改写的 id 不得跟着这一次的发布走（置空后由成功分支重新赋值；
   // 本次改写若没落库成功就是 null，宁缺毋滥）
   rewriteLineageId = null
@@ -599,6 +787,9 @@ async function startRewrite() {
       content: trimmed,
       userSettings: {
         platform: platform.value || undefined,
+        industry: industry.value || undefined,
+        purpose: purpose.value || undefined,
+        tone: tone.value || undefined,
         wordCountRange: {
           min: Number(wordCountMin.value),
           max: Number(wordCountMax.value),
@@ -661,7 +852,22 @@ async function startRewrite() {
         resultLength: data.metadata?.resultLength || 0,
         // 实际生效的改写模式（用于字数概览的用词分派；缺省 imitate）
         mode: data.metadata?.mode || 'imitate',
+        // 分段改写（rewrite-segment-and-finish-reason 第二刀）：>阈值输入由引擎分 N 段
+        // 改写；结果卡元信息行展示段数，让「耗时/费用为什么变高」可见。
+        segmentCount: (data.segmented && data.segmented.enabled === true && Number.isFinite(Number(data.segmented.segmentCount)))
+          ? Number(data.segmented.segmentCount)
+          : 0,
       }
+      // 输出截断可见化（rewrite-limits-50000）：引擎 outputTruncated=true ⇒ 记录
+      // {length, max} 供结果卡横幅展示；未截断/缺省字段 ⇒ 复位 null。
+      outputTruncatedInfo.value = (data.outputTruncated === true && Number.isFinite(Number(data.outputLength)))
+        ? { length: Number(data.outputLength), max: wordCountMax.value || REWRITE_ENGINE_MAX_OUTPUT_CHARS }
+        : null
+      // 模型侧截断可见化（rewrite-segment-and-finish-reason）：两条横幅分型展示，
+      // 各自的文案不同（模型上限不能靠「调大字数控制」解决）。
+      modelTruncatedInfo.value = (data.modelTruncated === true && Number.isFinite(Number(data.outputLength)))
+        ? { length: Number(data.outputLength) }
+        : null
       if (data.warnings && data.warnings.length > 0) {
         rewriteError.value = data.warnings.join('；')
       }
@@ -727,6 +933,28 @@ async function copyResult() {
   }, 1500)
 }
 
+/** 改写稿的标题取法只留这一份（§7.10.3.4：入口与存草稿共用同一个提取点，各写一份必然漂移） */
+function resolveRewriteTitle() {
+  return rewriteTitle.value || content.value.trim().slice(0, 64) || t('rewritePage.title')
+}
+
+/**
+ * 文本出期入口（PRD §7.10.3.4 ②-b②）。与文案库那枚（§7.10.3.2）的差别只在正文来源：
+ * 这里的正文本来就躺在内存里，所以「空白即无正文」落在**动作是否出现**上，而不是点击后被拒；
+ * 频道一律取 usePodcastChannel 的既有解析，本视图不解析第二份、也不放下拉选择器。
+ */
+const podcast = usePodcastChannel()
+const scriptEntry = ref({ visible: false, openedOnce: false, script: '', title: '' })
+function openScriptEntry () {
+  // 只读既有解析：动作能出现就说明默认频道非空（模板同一个谓词），原先那句
+  // `|| await ensureChannel()` 是永远走不到的死分支（QM6-2），留着会让人以为这里能兜出频道。
+  const channelId = podcast.activeChannelId.value
+  if (!channelId) return
+  const body = rewriteResult.value
+  if (!body || !body.trim()) return
+  scriptEntry.value = { visible: true, openedOnce: true, script: body, title: resolveRewriteTitle() }
+}
+
 /** 存入草稿 */
 async function saveToDraft() {
   if (!rewriteResult.value.trim()) return
@@ -734,7 +962,7 @@ async function saveToDraft() {
     const saved = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       // 标题优先用改写结果标题（≤20 字，2026-09-18）；缺失时回退原文前 64 字
-      title: rewriteTitle.value || content.value.trim().slice(0, 64) || t('rewritePage.title'),
+      title: resolveRewriteTitle(),
       content: rewriteResult.value,
       source: 'rewrite',
       createdAt: new Date().toISOString(),
@@ -982,6 +1210,18 @@ function onPublishVideo(pipelineId) {
   .config-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* 行业 / 目的 / 语气 三列并排（窄屏逐级降为单列，避免挤压成不可读的窄条） */
+.config-grid--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: var(--space-lg);
+}
+@media (max-width: 1024px) {
+  .config-grid--three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 820px) {
+  .config-grid--three { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* 策略选择器内部的单选文案字号与其它字段保持一致（子组件默认 12px） */
 .rewrite-config-card :deep(.strategy-radio) { font-size: var(--font-size-sm); }
 .rewrite-config-card :deep(.strategy-mode-row) { gap: var(--space-lg); }
@@ -1033,6 +1273,19 @@ function onPublishVideo(pipelineId) {
   color: var(--ink);
   line-height: 1.4;
   word-break: break-all;
+}
+
+/* 输出截断可见化（rewrite-limits-50000，2026-10-19）：结果卡顶部的暖橙横幅，
+   与质量评估 warn 色一致；不抢视觉焦点但一定可见。 */
+.rewrite-output-truncated-banner {
+  margin: 0 0 var(--space-md);
+  padding: 10px var(--space-md);
+  border: 1px solid #f3d5a3;
+  border-radius: 8px;
+  background: #fdf6ec;
+  color: #92610c;
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
 }
 
 /* 质量评估：左侧结论强调条取代原先「结果卡片内再套一个带边框的卡片」，

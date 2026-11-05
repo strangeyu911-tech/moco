@@ -189,12 +189,56 @@ const UNTRUSTED_PYTHON_MARKERS = Object.freeze([
   '_work/_tool',
 ])
 
-/** Windows 标准用户级 Python 3.12 安装候选路径（按优先级）。 */
+/**
+ * 判断某个 Python 解释器是否具备 python-backend 的运行依赖（uvicorn）。
+ *
+ * 背景（2026-10-24 实测）：只按「路径存在」选解释器是不够的 —— 本机装的是 Python313，
+ * 而旧实现只认 Python312 ⇒ 解析失败 ⇒ MP_PYTHON 不注入 ⇒ Python bridge 回落到 PATH 上的
+ * 裸解释器（WorkBuddy 托管的 python，无 uvicorn）⇒ server.py 在 `import uvicorn` 处直接
+ * ModuleNotFoundError，后端 8299 起不来，账号/发布等一切依赖后端的功能全部失效。
+ * 因此候选必须「能 import uvicorn」才算可用。
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function pythonHasBackendDeps(filePath) {
+  try {
+    execFileSync(filePath, ['-c', 'import uvicorn'], {
+      windowsHide: true,
+      timeout: 15000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+/** Windows 标准用户级 Python 安装候选路径（按版本号倒序：Python314 → Python313 → …）。 */
 function systemPythonCandidates() {
   const localAppData = process.env.LOCALAPPDATA || ''
   const candidates = []
   if (localAppData) {
-    candidates.push(path.join(localAppData, 'Programs', 'Python', 'Python312', 'python.exe'))
+    const base = path.join(localAppData, 'Programs', 'Python')
+    // 2026-10-24：原实现硬编码只找 Python312，机器上只装了 Python313 时就整体解析失败。
+    // 改为枚举 %LOCALAPPDATA%\Programs\Python\Python3NN\python.exe 并按版本号倒序，
+    // 新版本优先（本机 313 装有 uvicorn 0.32.1 / pydantic 等业务依赖）。
+    let entries = []
+    try {
+      entries = fs.readdirSync(base, { withFileTypes: true })
+    } catch (_) {
+      entries = []
+    }
+    const found = []
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const matched = /^Python(\d{3})$/.exec(entry.name)
+      if (!matched) continue
+      found.push({ version: Number(matched[1]), exe: path.join(base, entry.name, 'python.exe') })
+    }
+    found.sort((a, b) => b.version - a.version)
+    for (const item of found) candidates.push(item.exe)
+    // 兜底：显式补一条 Python312，保证既有「标准 3.12 安装」场景优先级不变。
+    candidates.push(path.join(base, 'Python312', 'python.exe'))
   }
   return candidates
 }
@@ -234,13 +278,20 @@ let cachedSystemPython = undefined
 function resolveSystemPython() {
   if (cachedSystemPython !== undefined) return cachedSystemPython
   let resolved = null
+  let fallback = null
   for (const candidate of systemPythonCandidates()) {
+    let exists = false
     try {
-      if (fs.existsSync(candidate)) {
-        resolved = candidate
-        break
-      }
+      exists = fs.existsSync(candidate)
     } catch (_) { /* 忽略单点失败，继续探测 */ }
+    if (!exists) continue
+    if (!fallback) fallback = candidate
+    // 只有「能 import uvicorn」的解释器才算真正可用：否则注入了 MP_PYTHON 也只是把
+    // 失败点从「PATH 上的裸 python」换成「显式指定的裸 python」，后端一样起不来。
+    if (pythonHasBackendDeps(candidate)) {
+      resolved = candidate
+      break
+    }
   }
   if (!resolved && process.platform === 'win32') {
     try {
@@ -251,13 +302,15 @@ function resolveSystemPython() {
         stdio: ['ignore', 'pipe', 'ignore'],
       })
       const candidate = String(output || '').trim().split(/\r?\n/)[0]
-      if (candidate && isTrustedPythonPath(candidate) && fs.existsSync(candidate)) {
+      if (candidate && isTrustedPythonPath(candidate) && fs.existsSync(candidate) && pythonHasBackendDeps(candidate)) {
         resolved = candidate
       }
     } catch (_) { /* py launcher 不可用或解析异常，回退 null */ }
   }
-  cachedSystemPython = resolved
-  return resolved
+  // 没有任何候选带齐依赖时，退回「第一个存在的候选」——保持 2026-09-18 之前的原有语义，
+  // 让调用方仍拿到一个绝对路径（而不是 undefined 后回落到 PATH）。
+  cachedSystemPython = resolved || fallback
+  return cachedSystemPython
 }
 
 /**

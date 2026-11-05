@@ -23,7 +23,7 @@ export default {
       circuit_open: '该平台请求已被熔断保护（连续失败触发）。请等待约 1 小时后重试，或先采集其他平台。',
       rate_limited: '请求过于频繁，被平台限流。请等待 30 秒后重试。',
       weekend_throttle: '周末自动采集已按保护策略降低频率（模拟人工低频使用，降低账号被平台封禁的风险）。本次请求被随机延迟。您可以：1) 稍等片刻再试；2) 在采集页手动输入链接单次采集（手动采集不受周末策略限制）；3) 工作日再执行批量采集。',
-      security_challenge: '目标页面触发了安全验证（如知乎反爬）。建议：1) 在浏览器中打开该链接确认可访问；2) 稍后重试；3) 换用其他文章链接。',
+      security_challenge: '目标页面触发了安全验证（如百度安全验证 / 知乎反爬），本次没有拿到真实正文，已阻止把验证提示当作采集内容。建议：1) 等待 1-2 分钟后重试（多数情况会自动通过）；2) 在浏览器中打开该链接确认可访问；3) 换用同平台其他文章链接。',
       timeout: '目标网站响应超时。请检查网络连接后重试；若持续超时，可能是目标站点负载高，建议稍后再试。',
       unreachable: '无法连接目标网站。请检查：1) 链接是否正确；2) 本机网络是否可访问该站点；3) 是否需要代理。',
       content_unextractable: '页面内容无法提取（可能是 SPA 动态渲染或结构特殊）。建议换用其他文章链接，或复制正文手动创建草稿。',
@@ -47,6 +47,7 @@ export default {
     },
     collectSuccess: '内容采集成功',
     collectRequestFailed: '采集请求失败',
+    draftBlockedSecurityChallenge: '该条采集内容实际是「安全验证」页提示文字，不是文章正文，已阻止创建草稿 / 进入发布页。请重新采集原文，或删除该条采集记录。',
     videoStageProbe: '正在探测视频信息...',
     videoStageDownloading: '正在下载视频...',
     videoStageExtracting: '正在提取音频...',
@@ -186,6 +187,8 @@ export default {
     rewriting: 'AI 改写中...',
     rewriteSuccess: '改写完成',
     rewriteFailed: 'AI 改写失败',
+    // 分段改写提示（rewrite-segment-and-finish-reason）：>阈值透传全文由引擎分段，不再预截断
+    rewriteSegmented: '正文共 {length} 字，超过单次改写上限 {max} 字，将分段改写（耗时与费用相应增加，其他 AI 功能可能变慢）',
     oneClickRewrite: '一键改写',
     oneClickRewriting: '一键改写中...',
     originalContent: '采集原文',
@@ -246,6 +249,8 @@ export default {
       mappingMismatch: '采集结果映射异常（主进程报告成功但无条目产出），请查看日志或反馈',
     },
     zhihuFav: {
+      stepHintNoFavlists: '下一步：点「获取收藏夹」拉取收藏夹列表，才能选择要采集的范围。',
+      stepHintNeedContents: '下一步：选好范围与数量后点「加载收藏内容」——加载出来的条目才能勾选并「采集&改写」。',
       kindAnswer: '回答', kindArticle: '文章', kindColumn: '专栏', kindPin: '想法', kindVideo: '视频', kindUnknown: '链接',
       rewriteFailedBadge: '改写失败用原文',
       imageFallbackBadge: '{count} 张图片回退原链',
@@ -254,6 +259,14 @@ export default {
       doneNote: '完成',
       registerOnlyNote: '已登记（暂不支持正文采集）',
       collectOkRewriteFailNote: '采集成功，改写失败用原文',
+      duplicateNote: '已采集过，本次跳过（勾选「包含已采集」可强制重采）',
+      failedNote: '采集失败：{reason}',
+      failedNoReason: '采集失败（无详情，请查看日志）',
+      allFailedNote: '全部采集失败（{failed} 条），详情见进度明细与日志',
+      allSkippedNote: '这 {skipped} 条都已采集过，本次全部跳过（勾选「包含已采集」可强制重采）',
+      cancelledNote: '已取消采集',
+      circuitBrokenNote: '已触发平台限流保护（熔断），本轮中止，请稍后重试',
+      nothingCollectedNote: '本轮没有采集到内容',
       fallbackSuffix: '，{count} 张图片回退原链',
       // ── collection-ui-refinement：BatchCollectPanel 迁入扫描视野后补齐的 12 个既有用法 key ──
       scopeFavlist: '指定收藏夹',
@@ -266,7 +279,7 @@ export default {
       selectAll: '全选',
       selectedCount: '已选 {count} 条',
       collecting: '采集中...',
-      collectAndRewrite: '采集并改写',
+      collectAndRewrite: '采集&改写',
       markCollected: '已采集',
     },
     batch: {
@@ -310,6 +323,20 @@ export default {
     cancelBatch: '取消',
     enterRss: '请输入 RSS 链接',
     enterUrlList: '请输入至少一个链接',
+    // ── 采集页整体 UI/UE 统一（collection-page-ui-ue-refine，2026-10-17）──
+    // 模板里的裸中文字符串搬进 locale（zh/en 成对，渲染端 CJK 基线纪律）。
+    // 每行两个键是刻意的：本域文件改动前已 483 行，逐条一行会把本文件顶过
+    // check-max-lines 的 500 行硬限（NEW_OVER_LIMIT）。
+    pageSubtitle: '从各平台采集内容，或快速创建草稿',
+    urlPlaceholder: '输入文章链接，自动采集标题、正文、封面…',
+    collect: '采集', collecting: '采集中…',
+    retry: '重试', createDraft: '创建草稿',
+    useViralLibrary: '结合爆款库', usePersonalExperience: '结合个人经历',
+    saveDraft: '存入草稿', goPublish: '去发布',
+    cancel: '取消', resultTitlePrefix: '采集结果',
+    hasCoverImage: '有封面图', quickNewDraft: '新建草稿',
+    quickClipboard: '剪贴板导入', quickGroupNew: '新建',
+    quickGroupDrafts: '草稿', quickGroupSources: '素材来源',
     tabCollect: '内容采集',
     quickCollectTab: '快捷采集',
     draftsTab: '草稿箱',
@@ -332,10 +359,11 @@ export default {
     draftsSource_clipboard: '剪贴板',
     draftsSource_url: '链接采集',
     draftsSource_rss: 'RSS',
-    // 素材来源快捷入口（语义：去哪**找素材**，不是去哪发内容）
+    // 素材来源快捷入口（语义：去哪**找素材**，不是去哪发内容）。
+    // 卡片 = 免登录可匿名浏览的渲染页；知乎已撤下（强制登录），头条指向首页（无渲染版热榜页）
     sourceWeibo: '微博热搜',
-    sourceZhihu: '知乎热榜',
-    sourceToutiao: '头条热榜',
+    sourceBaidu: '百度热搜',
+    sourceToutiao: '今日头条',
     platformSourceTabTitle: (ctx) => ctx.named('platform') + ' 素材来源',
     tabRecords: '文案库',
     recordsTitle: '文案库',

@@ -141,29 +141,8 @@
                   <option :value="false">关闭</option>
                 </UiSelect>
               </UiField>
-              <UiField class="config-item" option-key="voice.bgm" label="背景音乐">
-                <div class="inline-file-control">
-                  <UiSelect v-model="s2vConfig.bgmPath" testid="s2v-bgm-select">
-                    <option value="">{{ translateWithLocaleFallback('create.story2video.bgmLibrary.noBgm', '不使用背景音乐', 'No background music') }}</option>
-                    <option v-for="item in s2vBgmLibrary" :key="item.id" :value="item.path">{{ item.name }}</option>
-                    <option v-if="s2vLegacyBgmPath" :value="s2vLegacyBgmPath">{{ translateWithLocaleFallback('create.story2video.bgmLibrary.legacyBgm', '已选音频（未入库）', 'Selected audio (not in library)') }}</option>
-                  </UiSelect>
-                  <button type="button" class="s2v-btn-secondary" data-testid="s2v-bgm-manage-button" @click="openBgmLibraryDialog">{{ translateWithLocaleFallback('create.story2video.bgmLibrary.manage', '管理背景音乐', 'Manage music') }}</button>
-                </div>
-                <p class="config-hint">{{ mediaRequirementsBgmText }}</p>
-              </UiField>
-              <div class="config-item" v-if="s2vOptionVisible('voice.bgmVolume')">
-                <UiSlider
-                  v-model="s2vConfig.bgmVolume"
-                  :min="0"
-                  :max="10"
-                  :step="1"
-                  :default-value="5"
-                  testid="s2v-bgm-volume"
-                  :label="$t('create.story2video.ui.bgmVolumeLabel')"
-                  :hint="$t('create.story2video.ui.doubleResetHint')"
-                />
-              </div>
+              <!-- 背景音乐与音量已归位「声音」分组（s2v-bgm-legacy-repair，2026-10-17）：
+                   二者 optionKey 本就是 voice.*，模板留在「画面」属实现与目录不一致。 -->
               <div class="config-item" v-if="s2vOptionVisible('visual.watermarkText')">
                 <label>{{ translateWithLocaleFallback('create.story2video.watermark.label', 'Watermark text', 'Watermark text') }}</label>
                 <input v-model.trim="s2vConfig.watermarkText" class="form-input" :placeholder="translateWithLocaleFallback('create.story2video.watermark.placeholder', 'Optional', 'Optional')" />
@@ -357,8 +336,15 @@
               <span>{{ s2vSectionLabel('voice') }}</span>
               <span class="s2v-summary">{{ s2vSectionSummary('voice') }}<span v-if="s2vSectionAtDefault('voice')" class="s2v-summary-default">{{ $t('create.story2video.ui.sectionDefaultSuffix') }}</span></span>
             </summary>
-            <div class="s2v-field-grid">
-              <UiField class="config-item" option-key="voice.voiceProvider" label="语音生成器">
+              <!-- 声音区内再分三个子分区（s2v-voice-section-layout，2026-10-18）：
+                   原为单一自适应栅格，四类控件（语音生成器/音色ID、背景音乐/音量、音色克隆）
+                   混排，「音色复制 / 克隆」只占半行宽、和「背景音乐音量」并排，看不出分组。
+                   拆为「旁白设置 / 背景音乐 / 音色克隆」三块，各带标题行，
+                   克隆面板独占满宽。子分区沿用 .s2v-subgroup 既有样式（与「高级」区同构）。 -->
+              <div class="s2v-subgroup" data-testid="s2v-subgroup-voiceNarration">
+                <h4 class="s2v-subgroup-title">{{ s2vSubgroupLabel('voiceNarration') }}</h4>
+                <div class="s2v-field-grid">
+                  <UiField class="config-item" option-key="voice.voiceProvider" label="语音生成器">
                 <UiSelect v-model="s2vConfig.voiceProvider" @change="handleS2VVoiceProviderChange">
                   <!-- 首项「自动 Edge TTS」为常驻免费兜底（id=''），列表为空时下拉仍非空白；
                        仅补充配置引导提示（2026-08-12 复审 W1，与图片/视频空态提示对齐）。 -->
@@ -366,18 +352,15 @@
                 </UiSelect>
                 <p v-if="s2vVoiceProviders.length === 0" class="config-hint">未配置 TTS 模型时将使用自动 Edge TTS（免费）；如需 MiniMax 等语音模型与音色克隆能力，请先在「模型服务商」中配置。<a href="#/model-providers" class="config-hint-link">前往配置 →</a></p>
               </UiField>
-              <UiField v-if="s2vConfig.voiceProvider && !s2vVoiceModelHidden" class="config-item" label="语音模型">
-                <UiSelect
-                  v-if="s2vVoiceModelOptions.length > 0"
-                  v-model="s2vConfig.voiceModel"
-                  @change="handleS2VVoiceModelChange"
-                >
-                  <option disabled value="">选择模型</option>
-                  <option v-for="model in s2vVoiceModelOptions" :key="model" :value="model">{{ model }}</option>
-                </UiSelect>
-                <span v-else class="config-hint">当前服务商没有可用的语音模型。</span>
-              </UiField>
-              <UiField v-if="s2vConfig.voiceProvider && (s2vConfig.voiceModel || s2vVoiceModelHidden)" class="config-item" label="语音 / 音色 ID">
+              <!-- 「语音模型」下拉已移除（voice-model-program-resolved，2026-10-18）：
+                   用户只选择能力提供方，具体 Model ID 由程序按运营中心配置的默许模型解析
+                   （resolveVoiceModelForProvider），静默写入 s2vConfig.voiceModel 供 IPC/快照使用。
+                   MiMo 的 tts/voiceclone 双模型区分由音色类型驱动，与此正交。 -->
+              <!-- 显示条件（voice-model-program-resolved 修正，2026-10-19）：已选提供方 **且** 已知模型。
+                   模型有两个来源：①程序按运营默许模型解析出的 s2vVoiceContextModel（正常路径）；
+                   ②既有 s2vConfig.voiceModel（历史快照 / 配置档案回填后尚未重算、或分发夹具显式给值）。
+                   两者都为空 ⇒ 无法确定用哪个模型 ⇒ 整项不渲染，不留一个空音色下拉。 -->
+              <UiField v-if="s2vConfig.voiceProvider && (s2vVoiceContextModel || s2vConfig.voiceModel)" class="config-item" label="语音 / 音色 ID">
                 <UiSelect
                   id="s2v-voice-catalog"
                   v-model="s2vConfig.voiceId"
@@ -400,8 +383,76 @@
                   @click="refreshS2VVoiceCatalog"
                 >刷新音色列表</button>
                 <span v-else-if="s2vVoiceOptions.length === 0" class="config-hint">当前模型没有可用音色。</span>
+                </UiField>
+              </div>
+              </div>
+              <div class="s2v-subgroup" data-testid="s2v-subgroup-voiceBgm">
+                <h4 class="s2v-subgroup-title">{{ s2vSubgroupLabel('voiceBgm') }}</h4>
+                <div class="s2v-field-grid">
+              <!-- 背景音乐与音量（自「画面」移入「声音」，s2v-bgm-legacy-repair）：
+                   历史路径不再只有「未入库」一词，而是按主进程只读核验结果区分为
+                   可用/已丢失/不可用/未知，并给出【加入素材库】/【清除】一次性修复动作。 -->
+              <UiField class="config-item" option-key="voice.bgm" label="背景音乐">
+                <div class="inline-file-control">
+                  <UiSelect v-model="s2vConfig.bgmPath" testid="s2v-bgm-select">
+                    <option value="">{{ $t('create.story2video.bgmLibrary.noBgm') }}</option>
+                    <option v-for="item in s2vBgmLibrary" :key="item.id" :value="item.path">{{ item.name }}</option>
+                    <option v-if="s2vLegacyBgmPath" :value="s2vLegacyBgmPath">{{ $t(legacyBgmOptionKey) }}</option>
+                  </UiSelect>
+                  <button type="button" class="s2v-btn-secondary" data-testid="s2v-bgm-manage-button" @click="openBgmLibraryDialog">{{ $t('create.story2video.bgmLibrary.manage') }}</button>
+                </div>
+                <p class="config-hint">{{ mediaRequirementsBgmText }}</p>
+                <div
+                  v-if="s2vLegacyBgmPath"
+                  class="s2v-bgm-legacy-status"
+                  :data-state="s2vLegacyBgmStatus.state"
+                  data-testid="s2v-bgm-legacy-status"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <p v-if="legacyBgmStatusHintKey" class="config-hint" :class="{ 'inline-error': legacyBgmStatusNeedsAction }">{{ $t(legacyBgmStatusHintKey) }}</p>
+                  <div v-if="legacyBgmStatusNeedsAction || s2vLegacyBgmStatus.state === 'available' || s2vLegacyBgmStatus.state === 'unknown'" class="s2v-bgm-legacy-actions">
+                    <button
+                      v-if="s2vLegacyBgmStatus.state === 'available'"
+                      type="button"
+                      class="s2v-btn-secondary s2v-btn-sm"
+                      data-testid="s2v-bgm-adopt"
+                      @click="adoptS2VLegacyBgm"
+                    >{{ $t('create.story2video.bgmLibrary.adoptAction') }}</button>
+                    <button
+                      v-if="legacyBgmStatusNeedsAction"
+                      type="button"
+                      class="s2v-btn-secondary s2v-btn-sm"
+                      data-testid="s2v-bgm-clear"
+                      @click="clearS2VLegacyBgm"
+                    >{{ $t('create.story2video.bgmLibrary.clearAction') }}</button>
+                    <button
+                      v-if="s2vLegacyBgmStatus.state === 'unknown'"
+                      type="button"
+                      class="s2v-btn-secondary s2v-btn-sm"
+                      data-testid="s2v-bgm-recheck"
+                      @click="verifyS2VLegacyBgm(s2vLegacyBgmPath)"
+                    >{{ $t('create.story2video.bgmLibrary.verifyRetry') }}</button>
+                  </div>
+                </div>
               </UiField>
-              <div v-if="s2vVoiceCapability?.type === 'provider_personal_slot'" class="config-item config-span-2 voice-slot-hint">
+              <div class="config-item" v-if="s2vOptionVisible('voice.bgmVolume')">
+                <UiSlider
+                  v-model="s2vConfig.bgmVolume"
+                  :min="0"
+                  :max="10"
+                  :step="1"
+                  :default-value="5"
+                  testid="s2v-bgm-volume"
+                  :label="$t('create.story2video.ui.bgmVolumeLabel')"
+                  :hint="$t('create.story2video.ui.doubleResetHint')"
+                />
+                </div>
+                </div>
+            </div>
+              <div class="s2v-subgroup" data-testid="s2v-subgroup-voiceClone">
+                <h4 class="s2v-subgroup-title">{{ s2vSubgroupLabel('voiceClone') }}</h4>
+                <div v-if="s2vVoiceCapability?.type === 'provider_personal_slot'" class="config-item config-span-2 voice-slot-hint">
                 <label>个人音色槽位</label>
                 <p class="config-hint">请先在服务商官方控制台创建或管理个人音色，再刷新本地目录并在上方下拉列表中选择。当前页面不会伪造或复制服务商槽位。</p>
               </div>
@@ -419,9 +470,13 @@
                 </p>
                 <p v-if="s2vVoiceCloneRequirements" class="config-hint">以上为当前模型能力数据驱动的本地校验提示，具体以供应商官方 API 合同为准。</p>
                 <div class="voice-clone-actions">
-                  <button type="button" class="s2v-btn-secondary s2v-btn-sm" :disabled="s2vVoiceCloneLoading" @click="chooseS2VVoiceCloneSamples">
-                    {{ s2vVoiceCloneLoading
-                      ? translateWithLocaleFallback('create.story2video.voice.cloneInProgressButton', '正在克隆…', 'Cloning...')
+                  <!-- 进行中文案只由实际「添加克隆音色」阶段（s2vVoiceClonePending）驱动：
+                       浏览系统文件选择器期间 s2vVoiceCloneLoading 也为 true，但用户尚未选定文件，
+                       按钮文案必须保持「选择本地音频文件/重新选择音频文件」不变
+                       （voice-clone-pick-feedback，2026-10-18）。 -->
+                  <button type="button" class="s2v-btn-secondary s2v-btn-sm" data-testid="s2v-voice-clone-choose-button" :disabled="s2vVoiceCloneLoading" @click="chooseS2VVoiceCloneSamples">
+                    {{ s2vVoiceClonePending
+                      ? translateWithLocaleFallback('create.story2video.voice.cloneInProgressButton', '正在添加…', 'Adding...')
                       : (s2vVoiceCloneSelection
                         ? translateWithLocaleFallback('create.story2video.voice.cloneReselectButton', '重新选择音频文件', 'Choose audio file again')
                         : translateWithLocaleFallback('create.story2video.voice.cloneSelectButton', '选择本地音频文件', 'Choose local audio file')) }}
@@ -475,12 +530,12 @@
                   </div>
                 </div>
                 </template>
+                </div>
+                <div v-else-if="s2vVoiceCapability?.type === 'user_clone'" class="config-item config-span-2 voice-slot-hint">
+                  <label>音色复制 / 克隆</label>
+                  <p class="config-hint">当前服务商尚未接入可用的音色克隆能力。</p>
+                </div>
               </div>
-              <div v-else-if="s2vVoiceCapability?.type === 'user_clone'" class="config-item config-span-2 voice-slot-hint">
-                <label>音色复制 / 克隆</label>
-                <p class="config-hint">当前服务商尚未接入可用的音色克隆能力。</p>
-              </div>
-            </div>
           </details>
 
           <details
@@ -677,6 +732,29 @@ const s2vCustomTemplateName = computed({ get: () => state.s2vCustomTemplateName,
 const s2vImageProviderOptions = computed(() => state.s2vImageProviderOptions);
 const s2vImageProviders = computed(() => state.s2vImageProviders);
 const s2vLegacyBgmPath = computed(() => state.s2vLegacyBgmPath);
+// 历史路径核验状态（idle/checking/available/missing/unusable/unknown）：
+// 缺省按 idle 兜底，保证父级旧快照/测试夹具未提供该键时面板不炸。
+const s2vLegacyBgmStatus = computed(() => state.s2vLegacyBgmStatus || { state: 'idle', path: '', reason: '', exists: false });
+// 选项文案与提示文案只返回 locale key，由模板 $t 解析：
+// 避免在 src 非 locales 文件新增中文字面量（CI locale CJK 基线增量扫描）。
+const legacyBgmOptionKey = computed(() => {
+  const status = s2vLegacyBgmStatus.value.state;
+  if (status === 'missing') return 'create.story2video.bgmLibrary.legacyMissing';
+  if (status === 'unusable') return 'create.story2video.bgmLibrary.legacyUnusable';
+  if (status === 'available') return 'create.story2video.bgmLibrary.legacyAvailable';
+  return 'create.story2video.bgmLibrary.legacyBgm';
+});
+const legacyBgmStatusHintKey = computed(() => {
+  const status = s2vLegacyBgmStatus.value.state;
+  if (status === 'checking') return 'create.story2video.bgmLibrary.legacyHintChecking';
+  if (status === 'available') return 'create.story2video.bgmLibrary.legacyHintAvailable';
+  if (status === 'missing') return 'create.story2video.bgmLibrary.legacyHintMissing';
+  if (status === 'unusable') return 'create.story2video.bgmLibrary.legacyHintUnusable';
+  if (status === 'unknown') return 'create.story2video.bgmLibrary.legacyHintUnknown';
+  return '';
+});
+// 需要用户处理的两种状态（丢失/不可用）：提示转错误色并出现【清除】按钮。
+const legacyBgmStatusNeedsAction = computed(() => ['missing', 'unusable'].includes(s2vLegacyBgmStatus.value.state));
 const s2vMaxPromptLengthHint = computed(() => state.s2vMaxPromptLengthHint);
 const s2vMaxPromptLengthLabel = computed(() => state.s2vMaxPromptLengthLabel);
 const s2vMaxPromptLengthOptions = computed(() => state.s2vMaxPromptLengthOptions);
@@ -711,8 +789,7 @@ const s2vVoiceCloneRenamingId = computed(() => state.s2vVoiceCloneRenamingId);
 const s2vVoiceCloneRequirements = computed(() => state.s2vVoiceCloneRequirements);
 const s2vVoiceCloneSelection = computed(() => state.s2vVoiceCloneSelection);
 const s2vVoiceClones = computed(() => state.s2vVoiceClones);
-const s2vVoiceModelHidden = computed(() => state.s2vVoiceModelHidden);
-const s2vVoiceModelOptions = computed(() => state.s2vVoiceModelOptions);
+const s2vVoiceContextModel = computed(() => state.s2vVoiceContextModel);
 const s2vVoiceOptions = computed(() => state.s2vVoiceOptions);
 const s2vVoiceProviderOptions = computed(() => state.s2vVoiceProviderOptions);
 const s2vVoiceProviders = computed(() => state.s2vVoiceProviders);
@@ -722,12 +799,13 @@ const story2videoImageStyleHint = computed(() => state.story2videoImageStyleHint
 const story2videoPromptStyleHint = computed(() => state.story2videoPromptStyleHint);
 
 // ---- 方法转发 ----
+const adoptS2VLegacyBgm = (...args) => fns.adoptS2VLegacyBgm(...args);
 const applyS2VTemplate = (...args) => fns.applyS2VTemplate(...args);
 const cancelS2VVoiceCloneRename = (...args) => fns.cancelS2VVoiceCloneRename(...args);
 const chooseS2VVoiceCloneSamples = (...args) => fns.chooseS2VVoiceCloneSamples(...args);
+const clearS2VLegacyBgm = (...args) => fns.clearS2VLegacyBgm(...args);
 const deleteS2VVoiceClone = (...args) => fns.deleteS2VVoiceClone(...args);
 const handleS2VVideoProviderChange = (...args) => fns.handleS2VVideoProviderChange(...args);
-const handleS2VVoiceModelChange = (...args) => fns.handleS2VVoiceModelChange(...args);
 const handleS2VVoiceProviderChange = (...args) => fns.handleS2VVoiceProviderChange(...args);
 const handleS2VVoiceSelection = (...args) => fns.handleS2VVoiceSelection(...args);
 const isOrchestratedPipeline = (...args) => fns.isOrchestratedPipeline(...args);
@@ -749,4 +827,5 @@ const selectS2VVoice = (...args) => fns.selectS2VVoice(...args);
 const setS2VSectionOpen = (...args) => fns.setS2VSectionOpen(...args);
 const startS2VVoiceCloneRename = (...args) => fns.startS2VVoiceCloneRename(...args);
 const translateWithLocaleFallback = (...args) => fns.translateWithLocaleFallback(...args);
+const verifyS2VLegacyBgm = (...args) => fns.verifyS2VLegacyBgm(...args);
 </script>

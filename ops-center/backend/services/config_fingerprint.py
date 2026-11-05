@@ -12,8 +12,10 @@ import math
 
 from models import RuntimeConfigVersion  # noqa: F401  （保持与 models 的导入时序一致）
 
-#: 参与内容指纹计算的 13 个下发数据块。新增下发块时 MUST 同步加入此处，
+#: 参与内容指纹计算的 14 个下发数据块。新增下发块时 MUST 同步加入此处，
 #: 否则该块变更不会体现在 config_hash 上 → 客户端不会收到 ACK → 看板显示「未生效」。
+#: ⚠️ 这份白名单与桌面端 `ops-runtime-snapshot.js` 的 `RUNTIME_BLOCKS` **必须成对改**：
+#: 只改一端 ⇒ 两端 canonical 输入不同 ⇒ config_hash 不同 ⇒ 客户端 ACK 永不被认可。
 RUNTIME_BLOCKS = (
     "announcements",
     "update_policy",
@@ -28,6 +30,7 @@ RUNTIME_BLOCKS = (
     "pipelineOptions",
     "appMenu",
     "contentCategories",
+    "storyTextLimit",
 )
 
 #: JS 侧 Number 能精确表示的最大整数。超过则 JS 丢精度、Python 不丢 ⇒ 两端 hash 必不同。
@@ -35,17 +38,31 @@ MAX_SAFE_INTEGER = 9007199254740992
 
 
 def compute_config_hash(payload: dict, canonical_json) -> str:
-    """13 个下发数据块 canonical JSON 的 SHA-256 前 16 位。
+    """14 个下发数据块 canonical JSON 的 SHA-256 前 16 位。
 
     参数 ``canonical_json`` 由调用方注入（复用 runtime_service 那个与桌面端逐字节对齐的
     实现，避免在这里复制第二份序列化器 —— 那正是两端漂移的来源）。
 
-    三条不可违背的约束（design.md §1.2）：
+    四条不可违背的约束（design.md §1.2）：
     1. 只取 RUNTIME_BLOCKS 白名单——synced_at 每次请求都变，纳入则 hash 永远变、
        客户端每次都发 ACK，直接变成推送地狱。
     2. 缺失键以 ``None`` 参与而非跳过——否则「删掉一个数据块」与「该键本来不存在」
        产生同一个 hash，运营删除配置会静默不升版。
     3. 不得纳入 config_version / config_hash / signature（自指）。
+    4. **白名单内每个块的载荷本身也不得含「每请求变化的时钟产物」**（synced_at /
+       syncedAt / 任何 `_now()` 产物）——只把顶层 synced_at 挡在白名单外是不够的：
+       2026-10-18 之前 appMenu 与 contentCategories 两个块各自返回了块内 synced_at，
+       注释第 1 条明明写对了，实现却对不上，实测后果是「内容没变 hash 也变」：
+       每次 bootstrap 的 config_hash 都不同、config_version 每次 +1、
+       生效看板「已确认率」永远上不去、RuntimeConfigVersion 表随请求数无限增长。
+       回归锁：`ops-center/backend/tests/test_config_hash_stability.py`
+       （同一库连构两次 bootstrap，hash 必须逐字相等）。
+
+       ⚠️ **只禁「时钟产物」，不禁「内容属性」**：`updated_at` / `created_at` 属于内容属性
+       ——运营改了这条配置，它跟着变，hash 随之变化是**正确**行为（否则「内容变更升版」
+       这条语义会被一起判死）。区别在于：synced_at 是每次请求现生成的、与内容无关；
+       updated_at 记录的是「这条内容最后一次被改」。判据因此分两层：
+       不变量测试抓「值在变」，静态锁只查 synced_at 键、刻意不查 updated_at。
 
     第四道锁：**数值必须两端序列化一致**，否则 raise ValueError。
     """

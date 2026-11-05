@@ -1,0 +1,12 @@
+{
+  "id": "video-clone-slice4d",
+  "title": "视频克隆切片 4d：持久化 + regenerate",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "desktop",
+  "currentPhase": "completed",
+  "nextAction": "归档",
+  "createdAt": "2026-08-12T13:00:00Z",
+  "branch": "codex/video-clone-slice4d"
+}

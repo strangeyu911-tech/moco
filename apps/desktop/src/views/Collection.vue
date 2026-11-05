@@ -3,59 +3,79 @@
     <div class="cohere-page-header">
       <div>
         <div class="collection-tabs" role="tablist">
-          <button role="tab" :aria-selected="activeTab === 'collect'" class="collection-tab-btn" :class="{ active: activeTab === 'collect' }" @click="switchTab('collect')">{{ $t('collection.tabCollect') }}</button>
+          <button
+            role="tab"
+            id="collection-tab-btn-collect"
+            :aria-selected="activeTab === 'collect'"
+            :aria-controls="'collection-tabpanel-' + activeTab"
+            class="collection-tab-btn"
+            :class="{ active: activeTab === 'collect' }"
+            data-testid="collection-tab-collect"
+            @click="switchTab('collect')">{{ $t('collection.tabCollect') }}</button>
           <QuickCollectTab :active="activeTab === 'quick'" @select="switchTab('quick')" />
           <CollectionDraftsTab :active="activeTab === 'drafts'" :count="draftCount" @select="switchTab('drafts')" />
-          <button role="tab" :aria-selected="activeTab === 'records'" class="collection-tab-btn" :class="{ active: activeTab === 'records' }" data-testid="collection-tab-library" @click="switchTab('records')">{{ $t('collection.tabRecords') }}</button>
+          <button
+            role="tab"
+            id="collection-tab-btn-records"
+            :aria-selected="activeTab === 'records'"
+            :aria-controls="'collection-tabpanel-' + activeTab"
+            class="collection-tab-btn"
+            :class="{ active: activeTab === 'records' }"
+            data-testid="collection-tab-library"
+            @click="switchTab('records')">{{ $t('collection.tabRecords') }}</button>
           <CollectionCreatorTab :active="activeTab === 'creator'" @select="switchTab('creator')" />
         </div>
-        <div class="page-subtitle">从各平台采集内容，或快速创建草稿</div>
+        <div class="page-subtitle">{{ $t('collection.pageSubtitle') }}</div>
       </div>
       <div class="page-actions">
-        <button class="cohere-btn-secondary" @click="importFromClipboard"><el-icon><DocumentCopy /></el-icon> 从剪贴板导入</button>
-        <button class="cohere-btn-primary" @click="createDraft">＋ 新建草稿</button>
+        <button class="cohere-btn-secondary" @click="importFromClipboard"><el-icon><DocumentCopy /></el-icon> {{ $t('collection.quickClipboard') }}</button>
+        <button class="cohere-btn-primary" @click="createDraft">＋ {{ $t('collection.quickNewDraft') }}</button>
       </div>
     </div>
 
-    <div v-if="activeTab === 'collect'" class="cohere-content">
+    <div v-if="activeTab === 'collect'" id="collection-tabpanel-collect" class="cohere-content" role="tabpanel" :aria-labelledby="'collection-tab-btn-' + activeTab">
       <!-- URL 采集输入 -->
       <div class="cohere-card col-panel">
         <div class="col-toolbar">
-          <span class="col-toolbar-icon"><el-icon><Link /></el-icon></span>
           <select v-model="collectSourceType" class="col-select">
             <option v-for="s in collectSources" :key="s.type" :value="s.type">{{ s.name }}</option>
           </select>
           <input
             ref="urlInputRef"
             v-model="linkUrl"
-            placeholder="输入文章链接，自动采集标题、正文、封面..."
+            :placeholder="$t('collection.urlPlaceholder')"
             class="col-input col-input--grow"
             @keyup.enter="collectUrl"
           />
-          <button data-testid="collection-collect-btn" class="cohere-btn-primary" @click="collectUrl" :disabled="collecting || oneClickRewriting">
-            {{ collecting ? '采集中...' : '采集' }}
+          <button data-testid="collection-collect-btn" class="col-btn col-btn--primary" @click="collectUrl" :disabled="collecting || oneClickRewriting">
+            {{ collecting ? $t('collection.collecting') : $t('collection.collect') }}
           </button>
-          <button class="cohere-btn-primary" @click="collectAndRewrite" :disabled="collecting || oneClickRewriting">
+          <button class="col-btn col-btn--primary" @click="collectAndRewrite" :disabled="collecting || oneClickRewriting">
             {{ oneClickRewriting ? $t('collection.oneClickRewriting') : $t('collection.oneClickRewrite') }}
           </button>
-          <button v-if="collectError && RETRYABLE_CODES.has(collectError.code)" class="cohere-btn-secondary col-btn-retry" @click="retryCollect" :disabled="collecting">
-            🔄 重试
+          <button v-if="collectError && RETRYABLE_CODES.has(collectError.code)" class="col-btn col-btn--secondary col-btn-retry" @click="retryCollect" :disabled="collecting">
+            {{ $t('collection.retry') }}
           </button>
         </div>
         <div v-if="collectError" class="col-error-banner">
           {{ collectErrorDetail }}
-          <button v-if="collectError && collectErrorRetryable" class="cohere-btn-secondary col-btn-retry-sm" @click="retryCollect" :disabled="collecting">
-            🔄 重试
+          <button v-if="collectError && collectErrorRetryable" class="col-btn col-btn--secondary col-btn-retry-sm" @click="retryCollect" :disabled="collecting">
+            {{ $t('collection.retry') }}
           </button>
         </div>
         <div v-if="videoCollectStage" data-testid="collection-video-stage" class="col-stage-banner">
           {{ videoStageText(videoCollectStage) }}
         </div>
-        <div v-if="collectedResult" class="col-result-box">
-          <div class="col-result-title">✅ {{ collectedResult.title || '无标题' }}</div>
+        <!-- 结果详情框（2026-10-17 加锚点）：id=collected-result-box。
+             修复「点编辑/点内容没反应」：之前 select 只改了 collectedResult，详情框
+             出现在页面很靠上的位置，而列表在视口下方 ⇒ 视觉上"点了没反应"。
+             现在 selectCollectedItem 会选中并 scrollIntoView 到这个框。
+             用 id 而非 ref 做锚：采集页单实例，且 jsdom 测试可直接桩元素。 -->
+        <div v-if="collectedResult" id="collected-result-box" data-testid="collected-result-box" class="col-result-box">
+          <div class="col-result-title">{{ $t('collection.resultTitlePrefix') }} {{ collectedResult.title || $t('collection.recordsUntitled') }}</div>
           <div class="col-result-meta">
-            {{ collectedResult.description ? collectedResult.description.slice(0, 120) + '...' : '' }}
-            <span v-if="collectedResult.coverImage"> · 有封面图</span>
+            {{ collectedResult.description ? collectedResult.description.slice(0, 120) + '…' : '' }}
+            <span v-if="collectedResult.coverImage"> · {{ $t('collection.hasCoverImage') }}</span>
             <span v-if="collectedResult.mediaType === 'video'"> · <el-icon><VideoCamera /></el-icon> {{ $t('collection.videoTranscriptLabel') }}<template v-if="collectedResult.duration"> · {{ formatVideoDuration(collectedResult.duration) }}</template><template v-if="collectedResult.platform && PLATFORM_KEYS.includes(collectedResult.platform)"> · {{ platformLabel(collectedResult.platform) }}</template></span>
           </div>
           <!-- 改写策略选择（2026-09-15 补齐）：与 /rewrite 页同组件同契约，此前采集页改写无策略入口 -->
@@ -76,20 +96,20 @@
             }"
           />
           <div class="col-chip-row">
-            <button class="cohere-btn-primary" @click="createFromCollected">创建草稿</button>
+            <button class="col-btn col-btn--primary" @click="createFromCollected">{{ $t('collection.createDraft') }}</button>
             <button
-              class="cohere-btn-secondary"
+              class="col-btn col-btn--secondary"
               :disabled="addedToViral"
               :title="addedToViral ? $t('knowledgeBase.addedToViral') : $t('knowledgeBase.addToViral')"
               @click="addCollectedToViral"
             >
               {{ addedToViral ? '✓ ' + $t('knowledgeBase.addedToViral') : $t('knowledgeBase.addToViral') }}
             </button>
-            <label class="col-check-label" :class="{ 'o-disabled': rewriting || oneClickRewriting }">
-              <input type="checkbox" v-model="useViralLibrary" class="coral-check" :disabled="rewriting || oneClickRewriting" /> 结合爆款库
+            <label class="col-check-label" :class="{ 'is-disabled': rewriting || oneClickRewriting }">
+              <input type="checkbox" v-model="useViralLibrary" class="coral-check" :disabled="rewriting || oneClickRewriting" /> {{ $t('collection.useViralLibrary') }}
             </label>
-            <label class="col-check-label" :class="{ 'o-disabled': rewriting || oneClickRewriting }">
-              <input type="checkbox" v-model="usePersonalExperience" class="coral-check" :disabled="rewriting || oneClickRewriting" /> 结合个人经历
+            <label class="col-check-label" :class="{ 'is-disabled': rewriting || oneClickRewriting }">
+              <input type="checkbox" v-model="usePersonalExperience" class="coral-check" :disabled="rewriting || oneClickRewriting" /> {{ $t('collection.usePersonalExperience') }}
             </label>
             <select v-model="rewriteStyle" class="col-select-sm" :disabled="rewriting || oneClickRewriting">
               <option v-for="s in getRewriteStyles()" :key="s.value" :value="s.value">{{ s.label }}</option>
@@ -105,17 +125,17 @@
               :error="rewriteWordCountError"
               :disabled="rewriting || oneClickRewriting"
             />
-            <button class="cohere-btn-secondary" @click="rewriteCollected" :disabled="rewriting || oneClickRewriting || !collectedResult || !!rewriteWordCountError">
+            <button class="col-btn col-btn--secondary" @click="rewriteCollected" :disabled="rewriting || oneClickRewriting || !collectedResult || !!rewriteWordCountError">
               {{ rewriting ? $t('collection.rewriting') : $t('collection.rewrite') }}
             </button>
-            <button v-if="rewriteError && RETRYABLE_CODES.has(rewriteError.code)" class="cohere-btn-secondary col-btn-retry" @click="retryRewrite" :disabled="rewriting">
-              🔄 重试
+            <button v-if="rewriteError && RETRYABLE_CODES.has(rewriteError.code)" class="col-btn col-btn--secondary col-btn-retry" @click="retryRewrite" :disabled="rewriting">
+              {{ $t('collection.retry') }}
             </button>
             <template v-if="rewriteResult">
-              <button class="cohere-btn-secondary" @click="saveDraftAfterRewrite"><el-icon><FolderAdd /></el-icon> 存入草稿</button>
-              <button class="cohere-btn-primary" @click="goPublishAfterRewrite"><el-icon><Promotion /></el-icon> 去发布</button>
+              <button class="col-btn col-btn--secondary" @click="saveDraftAfterRewrite"><el-icon><FolderAdd /></el-icon> {{ $t('collection.saveDraft') }}</button>
+              <button class="col-btn col-btn--primary" @click="goPublishAfterRewrite"><el-icon><Promotion /></el-icon> {{ $t('collection.goPublish') }}</button>
             </template>
-            <button class="cohere-btn-secondary" @click="clearResult">取消</button>
+            <button class="col-btn col-btn--secondary" @click="clearResult">{{ $t('collection.cancel') }}</button>
             <div v-if="rewriteError" class="col-error-banner">
               {{ rewriteError.message }}
             </div>
@@ -156,7 +176,7 @@
         :batch-video-account-options="batchVideoAccountOptions"
         :platform-keys="PLATFORM_KEYS"
         :is-account-selected-fn="batch.isBatchAccountSelected"
-        @select="collectedResult = $event"
+        @select="selectCollectedItem"
         @create-draft="createFromItem"
         @to-video="sendItemToPipeline"
         @publish="goPublishFromItem"
@@ -170,54 +190,72 @@
         @toggle-batch-account="batch.toggleBatchAccount"
       />
 
-      <!-- 快捷操作 -->
-      <div class="cohere-stat-grid col-stat-grid-mb">
-        <div class="cohere-stat-card col-stat-card-click" @click="createDraft">
-          <div class="stat-value">✏️</div>
-          <div class="stat-label">新建草稿</div>
-        </div>
-        <div class="cohere-stat-card col-stat-card-click" @click="importFromClipboard">
-          <div class="stat-value"><el-icon><DocumentCopy /></el-icon></div>
-          <div class="stat-label">剪贴板导入</div>
-        </div>
-        <div class="cohere-stat-card col-stat-card-click" data-testid="quick-drafts-box" @click="switchTab('drafts')">
-          <div class="stat-value"><el-icon><FolderOpened /></el-icon></div>
-          <div class="stat-label">{{ $t('collection.draftsBoxShort') }}</div>
-        </div>
-        <div class="cohere-stat-card col-stat-card-click" @click="openCollection('weibo')">
-          <div class="stat-value">✧</div>
-          <div class="stat-label">{{ $t('collection.sourceWeibo') }}</div>
-        </div>
-        <div class="cohere-stat-card col-stat-card-click" @click="openCollection('zhihu')">
-          <div class="stat-value">❓</div>
-          <div class="stat-label">{{ $t('collection.sourceZhihu') }}</div>
-        </div>
-        <div class="cohere-stat-card col-stat-card-click" @click="openCollection('toutiao')">
-          <div class="stat-value">📰</div>
-          <div class="stat-label">{{ $t('collection.sourceToutiao') }}</div>
-        </div>
+      <!-- 快捷操作区（2026-10-17 collection-page-ui-ue-refine 重排）：
+           原 6 张平铺卡混了「写操作 / 导航 / 外跳」三种语义，且用 emoji（✏️✧❓📰）做图标
+           —— emoji 在跨平台字体下渲染不一致，是用户反馈「不精致高级」的直接来源之一。
+           现按「新建 / 草稿 / 素材来源」三组呈现，各组带分组标题；
+           写操作与导航用 el-icon 线性图标，平台卡片用品牌首字徽标（非 emoji）。
+           来源集以上游 useSourceEntry.js 的真机复核表为准，知乎已撤下、百度接位。 -->
+      <div class="col-quick">
+        <section class="col-quick__group">
+          <div class="col-quick__group-title">{{ $t('collection.quickGroupNew') }}</div>
+          <div class="col-quick__cards">
+            <div class="cohere-stat-card col-stat-card-click" @click="createDraft">
+              <div class="stat-value"><el-icon><EditPen /></el-icon></div>
+              <div class="stat-label">{{ $t('collection.quickNewDraft') }}</div>
+            </div>
+            <div class="cohere-stat-card col-stat-card-click" @click="importFromClipboard">
+              <div class="stat-value"><el-icon><DocumentCopy /></el-icon></div>
+              <div class="stat-label">{{ $t('collection.quickClipboard') }}</div>
+            </div>
+          </div>
+        </section>
+        <section class="col-quick__group">
+          <div class="col-quick__group-title">{{ $t('collection.quickGroupDrafts') }}</div>
+          <div class="col-quick__cards">
+            <div class="cohere-stat-card col-stat-card-click" data-testid="quick-drafts-box" @click="switchTab('drafts')">
+              <div class="stat-value"><el-icon><FolderOpened /></el-icon></div>
+              <div class="stat-label">{{ $t('collection.draftsBoxShort') }}</div>
+            </div>
+          </div>
+        </section>
+        <section class="col-quick__group">
+          <div class="col-quick__group-title">{{ $t('collection.quickGroupSources') }}</div>
+          <div class="col-quick__cards">
+            <div class="cohere-stat-card col-stat-card-click" @click="openCollection('weibo')">
+              <div class="stat-value">{{ $t('collection.sourceWeibo').slice(0, 1) }}</div>
+              <div class="stat-label">{{ $t('collection.sourceWeibo') }}</div>
+            </div>
+            <!-- 知乎热榜已撤下（/hot 强制登录，匿名点开只会落到安全验证页）→ 百度热搜；
+                 头条热榜改为今日头条首页（官方无渲染版热榜页，热榜 JSON 接口直接打开是一屏文本）。
+                 依据与不可回退约束见 features/collection/useSourceEntry.js 的文件头表。 -->
+            <div class="cohere-stat-card col-stat-card-click" @click="openCollection('baidu')">
+              <!-- 图标用 el-icon 而非 emoji：放大镜 emoji 命中 icon-usage.test.js 的功能图标位黑名单（T1-5） -->
+              <div class="stat-value"><el-icon><Search /></el-icon></div>
+              <div class="stat-label">{{ $t('collection.sourceBaidu') }}</div>
+            </div>
+            <div class="cohere-stat-card col-stat-card-click" @click="openCollection('toutiao')">
+              <div class="stat-value">{{ $t('collection.sourceToutiao').slice(0, 1) }}</div>
+              <div class="stat-label">{{ $t('collection.sourceToutiao') }}</div>
+            </div>
+          </div>
+        </section>
       </div>
 
       <!-- 草稿箱已独立为「草稿箱」页签（2026-10-12）：统一到 draftSave/draftList 真源，
            不再在采集页底部重复一份只写 store 的轻量草稿列表（两套方言互相污染） -->
     </div>
 
-    <!-- 草稿箱：独立页签，与发布页草稿同源（draftList） -->
-    <CollectionDraftsPanel
-      v-else-if="activeTab === 'drafts'"
-      active
-      :reload-token="draftsReloadToken"
-      @create="createDraft"
-      @edit="editDraft"
-      @publish="goPublish"
-    />
+    <!-- S1c：草稿箱页内列表（CollectionDraftsPanel）已删除 ——
+         点击「草稿箱」页签由 switchTab 直接跳转 /publish?tab=drafts，
+         草稿箱全仓只保留一个整页实现。 -->
 
     <!-- 文案库标签页（2026-09-16 合并：原「采集记录」+「文案库」两标签合一，以采集记录卡片为准） -->
     <!-- 博主监控：独立组件，避免把 2700+ 行的采集页继续堆胖 -->
     <CreatorMonitor v-else-if="activeTab === 'creator'" />
     <!-- 快捷采集：启动器 + 指令管理；执行结果通过 onQuickCollected 走既有采集结果链路 -->
     <QuickCollectPanel v-else-if="activeTab === 'quick'" active @collected="onQuickCollected" />
-    <div v-else-if="activeTab === 'records'" class="cohere-content" role="tabpanel" :aria-label="$t('collection.recordsTitle')">
+    <div v-else-if="activeTab === 'records'" id="collection-tabpanel-records" class="cohere-content" role="tabpanel" :aria-labelledby="'collection-tab-btn-' + activeTab">
       <div class="cohere-section-title col-section-title col-section-title--flex">
         <span>{{ $t('collection.recordsTitle') }} · {{ $t('collection.libraryCount', { count: libraryItems.length }) }}</span>
         <div class="library-filters" role="group" :aria-label="$t('collection.libraryFilterLabel')">
@@ -315,13 +353,13 @@
                 </div>
               </div>
             </div>
-            <div class="card-actions">
-              <button @click.stop="openRecordForEdit(entry.item)">{{ $t('collection.recordsEdit') }}</button>
-              <button @click.stop="createFromItem(entry.item)">{{ $t('collection.recordsCreateDraft') }}</button>
-              <button @click.stop="sendItemToPipeline(entry.item)">{{ $t('collection.recordsToVideo') }}</button>
-              <button @click.stop="goPublishFromItem(entry.item)">{{ $t('collection.recordsPublish') }}</button>
-              <button class="primary" :data-testid="'copy-library-rewrite-' + entry.item.id" @click.stop="rewriteFromLibrary(entry)">{{ $t('collection.libraryRewrite') }}</button>
-              <button class="danger" @click.stop="deleteRecord(entry.item)">{{ $t('collection.recordsDelete') }}</button>
+            <div class="col-card-actions">
+              <button class="col-btn col-btn--primary" :data-testid="'copy-library-rewrite-' + entry.item.id" @click.stop="rewriteFromLibrary(entry)">{{ $t('collection.libraryRewrite') }}</button>
+              <button class="col-btn col-btn--secondary" @click.stop="createFromItem(entry.item)">{{ $t('collection.recordsCreateDraft') }}</button>
+              <button class="col-btn col-btn--secondary" @click.stop="openRecordForEdit(entry.item)">{{ $t('collection.recordsEdit') }}</button>
+              <button class="col-btn col-btn--secondary" @click.stop="sendItemToPipeline(entry.item)">{{ $t('collection.recordsToVideo') }}</button>
+              <button class="col-btn col-btn--secondary" @click.stop="goPublishFromItem(entry.item)">{{ $t('collection.recordsPublish') }}</button>
+              <button class="col-btn col-btn--danger" @click.stop="deleteRecord(entry.item)">{{ $t('collection.recordsDelete') }}</button>
             </div>
           </div>
           <!-- 改写文案卡片：来自文案库改写闭环（采集页内改写 / 改写页交接改写） -->
@@ -336,10 +374,10 @@
                 <div class="card-account">{{ rewriteMetaText(entry.record) }}</div>
               </div>
             </div>
-            <div class="card-actions">
-              <button @click.stop="previewRewrite = entry.record">{{ $t('collection.libraryView') }}</button>
-              <button class="primary" :data-testid="'copy-library-rewrite-r' + entry.record.id" @click.stop="rewriteFromLibrary(entry)">{{ $t('collection.libraryRewrite') }}</button>
-              <button class="danger" @click.stop="deleteLibraryRewrite(entry.record)">{{ $t('collection.recordsDelete') }}</button>
+            <div class="col-card-actions">
+              <button class="col-btn col-btn--primary" :data-testid="'copy-library-rewrite-r' + entry.record.id" @click.stop="rewriteFromLibrary(entry)">{{ $t('collection.libraryRewrite') }}</button>
+              <button class="col-btn col-btn--secondary" @click.stop="previewRewrite = entry.record">{{ $t('collection.libraryView') }}</button>
+              <button class="col-btn col-btn--danger" @click.stop="deleteLibraryRewrite(entry.record)">{{ $t('collection.recordsDelete') }}</button>
             </div>
           </div>
         </template>
@@ -435,8 +473,8 @@ import { useI18n } from 'vue-i18n'
 import { useTabStore } from '@/stores/tab'
 // eslint-disable-next-line no-unused-vars
 import UiInput from "../components/UiInput.vue";
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { Document, DocumentCopy, FolderAdd, FolderOpened, Link, MagicStick, Promotion, Search, VideoCamera } from '@element-plus/icons-vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { Document, DocumentCopy, EditPen, FolderAdd, FolderOpened, MagicStick, Promotion, Search, VideoCamera } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { useNotify } from '@/composables/useNotify'
 import { useAsrInstall } from '@/composables/useAsrInstall'
@@ -444,7 +482,11 @@ import { resolveNotifyText } from '@/utils/notifyCore'
 import { storeGetSetting, storeSetSetting, draftList, aiRewrite, aiListRewriteStrategies, aiGetRecommendedStrategies } from '@/api/publisher'
 import { extractRewriteHistoryId, attachRewriteLineage } from '@/utils/rewrite-lineage'
 import { formatUserError } from '@/utils/user-facing-error'
+import { REWRITE_ENGINE_MAX_INPUT_CHARS, prepareRewriteInput, shouldSegmentRewrite } from '@/utils/rewrite-engine-limits'
+import { normalizeRewriteEngineError } from '@/utils/rewrite-engine-error'
 import { classifyCollectError } from '@/utils/collect-error'
+// 采集内容守卫：识别「百度安全验证」等反爬验证页文字（判据与主进程同源，见模块注释）
+import { isVerificationContent } from '@/utils/collected-content-guard'
 import { useWordCountValidation } from '@/composables/useWordCountValidation'
 import { addViralToLibrary } from '@/api/knowledge-library'
 import PublishDestinationModal from '@/components/PublishDestinationModal.vue'
@@ -456,7 +498,7 @@ import { safeHttpUrl } from '@multi-publish/shared-utils/src/safe-http-url'
 import { normalizeCollectedItem, normalizeItemTags, itemTags, CollectionCreatorTab } from '@/features/collection/collected-item'
 import { QuickCollectTab, QuickCollectPanel } from '@/features/collection/quick-collect-ui'
 // 草稿箱页签 + 面板（2026-10-12）：独立组件，Collection.vue 只付 1 行 import
-import { CollectionDraftsTab, CollectionDraftsPanel } from '@/features/collection/draft-box-ui'
+import { CollectionDraftsTab } from '@/features/collection/draft-box-ui'
 import { createOpenSourceHandler } from '@/features/collection/useSourceEntry'
 import { useCollectionDrafts } from '@/composables/useCollectionDrafts'
 import BatchCollectPanel from '@/features/collection/BatchCollectPanel.vue'
@@ -486,6 +528,28 @@ const collecting = ref(false)
 const rewriting = ref(false)
 const oneClickRewriting = ref(false)
 const collectedResult = ref(null)
+/**
+ * 选中一条采集结果并**滚动到详情框**。
+ *
+ * 为什么不只是 `collectedResult = $event`：详情框在页面上方，而结果列表在下方；
+ * 用户点列表里的「查看/编辑」或卡片内容时视口停在列表区 ⇒ 状态其实变了但视口内看不到
+ * ⇒ 被感知为「点了没反应」（用户实测反馈）。选中后把详情框滚进视口 + 短高亮，
+ * 让「点了有地方去」成为可见反馈。card-info/card-icon 的点击与「查看」按钮同走这里。
+ * 锚点用 `document.getElementById('collected-result-box')`（采集页单实例；jsdom 可桩）。
+ */
+function selectCollectedItem (item) {
+  collectedResult.value = item
+  nextTick(() => {
+    const box = document.getElementById('collected-result-box')
+    if (box && typeof box.scrollIntoView === 'function') {
+      box.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      box.classList.remove('col-result-box--flash')
+      // 触发一次重排后再加类，保证重复点击同一项也有高亮动画
+      void box.offsetWidth
+      box.classList.add('col-result-box--flash')
+    }
+  })
+}
 const collectError = ref(null)
 const videoCollectStage = ref('')  // 视频采集分阶段提示: probe/downloading/extracting/transcribing
 
@@ -614,6 +678,31 @@ function clearRewriteResult () {
 }
 
 async function rewriteViaEngine (content) {
+  // 空正文守卫（2026-10-18，fix-collect-rewrite-empty-content）：内容缓存命中会返回空壳
+  // {title:'',content:''}（url-collector.js cache_hit 分支），此时「一键改写」会把空串
+  // 发往改写引擎（旧链路报 Python 422，新链路同样无意义）。四个调用点（视频转写 /
+  // stealth 自动 / 聚合回退 / 手动改写）都走这个漏斗，在这里判空一次覆盖全部路径；
+  // 复用既有稳定错误码 AGGREGATION_CONTENT_EMPTY（zh/en 文案已由 user-facing-error 提供）。
+  if (!content || !String(content).trim()) {
+    return {
+      __error: {
+        code: -400,
+        errorCode: 'AGGREGATION_CONTENT_EMPTY',
+        message: resolveNotifyText('userErrors.AGGREGATION_CONTENT_EMPTY').text,
+      },
+    }
+  }
+  // 长文处理（rewrite-segment-and-finish-reason 第二刀）：不再预截断，改为事前提示。
+  // 历史：曾把 >上限正文截到 50000（fix-collect-rewrite-too-long）——分段改写落地后，
+  // 预截断会让超长正文永远到不了引擎分段路径（评审 M1：死代码），故改为透传全文 +
+  // 事前告知「将分 N 段改写，耗时与费用相应增加」。N 由引擎侧切分决定，这里只报阈值。
+  const prepared = prepareRewriteInput(content)
+  const willSegment = shouldSegmentRewrite(prepared.text)
+  if (willSegment) {
+    notifyInfo('collection.rewriteSegmented', {
+      params: { length: prepared.originalLength, max: REWRITE_ENGINE_MAX_INPUT_CHARS },
+    })
+  }
   let res
   try {
     // main 新增的字数控制（min/max）→ targetLength 语义映射：窄区间视为 short，宽高区间视为 long，其余 medium
@@ -622,7 +711,7 @@ async function rewriteViaEngine (content) {
     const wordCountTarget = maxW <= 800 ? 'short' : (minW >= 1500 || maxW >= 2500) ? 'long' : 'medium'
     const params = {
       mode: 'imitate',
-      content: content,
+      content: prepared.text,
       userSettings: {
         tone: STYLE_TO_TONE[rewriteStyle.value] || 'casual',
         targetWordCount: { min: minW, max: maxW },
@@ -645,10 +734,28 @@ async function rewriteViaEngine (content) {
     // 归因链：这里是本页唯一能拿到信封的地方，所以「当前改写结果的 rewrite_history 行 id」
     // 只在此处写一次（由 saveDraftAfterRewrite 读一次）——三个调用点各写一遍必然漂移。
     collectRewriteLineageId = extractRewriteHistoryId(res)
-    return { result_content: res.data.result, knowledgeRefs: res.data.knowledgeRefs || [] }
+    // 截断/分段元数据透传（rewrite-segment-and-finish-reason 第二刀，评审 M5）：
+    // 成功分支历史上只挑 result_content/knowledgeRefs，引擎新增的 visible 字段会被静默丢弃。
+    // 这里统一收进 meta，供调用方决定是否提示（引擎截断 / 模型截断 / 分段改写）。
+    return {
+      result_content: res.data.result,
+      knowledgeRefs: res.data.knowledgeRefs || [],
+      meta: {
+        outputTruncated: res.data.outputTruncated === true,
+        outputLength: res.data.outputLength,
+        modelTruncated: res.data.modelTruncated === true,
+        segmented: res.data.segmented || null,
+      },
+    }
   }
-  // 失败时透传原始 res（含 errorCode/message），供调用方 formatUserError 映射友好文案
-  if (res && (res.code !== 0 || (res.data && res.data.success === false))) {
+  // 引擎业务错误（`{code:0, data:{success:false, error, errorCode}}`）必须归一化到顶层：
+  // formatUserError 只读顶层 errorCode/message，直接透传整个信封会让具体原因丢失，
+  // 用户只看到兜底「AI 改写失败」（2026-10-19 事故形态，正文 6766 字 > 6000 上限）。
+  if (res && res.code === 0 && res.data && res.data.success === false) {
+    return { __error: normalizeRewriteEngineError(res) }
+  }
+  // IPC 层错误（code !== 0）本身已是顶层 message 形状，原样透传
+  if (res && res.code !== 0) {
     return { __error: res }
   }
   return null
@@ -861,10 +968,9 @@ function closeAsrInstallDialog () {
 // draftSave 落在**同一行存储**（scopedSettingKey('drafts')），两套方言互相污染：
 // 发布页草稿在采集页显示不出时间（createdAt vs created_at）、采集页草稿在发布页
 // 显示 0 平台、同内容还会被指纹去重互相覆盖。现在写入一律走 draftSave，
-// 读取交给草稿箱页签（CollectionDraftsPanel）走 draftList。
+// S1c：草稿读取已迁移到 /publish?tab=drafts（唯一整页实现）。
 const { saveDraft: saveDraftToStore } = useCollectionDrafts()
-const draftsReloadToken = ref(0)
-const draftCount = ref(0)   // 页签角标条数（drafts ref 在上方声明，列表渲染已交给页签）
+const draftCount = ref(0)   // 页签角标条数
 
 /** 取草稿条数（页签角标）；失败静默保留旧值，不阻塞采集页 */
 async function countDrafts () {
@@ -881,9 +987,15 @@ async function countDrafts () {
  * @returns {Promise<string|null>} 落库草稿 id（失败为 null）
  */
 async function persistDraft (payload, allowEmpty) {
+  // 发布链路最后一道守卫（2026-10-18 用户可见事故）：修复前落库的历史采集记录可能仍是
+  // 「百度安全验证」页文字，这里拦在「创建草稿 → 进发布页」之前，保证验证文字永远
+  // 不会进入发布页正文输入框。空白草稿（allowEmpty）不受此限。
+  if (payload && !allowEmpty && isVerificationContent({ title: payload.title, content: payload.content })) {
+    notifyError('collection.draftBlockedSecurityChallenge')
+    return null
+  }
   const saved = await saveDraftToStore(payload, { allowEmpty: Boolean(allowEmpty) })
   if (saved && saved.ok) {
-    draftsReloadToken.value++
     draftCount.value = await countDrafts()
     return saved.draftId
   }
@@ -921,7 +1033,8 @@ async function importFromClipboard () {
 
 // 素材来源快捷入口：语义是「去哪找素材」，走 PLATFORM_SOURCE_URLS，
 // 不用 PLATFORM_DASHBOARD_URLS（那是创作者后台/发布目的地，且被登录态校验复用）。
-// 实现与实测口径见 features/collection/useSourceEntry.js。
+// 入参是**来源 id**（weibo/baidu/toutiao），不是可发布平台 id —— 百度只是素材来源。
+// 实现、显示名表与 2026-10-17 实测口径见 features/collection/useSourceEntry.js。
 const openCollection = createOpenSourceHandler({
   createTab: (payload) => tabStore.createTab(payload),
   notifyWarning,
@@ -929,17 +1042,9 @@ const openCollection = createOpenSourceHandler({
   t,
 })
 
-// 编辑与发布都跳发布页并带上草稿 id；发布页 watch(route.query.draft) 会走
-// draftList + loadDraft 加载（同源于本页写入的草稿）。
-async function editDraft (d) {
-  if (!d || !d.id) return
-  router.push('/publish?draft=' + d.id)
-}
-
-function goPublish (d) {
-  if (!d || !d.id) return
-  router.push('/publish?draft=' + d.id)
-}
+// 编辑与发布两处入口（原 CollectionDraftsPanel 的 @edit / @publish）已随面板删除：
+// 两者实现完全相同（都 push `/publish?draft=<id>`），属规则 1「一个动作=一个结果」
+// 下的重复标签，收敛后由 /publish?tab=drafts 整页的单一「去发布」按钮承担。
 
 // 错误码常量（与 IPC handler 同步）
 const ERROR_CODES = {
@@ -1034,9 +1139,27 @@ function isNoVideoCollectError (res) {
 
 // 采集错误细分提示：按 classifyCollectError 的 reason 渲染「具体原因 + 建议」文案，
 // 重试按钮按 retryable 显示（invalid_url/internal_url/protocol 类输入错误重试无意义）。
+// 结构化 reason 优先（2026-10-18 QM-6 外部评审 P3）：主进程/渲染层已给出 reason 时，
+// 必须把**整个错误对象**交给分类器；此前只取 message 字符串，en 文案不含中文关键词 ⇒
+// 退化为 unknown。视频管线仍按 message 透传具体 detail（结构化 reason 不在视频链路产生）。
+function collectErrorSource (err) {
+  if (!err) return ''
+  return err.reason ? err : (err.message || err)
+}
+
+// IPC 失败信封 → 采集错误对象：把 data.reason 一并带出（主进程在 data 里给的是结构化分类）
+function toCollectErrorFromIpc (res) {
+  const data = (res && res.data) || {}
+  return {
+    code: res && res.code != null ? res.code : -99,
+    ...(data.reason ? { reason: data.reason } : {}),
+    message: (res && (res.message || data.error)) || '',
+  }
+}
+
 const collectErrorDetail = computed(() => {
   if (!collectError.value) return ''
-  const raw = collectError.value.message || collectError.value
+  const raw = collectErrorSource(collectError.value)
   const { reason, detailKey } = classifyCollectError(raw)
   // 视频管线错误：后端 detail 已含具体中文提示（如「视频过长（15:32），采集仅支持 10 分钟内的短视频」），
   // 剥掉错误码前缀后直接透传，避免模板文案丢失实际时长/大小等关键信息。
@@ -1053,19 +1176,33 @@ const collectErrorDetail = computed(() => {
 })
 const collectErrorRetryable = computed(() => {
   if (!collectError.value) return false
-  const raw = collectError.value.message || collectError.value
-  return classifyCollectError(raw).retryable
+  return classifyCollectError(collectErrorSource(collectError.value)).retryable
 })
 
-// 检测采集结果是否为反爬安全验证页面（如百度家号返回「百度安全验证」标题）
+// 检测采集结果是否为反爬安全验证页面（如百家号返回「百度安全验证」标题）
+// 判据单一真源 = 主进程 url-collector-antibot（本模块经 collected-content-guard 转发），
+// 禁止在渲染层另抄一份词表 —— 两份词表必然漂移（2026-10-18 复盘）。
 function isSecurityChallenge (res) {
-  if (!res || !res.title) return false
-  const title = String(res.title)
-  const content = String(res.content || '')
-  // 安全验证页特征：标题含「安全验证」/「百度安全」或被正文长度极短且含提示语
-  if (title.includes('安全验证') || title.includes('百度安全') || title.includes('百度安全检测')) return true
-  if (content.length < 60 && (content.includes('安全验证') || content.includes('网络不给力') || content.includes('请稍后重试'))) return true
-  return false
+  if (!res) return false
+  return isVerificationContent({
+    title: String(res.title || ''),
+    content: String(res.content || res.description || ''),
+  })
+}
+
+/**
+ * 验证页结果统一处置：写入 security_challenge 采集错误并提示，调用方据此中止。
+ * 为什么必须中止：验证页的「文字」本身看起来像正文（标题=百度安全验证、正文=提示语），
+ * 一旦入库就会随「去发布」进入发布页正文输入框（用户可见事故）。
+ * @param {object} data - 采集返回的 { title, content }
+ * @returns {boolean} true = 命中验证页，调用方必须 return
+ */
+function abortIfVerificationPage (data) {
+  if (!isSecurityChallenge(data || {})) return false
+  const message = resolveNotifyText('collection.collectErrors.security_challenge').text
+  collectError.value = { code: -1, reason: 'security_challenge', message }
+  notifyError('collection.collectFailed', { message })
+  return true
 }
 
 // 聚合路径失败 — 无论任何错误码，都回退到 urlCollectFetch 降级
@@ -1186,14 +1323,17 @@ async function collectUrl () {
         return
       }
     }
-    // 反爬站点（知乎/百家号）→ 直接走 Node stealth 浏览器通道，跳过 Python 聚合层裸连
+    // 反爬站点（知乎/百家号）→ Node 采集通道（主进程内：知乎走 stealth 浏览器，
+    // 百家号 HTTP 优先 + 浏览器兜底），跳过 Python 聚合层裸连
     if (api && api.urlCollectFetch && await needsStealthRoute(api, trimmedUrl)) {
       const result = await api.urlCollectFetch(trimmedUrl)
       if (result.code !== 0) {
-        collectError.value = { code: result.code, message: result.message || (result.data && result.data.error) || '' }
+        collectError.value = toCollectErrorFromIpc(result)
         notifyError('collection.collectFailed', { message: formatUserError(result, { fallback: resolveNotifyText('collection.collectFailed').text }).message })
         return
       }
+      // 渲染层第二道守卫：旧版主进程/缓存仍可能把验证页当 success 返回，绝不入库
+      if (abortIfVerificationPage(result.data || {})) return
       const item = stealthResultToItem(result, linkUrl.value)
       collectedResult.value = item
       addedToViral.value = false
@@ -1242,10 +1382,12 @@ async function collectUrl () {
       const result = await api.urlCollectFetch(linkUrl.value.trim())
       if (result.code !== 0) {
         // IPC 失败返回 { code, message, data }：message 为主，旧版/异常时兜底 data.error
-        collectError.value = { code: result.code, message: result.message || (result.data && result.data.error) || '' }
+        collectError.value = toCollectErrorFromIpc(result)
         notifyError('collection.collectFailed', { message: formatUserError(result, { fallback: resolveNotifyText('collection.collectFailed').text }).message })
         return
       }
+      // 渲染层第二道守卫（与 stealth 分支同源）：验证页文字绝不入库
+      if (abortIfVerificationPage(result.data || {})) return
       const item = {
         ...result.data,
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -1370,14 +1512,18 @@ async function collectAndRewrite () {
       }
       // noVideoFallback：落回下方图文采集链路继续
     }
-    // 反爬站点（知乎/百家号）→ 直接走 Node stealth 浏览器通道采集，跳过 Python 聚合层裸连
+    // 反爬站点（知乎/百家号）→ Node 采集通道（主进程内：知乎走 stealth 浏览器，
+    // 百家号 HTTP 优先 + 浏览器兜底）。必须跳过 Python 聚合层裸连：先裸连失败再回退
+    // 会白白多触发一次反爬检测（提高封 IP 风险）。
     if (api.urlCollectFetch && await needsStealthRoute(api, trimmedUrl)) {
       const stealthResult = await api.urlCollectFetch(trimmedUrl)
       if (stealthResult.code !== 0) {
-        collectError.value = { code: stealthResult.code, message: stealthResult.message || (stealthResult.data && stealthResult.data.error) || '' }
+        collectError.value = toCollectErrorFromIpc(stealthResult)
         notifyError('collection.collectFailed', { message: formatUserError(stealthResult, { fallback: resolveNotifyText('collection.collectFailed').text }).message })
         return
       }
+      // 渲染层第二道守卫：验证页文字绝不入库、更不得进入改写正文
+      if (abortIfVerificationPage(stealthResult.data || {})) return
       const stealthItem = stealthResultToItem(stealthResult, linkUrl.value)
       collectedResult.value = stealthItem
       addedToViral.value = false
@@ -1385,25 +1531,20 @@ async function collectAndRewrite () {
       saveCollectedItems()
       notifySuccess('collection.collectSuccess')
       collecting.value = false
-      // Step 2: 自动改写
+      // Step 2: 自动改写 —— 必须走桌面改写引擎（aiRewrite）：它按「模型设置」解析默认
+      // 文字推理模型（含多模态 provider 的 llm 能力路由）。2026-10-18 事故根因：本分支
+      // 原调 Python /aggregation/rewrite，该后端只认进程环境变量 LLM_API_KEY，桌面模型
+      // 设置从未注入 ⇒ 用户已配置 Agnes 多模态仍误报 LLM_KEY_MISSING。
       rewriting.value = true
       try {
-        const rewrite = await api.aggregationRewrite({
-          content: stealthItem.content || stealthItem.description || '',
-          style: rewriteStyle.value,
-          min_word_count: Number(rewriteWordCountMin.value),
-          max_word_count: Number(rewriteWordCountMax.value),
-        })
+        const rewrite = await rewriteViaEngine(stealthItem.content || stealthItem.description || '')
         if (rewrite && rewrite.result_content) {
           rewriteResult.value = rewrite.result_content
-          // 归因链（QM-6 后端轴 W-2）：Python 改写链路不写桌面 rewrite_history，
-          // 没有可承载的 id。这里必须显式清掉上一次引擎改写留下的 id ——
-          // 否则"存草稿"会把旧引擎的关联挂到这份 Python 产物上，属于凭空伪造关联。
-          collectRewriteLineageId = null
           recordRewriteToLibrary(rewrite.result_content, stealthItem)
           notifySuccess('collection.rewriteSuccess')
         } else {
-          const formatted = formatUserError(rewrite || {}, { fallback: resolveNotifyText('collection.rewriteFailed').text })
+          const errorSource = rewrite && rewrite.__error ? rewrite.__error : (rewrite || {})
+          const formatted = formatUserError(errorSource, { fallback: resolveNotifyText('collection.rewriteFailed').text })
           rewriteError.value = { code: rewrite && rewrite.code != null ? rewrite.code : -99, message: formatted.message }
           notifyError('collection.rewriteFailed', { message: rewriteError.value.message })
         }
@@ -1429,7 +1570,7 @@ async function collectAndRewrite () {
       if (api.urlCollectFetch) {
         const fallback = await api.urlCollectFetch(linkUrl.value.trim())
         if (fallback.code !== 0) {
-          collectError.value = { code: fallback.code, message: fallback.message || (fallback.data && fallback.data.error) || '' }
+          collectError.value = toCollectErrorFromIpc(fallback)
           notifyError('collection.collectFailed', { message: formatUserError(fallback, { fallback: resolveNotifyText('collection.collectFailed').text }).message })
           return
         }
@@ -1687,6 +1828,13 @@ const TAB_KEYS = ['collect', 'quick', 'drafts', 'records', 'creator']
 
 function switchTab (tab) {
   if (!TAB_KEYS.includes(tab)) return
+  // PRD-UI-FLOW-CLARITY S1c：草稿箱收敛为唯一整页视图 /publish?tab=drafts。
+  // 采集页不再自渲染列表 —— 点击「草稿箱」页签直接跳过去（页签保留角标计数，
+  // 仍是最容易发现草稿箱的入口）。原页内 CollectionDraftsPanel 已删除。
+  if (tab === 'drafts') {
+    router.push('/publish?tab=drafts')
+    return
+  }
   activeTab.value = tab
 }
 
@@ -1912,283 +2060,40 @@ async function deleteLibraryRewrite (record) {
 </script>
 
 <style scoped>
-/* ========== 精致化主题（collection-ui-refinement token 收编：亮色硬编码全部换语义槽，暗色覆盖见底部 [data-theme="dark"] 块） ========== */
+/* 采集页控件规范层（collection-page-ui-ue-refine，2026-10-17）：
+ * 按钮三档 / 输入控件一档 / 卡片两档 / 徽标一档 / 横幅一档 / 页签 / 快捷区三组，
+ * 外加一批原本散布在本文件与各子组件里的重复声明（区块标题、结果框、进度块、
+ * 类别标签、文案库预览弹窗、ASR 弹窗…）统一收在那里持有。
+ * 本文件只保留「采集页视图级」的少量覆盖与 .cohere-content 的滚动容器语义。 */
+@import '../features/collection/collection-page.css';
 
 .cohere-content {
   background: var(--color-bg-page);
   min-height: 100%;
-  padding-bottom: 40px;
+  padding-bottom: var(--spacing-10);
 }
 
-.cohere-card {
-  background: var(--color-bg-card);
-  border: 1px solid var(--color-border);
-  border-radius: 16px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.02);
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.cohere-card:hover {
-  box-shadow: var(--shadow-card-hover);
-  transform: translateY(-3px);
-  border-color: var(--color-ribbon-soft);
-}
-
-.col-panel {
-  padding: 28px;
-  margin-bottom: 20px;
-  background: var(--color-bg-card);
-  border: 1px solid var(--color-border);
-  border-radius: 20px;
-  position: relative;
-  overflow: hidden;
-}
-
-.col-panel::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 4px;
-  background: var(--color-ribbon);
-  background-size: 200% 100%;
-  animation: col-panel-ribbon 3s infinite ease-in-out;
-}
-
-@keyframes col-panel-ribbon {
-  0%, 100% { background-position: 100% 0; }
-  50% { background-position: 0 0; }
-}
-
+/* .cohere-card / .col-panel / 顶部饰带 / 区块标题 / 结果框 / 进度块 / 类别标签 /
+   文案库预览弹窗 / ASR 弹窗等声明已迁至 collection-page.css 规范层统一持有
+   （collection-page-ui-ue-refine，2026-10-17）。本文件只保留视图级特有项。 */
 
 .rewrite-compare {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--space-sm);
+  gap: var(--spacing-2);
 }
 .rewrite-compare > div {
   min-width: 0;
 }
-.compare-textarea {
-  width: 100%;
-  min-height: 180px;
-  resize: vertical;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 12px;
-  font-size: var(--font-size-sm);
-  line-height: 1.6;
-  box-sizing: border-box;
-  font-family: inherit;
-  background: var(--color-bg-card);
-}
-.compare-textarea:focus { border-color: var(--coral); outline: none; }
-.compare-textarea[readonly] { background: var(--soft-stone); color: var(--color-text-secondary); }
 
 @media (max-width: 768px) {
   .rewrite-compare { grid-template-columns: 1fr; }
 }
-.o-disabled { opacity: 0.55; pointer-events: none; }
 
-.collection-tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 8px;
-  background: var(--soft-stone);
-  border-radius: 8px;
-  padding: 3px;
-  width: fit-content;
-}
-.collection-tab-btn {
-  padding: 6px 16px;
-  border: none;
-  background: transparent;
-  border-radius: 6px;
-  font-size: var(--font-size-sm);
-  font-weight: 500;
-  cursor: pointer;
-  color: var(--color-text-secondary);
-  transition: all 0.2s;
-}
-.collection-tab-btn:hover {
-  color: var(--color-text-primary);
-}
-.collection-tab-btn.active {
-  background: var(--color-bg-card);
-  color: var(--color-primary);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-}
-
+/* 文案库卡/结果卡：整卡可点（打开记录编辑）与焦点态 */
 .collection-record-card { cursor: pointer; transition: box-shadow 0.2s; }
-.collection-record-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+.collection-record-card:hover { box-shadow: var(--shadow-card-hover); }
 .collection-record-card:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
-
-/* ── 类别标签（2026-10-03）：统一内容类别真源 ── */
-.card-tags {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 6px;
-}
-.card-tag {
-  padding: 2px 8px; border-radius: 10px; background: var(--soft-stone);
-  color: var(--color-text-primary); font-size: var(--font-size-xs, 12px);
-}
-/* 类别已被运营删除：标签保留但置灰，悬停说明原因，且不参与筛选 */
-.card-tag--unknown { background: var(--soft-stone); color: var(--color-text-secondary); text-decoration: line-through; }
-.card-tag-edit {
-  padding: 2px 8px; border: 1px solid var(--color-border); border-radius: 4px;
-  background: var(--color-bg-card); color: var(--color-primary); font-size: var(--font-size-xs, 12px); cursor: pointer;
-}
-.tag-toggle {
-  padding: 2px 9px; border: 1px solid var(--color-border); border-radius: 11px;
-  background: var(--color-bg-card); color: var(--color-text-primary); font-size: var(--font-size-xs, 12px); cursor: pointer;
-}
-.tag-toggle--on { border-color: var(--color-primary); color: var(--color-primary); }
-.tag-save, .tag-cancel {
-  padding: 2px 9px; border: 1px solid var(--color-border); border-radius: 4px;
-  background: var(--color-bg-card); font-size: var(--font-size-xs, 12px); cursor: pointer;
-}
-.tag-save { border-color: var(--color-primary); color: var(--color-primary); }
-
-/* ── 文案库合并视图样式（原 CopyLibraryPanel 迁入）── */
-.library-filters {
-  display: flex;
-  gap: 4px;
-  background: var(--soft-stone);
-  border-radius: 8px;
-  padding: 3px;
-}
-.library-filter-btn {
-  padding: 4px 12px;
-  border: none;
-  background: transparent;
-  border-radius: 6px;
-  font-size: var(--font-size-sm);
-  cursor: pointer;
-  color: var(--color-text-secondary);
-  transition: all 0.15s;
-}
-.library-filter-btn:hover { color: var(--color-text-primary); }
-.library-filter-btn.active {
-  background: var(--color-bg-card);
-  color: var(--color-primary);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-}
-.card-platform-badge { display: flex; align-items: center; gap: 6px; }
-.copy-library-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.copy-origin-badge {
-  flex-shrink: 0;
-  padding: 1px 8px;
-  border-radius: 10px;
-  font-size: var(--font-size-xs);
-  line-height: 18px;
-  font-weight: 500;
-}
-.copy-origin-badge.is-rewrite { background: var(--color-ribbon-soft); color: var(--color-primary); }
-
-.copy-preview-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 2000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(23, 23, 32, 0.45);
-  padding: 20px;
-}
-.copy-preview-modal {
-  width: min(720px, 100%);
-  max-height: 86vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--color-bg-card);
-  border-radius: 16px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.22);
-  padding: 18px 24px 22px;
-}
-.copy-preview-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.copy-preview-title { margin: 0; font-size: var(--font-size-base); font-weight: 600; color: var(--color-text-primary); }
-.copy-preview-close {
-  border: none;
-  background: transparent;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-base);
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 6px;
-}
-.copy-preview-close:hover { background: var(--soft-stone); color: var(--color-text-primary); }
-.copy-preview-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0 12px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
-/* 长文本展示契约：显式换行 + 任意位置断词，避免长串英文/链接撑破弹窗 */
-.copy-preview-content {
-  margin: 0;
-  overflow-y: auto;
-  min-height: 0;
-  padding: 12px;
-  border-radius: 10px;
-  background: var(--soft-stone);
-  font-size: var(--font-size-sm);
-  line-height: 1.7;
-  color: var(--color-text-primary);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
-.collection-record-card .card-actions button.danger {
-  color: var(--color-error-banner-text);
-}
-.collection-record-card .card-actions button.danger:hover {
-  background: var(--color-error-banner-bg);
-}
-
-/* T1-3d：原 52 处内联样式全部类化；颜色一律 var(--color-*)（tokens.css 语义槽：
- * --color-error-banner、--color-info、--color-progress-track 为 T1-3d 新增收编槽）。 */
-.col-panel { padding: var(--space-md); margin-bottom: var(--space-lg); }
-.col-toolbar { display: flex; gap: var(--space-sm); align-items: center; flex-wrap: wrap; }
-.col-toolbar-icon { font-size: 1.2rem; }
-.col-select { border: 1px solid var(--color-border); border-radius: 6px; padding: 8px; font-size: var(--font-size-sm); }
-.col-select-sm { border: 1px solid var(--color-border); border-radius: var(--r-xs); padding: 4px 8px; font-size: var(--font-size-sm); }
-.col-input { border: 1px solid var(--color-border); border-radius: 6px; padding: 8px 12px; font-size: var(--font-size-sm); }
-.col-input--grow { flex: 1; }
-.col-input--block { width: 100%; }
-.col-textarea { resize: vertical; }
-.col-btn-retry { font-size: var(--font-size-sm); padding: 8px 12px; }
-.col-btn-retry-sm { font-size: var(--font-size-xs); padding: 4px 10px; margin-left: 8px; }
-.col-btn-cancel, .col-btn-clear { font-size: var(--font-size-xs); padding: 2px 8px; }
-.col-btn-cancel { margin-top: 4px; }
-.col-error-banner { margin-top: 8px; padding: 6px 10px; background: var(--color-error-banner-bg); border-radius: var(--r-xs); font-size: var(--font-size-xs); color: var(--color-error-banner-text); }
-.col-stage-banner { margin-top: 8px; padding: 6px 10px; background: var(--color-info-soft); border-radius: var(--r-xs); font-size: var(--font-size-xs); color: var(--color-info-text); }
-.col-result-box { margin-top: var(--space-sm); padding: var(--space-sm); background: var(--color-bg-inset); border-radius: 6px; }
-.col-result-title { font-weight: 600; margin-bottom: 4px; }
-.col-result-meta { font-size: var(--font-size-xs); color: var(--color-text-secondary); }
-.col-mt8 { margin-top: 8px; }
-.col-chip-row { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.col-check-label { display: inline-flex; align-items: center; gap: 4px; font-size: var(--font-size-sm); cursor: pointer; }
-.col-compare { margin-top: var(--space-sm); }
-.col-compare-title { font-weight: 600; font-size: var(--font-size-sm); margin-bottom: 4px; }
-.col-section-title { margin-bottom: var(--space-sm); }
-.col-section-title--flex { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
-.col-block { margin-bottom: var(--space-sm); }
-.col-block-title { font-weight: 600; font-size: var(--font-size-sm); margin-bottom: 4px; }
-.col-source-row { display: flex; gap: var(--space-sm); align-items: center; }
-.col-url-actions { display: flex; gap: var(--space-sm); align-items: center; margin-top: 4px; }
-.col-hint { font-size: var(--font-size-xs); color: var(--color-text-secondary); }
-.col-progress-track { background: var(--color-progress-track); border-radius: var(--r-xs); height: 8px; overflow: hidden; margin-bottom: 4px; }
-.col-progress-fill { background: var(--color-primary); height: 100%; transition: width 0.3s; }
-.col-list-wrap { margin-bottom: var(--space-lg); }
-.col-item--active { border-left: 3px solid var(--color-primary); }
-.col-stat-grid-mb { margin-bottom: var(--space-lg); }
-.col-stat-card-click { cursor: pointer; }
-
-/* ASR 依赖安装引导弹窗 */
-.asr-install-intro { margin: 0 0 12px; line-height: 1.6; color: var(--color-text-primary); }
-.asr-install-stage-text { font-weight: 600; margin-bottom: 8px; }
-.asr-install-detail { font-size: var(--font-size-xs); color: var(--color-text-secondary); margin-bottom: 8px; word-break: break-all; max-height: 60px; overflow: hidden; }
-.asr-install-bar { height: 8px; border-radius: 4px; background: var(--color-bg-inset); overflow: hidden; }
-.asr-install-bar-fill { height: 100%; border-radius: 4px; background: var(--color-primary); transition: width 0.3s ease; }
-.asr-install-error p { margin: 0 0 6px; color: var(--color-error-banner-text); }
-.asr-install-manual { color: var(--color-text-secondary) !important; font-size: var(--font-size-xs); }
-.asr-install-cmd { display: block; padding: 8px 10px; background: var(--color-bg-inset); border-radius: 6px; font-size: var(--font-size-xs); word-break: break-all; user-select: all; }
 
 </style>
 

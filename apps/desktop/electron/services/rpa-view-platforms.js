@@ -17,9 +17,10 @@ const PlatformConfig = require('@multi-publish/shared-utils/src/platform-config'
 // 发布能力注册表（publish-capability-registry）：无标题平台单一真源——视频号/快手/微博/X/Instagram/TikTok 无独立标题框，标题经 _composeEditorCaption 合并进描述首行。
 const { isNoTitlePlatform } = require('@multi-publish/shared-utils/src/publish-capabilities')
 const { platformSelectors } = require('@multi-publish/rpa-engine')
+const { resolvePublishSelectors } = require('@multi-publish/rpa-engine/src/publish-selectors-by-content-type')
 const { getPublishUrl } = require('@multi-publish/api-publish-engine/src/platform-entries')
 const { isApiTrack } = require('@multi-publish/api-publish-engine/src/api-router')
-const { buildXhsVideoRefusal } = require('./xiaohongshu-draft-guard')
+const { buildXhsVideoRefusal } = require('./xiaohongshu-draft-guard')   // 仅作草稿流程异常时的 fail-closed 兜底
 // 2026-10-02 头条兜底：DOM 被闭包门控拦下 ⇒ 失败时走「页面内 SDK 签名 + Node 直连」（toutiao-direct-bridge）
 const { ProgressThrottle } = require('./rpa-progress-throttle')
 const { FieldRetryState } = require('./rpa-field-retry')
@@ -94,17 +95,25 @@ function parsePublishResponseEvidence (body, response) {
 // 判据本体、三条红线与不变量见该模块头部注释。本文件只留薄调用点——它自己是逐文件行数
 // 门禁的**点名还账**文件（零增长容差），每多一行都在挤压一个已经压线的额度。
 const draftOnlyConfirm = require('./draft-only-confirm')
+// 发布前置门禁（publish-precondition-gate，2026-10-18）：点发布按钮之前断言
+// 「内容真的进去了」。动因是 2026-10-17 批量发布里头条/抖音的真实根因被
+// 「publish btn not found」「publish timeout」这两条下游症状掩盖。
+const publishPrecondition = require('./publish-precondition')
+// 真机 DOM 取证（MP_DOM_DUMP=1 才采集；默认零开销）
+const domDump = require('./rpa-dom-dump')
 
 
 const platformsMixin = {
   // ========== P2-B: Config loading ==========
-  _getPlatformConfig(platform) {
+  _getPlatformConfig(platform, article) {
     if (!_platformConfigInstance) {
       _platformConfigInstance = new PlatformConfig(getConfigPath('platforms.yaml'))
     }
     const cfg = _platformConfigInstance.getPlatform(platform)
     if (!cfg) throw new Error('platform config not found: ' + platform)
-    const sel = (platformSelectors.PLATFORM_PUBLISH_SELECTORS && platformSelectors.PLATFORM_PUBLISH_SELECTORS[platform]) || {}
+    // 2026-10-18 video-publish-4：按内容类型选选择器（视频上传页形状与图文页不同）；
+    // 规则与取证注释见 packages/rpa-engine/src/publish-selectors-by-content-type.js。
+    const sel = resolvePublishSelectors({ platform, article, selectors: platformSelectors.PLATFORM_PUBLISH_SELECTORS || {} })
     const rpa = cfg.rpa_config || {}
     const patterns = (rpa.success_patterns && rpa.success_patterns.length > 0) ? rpa.success_patterns : (PLATFORM_SUCCESS_PATTERNS[platform]||[])
     return { publish_url: cfg.publish_url||'', type: cfg.type||'article', has_api: cfg.has_api||false, selectors: sel, success_patterns: patterns, preFill: rpa.preFill||null, prePublishHook: rpa.prePublishHook||null, hookContext: rpa.hookContext||null, success_mode: rpa.success_mode||'url', success_selector: rpa.success_selector||null, max_content: Number(cfg.max_content) || null }
@@ -192,7 +201,7 @@ const platformsMixin = {
 
   // ========== P2-B: Generic publish engine ==========
   async _publish_generic(win, article, platform, publishConfig) {
-    const config = publishConfig || this._getPlatformConfig(platform)
+    const config = publishConfig || this._getPlatformConfig(platform, article)
     const sel = config.selectors
     log.info('RpaView', '[' + platform + '] publish config=' + (publishConfig ? 'provided' : 'default') + '; selectorCount=' + Object.keys(sel || {}).length + '; publishButtons=' + (sel?.publish_btn?.length || 0) + '; titleInputs=' + (sel?.title_input?.length || 0) + '; fileInputs=' + (sel?.file_input?.length || 0) + '; hasCoverInput=' + Boolean(sel?.cover_input) + '; hasTitle=' + Boolean(article?.title) + '; hasVideo=' + Boolean(article?.video_path) + '; hasCover=' + Boolean(article?.cover_path))
     const throttle = new ProgressThrottle(5000, 10)
@@ -202,7 +211,7 @@ const platformsMixin = {
     // draftOnly 分支仍无条件 return {success:true}，history 记 success
     // —— 假成功比失败危险：它骗过队列统计、历史列表与用户。
     // 这里收集**硬性内容字段**的填写结果，draftOnly 据此 fail-closed。
-    const fillReport = { title: null, content: null, tags: null }
+    const fillReport = { title: null, content: null, tags: null, upload: null }
 
     if (!config.publish_url) { log.warn('RpaView', '[' + platform + '] no publish_url configured'); return { success: false, error: platform+' no publish_url', platform: platform } }
 
@@ -214,6 +223,9 @@ const platformsMixin = {
       log.warn('RpaView', '[' + platform + '] not logged in url=' + curUrl)
       return { success: false, error: platform+' not logged in', platform: platform }
     }
+    // 导航完成后立刻取证：这一步回答「我们到底落在哪个页面上」（视频号曾落在平台首页）
+    // 取证是旁路：失败不得打断发布主链
+    try { await domDump.dumpDom(win, platform, 'nav', { logger: log }) } catch (_) { /* 旁路失败忽略 */ }
     // SPA 鐧诲綍鎬?DOM 鎺㈡祴锛歎RL 鏈烦杞絾椤甸潰宸叉槸鐧诲綍寮曞锛堝揩鎵嬬瓑 SPA 鏈櫥褰曚笉鏀瑰彉 URL锛?
     const loginProbe = await win.webContents.executeJavaScript(`(function(){
       var t = (document.body && document.body.innerText) || '';
@@ -277,38 +289,11 @@ const platformsMixin = {
     // video upload（必须先上传后填字段：kuaishou/bilibili 等平台的 publish_url 是
     // 上传落地页，标题/简介字段要等上传完成进入编辑器才渲染；旧顺序先填字段
     // 必然 timeout，2026-09 E2E 实锤）
-    log.info('RpaView', '[' + platform + '] file input hasVideo=' + Boolean(article.video_path) + ' selectorCount=' + (sel.file_input ? sel.file_input.length : 0))
-    if (article.video_path && sel.file_input && sel.file_input.length > 0) {
-      retry.addField('file_upload')
-      while (!retry.isDone('file_upload')) {
-        try {
-          this._emitProgress(platform, 'uploading file...', 25)
-          // 逐候选定位文件输入（上传落地页常有多个 input[type=file]，首个未必负责视频）
-          const fileSel = await this._resolveSelector(win, sel.file_input, 15000, 3000)
-          if (fileSel) {
-            await this._setFileInput(win, article.video_path, fileSel)
-            // 上传完成判定：百家号上传后页面会出现视频预览/编辑器初始化（发布按钮由 disabled 变可用）
-            // 不能依赖 progress/success class（百家号可能不使用），改为轮询"发布按钮可用或编辑器出现"
-            let uploadDone = false
-            if (platform === 'baijiahao') {
-              uploadDone = await this._waitForCondition(win, 'function(){var t=(document.body&&document.body.innerText)||"";var hasPreview=/预览|编辑|描述|简介|标题/.test(t);var ed=document.querySelector("[contenteditable=true],[data-lexical-editor=true]");var btn=[...document.querySelectorAll("button")].find(function(b){return (b.innerText||"").trim()==="发布"&&!b.disabled});return hasPreview&&(ed!==null||btn!==null)}', 180000, 1000)
-              if (!uploadDone) log.warn('RpaView', '['+platform+'] upload complete wait timeout (video may still be processing)')
-            } else {
-              await this._waitForVideoUploadComplete(win, platform, 900000, { fileBytes: readVideoFileBytes(article.video_path) })
-            }
-            // 编辑器表单就绪等待：上传完成后平台 SPA 渲染标题/简介字段有延迟，
-            // 不等直接填会全部 timeout（B站/快手上传完成后才切到编辑表单）
-            const formReady = await this._waitForCondition(win, 'function(){return !!document.querySelector(\'input[placeholder*="标题"],textarea,[contenteditable="true"]\')}', 120000, 1500)
-            if (!formReady) log.warn('RpaView', '[' + platform + '] editor form not ready after upload (still trying fields)')
-            retry.markDone('file_upload'); this._emitProgress(platform, 'file uploaded', 40)
-          } else {
-            if (!retry.retry('file_upload')) break; await this._sleep(2000)
-          }
-        } catch(e) {
-          log.warn('RpaView', '['+platform+'] upload: '+e.message)
-          if (!retry.retry('file_upload')) break; await this._sleep(2000)
-        }
-      }
+    // 视频上传整段下沉到 upload-waiter._runVideoUpload（含三态记录 + 选择器缺失判定）。
+    // 仅在有视频时调用：纯图文本就不该要求上传链存在（也让只 mock 图片链路的用例不受牵连）。
+    if (article.video_path) {
+      log.info('RpaView', '[' + platform + '] file input selectorCount=' + (sel.file_input ? sel.file_input.length : 0))
+      await this._runVideoUpload(win, article, platform, sel, fillReport, retry)
     }
 
     // title（逐候选回退 + 无独立标题字段时写进编辑器）
@@ -361,6 +346,16 @@ const platformsMixin = {
       if (captionSel && !titleSel) {
         // 标题已作为作品描述写进同一编辑器（快手），正文已在合并文案里，跳过避免覆写标题
         log.info('RpaView', '[' + platform + '] content already composed into editor caption, skip separate fill')
+        // publish-precondition-gate（2026-10-18）P4 以 fillReport.content 判「正文是否写入」。
+        // caption 合并路径的正文随合并文案一次性写入（_composeEditorCaption = 标题 + '\n' + 正文，
+        // _fillInput 内建读回校验）⇒ 标题写入成功时正文必然已在编辑器里，必须在此补记
+        // content.ok，否则门禁把「已随 caption 写入」误判为「正文未写入」，no-title 平台
+        // （微博/快手/X 等）的图文发布在点发布按钮之前被 100% 误拦（2026-10-27 微博图文
+        // 三连败根因：pre-submit gate blocked content-not-filled, content=null）。
+        // 标题写入失败时保持 null 不补记——此时合并文案没进编辑器，门禁拦截是正确行为。
+        if (fillReport.title && fillReport.title.ok === true) {
+          fillReport.content = { ok: true, via: 'editor-caption' }
+        }
       } else {
         const contentSel = await this._resolveSelector(win, cs, 10000, 3000)
         if (contentSel) {
@@ -471,6 +466,16 @@ const platformsMixin = {
         platform, sel, article, fillReport, config, baselineCtx: draftOnlyBaselineCtx,
       })
     }
+    // ★ publish-precondition-gate（2026-10-18）：点发布按钮之前断言「内容真的进去了」。
+    // 为什么必须在**点击之前**：发布按钮点击是副作用动作（每点一次都是一次真实提交尝试，风控面），
+    // 且点完没反应只会得到 publish timeout 这类与根因无关的症状；而「点击之前」失败 ⇒ 平台写操作
+    // 必然未发生 ⇒ 显式标 definitelyNotSent，由队列回滚发布间隔窗口（视频号 60′ 不再被假失败吃掉）。
+    // 取证（MP_DOM_DUMP=1）+ 判定 + 结果形状都在 publish-precondition.assertReady 里。
+    {
+      const gate = await publishPrecondition.assertReady({ win, platform, article, selectors: sel, fillReport, noTitlePlatform: isNoTitlePlatform(platform), logger: log })
+      if (!gate.ok) return gate.result
+    }
+
     if (sel.publish_btn && sel.publish_btn.length>0) {
       retry.addField('publish')
       while (!retry.isDone('publish')) {
@@ -1169,6 +1174,12 @@ const rp = this._waitForResponse(win,['aweme/create_v2','aweme/create','aweme/po
     const mediaId = saved.mediaId || ''
 
     if (!mediaId) {
+      // wxmp-unconfirmed-save（2026-10-18）：先分「保存没被确认」与「保存成功但采集不到 mediaId」
+      // 两种处境，再决定文案。现场读成后者会把用户引向错误方向（找媒体 ID）。
+      if (saved.saved === false) {
+        log.warn('RpaView', '[wechat_mp] save draft NOT confirmed by platform (saved=false, no mediaId) url=' + win.webContents.getURL())
+        return { success:false, error: draftMediaId.describeUnconfirmedSave(), platform:'wechat_mp' }
+      }
       log.warn('RpaView', '[wechat_mp] save draft result unverifiable: missing mediaId url=' + win.webContents.getURL())
       return { success:false, error: draftMediaId.describeSaveFailure(await readVisibleEditorToast(win), '微信公众号草稿保存结果无法验证：缺少媒体 ID'), platform:'wechat_mp' }
     }
@@ -1294,9 +1305,24 @@ const rp = this._waitForResponse(win,['aweme/create_v2','aweme/create','aweme/po
     if (!article || (!article.title && !article.content && !article.video_path)) {
       return { success:false, error:'小红书发布至少需要标题、正文或视频', platform:'xiaohongshu' }
     }
-    const config = this._getPlatformConfig('xiaohongshu')
+    const config = this._getPlatformConfig('xiaohongshu', article)
     const contentType = article.video_path ? 'video' : 'image'
-    if (contentType === 'video') return buildXhsVideoRefusal(win)   // 小红书不得真实发布：视频草稿链未实现 ⇒ fail-closed
+    // 2026-10-18 video-publish-4：小红书视频只落到平台草稿箱（用户硬约束）。
+    // 旧实现是 `if (contentType === 'video') return buildXhsVideoRefusal(win)` —— 直接拒绝。
+    // 本轮拿到真机 DOM 证据（Playwright + 真实账号 cookie 打开
+    // `publish/publish?from=menu&target=video` 并真实上传 mp4）后，视频链已可实现：
+    //   `input.upload-input`（可见）→ 标题 `input.d-text`（placeholder=填写标题会有更多赞哦）
+    //   → 正文 `div.tiptap.ProseMirror` → **不点「发布笔记」**（真机为 DIV 按钮），
+    //   靠平台自动草稿保存落到草稿箱（图文模式 2026-09-29 已采用同一策略）。
+    // 守卫：合并后的选择器仍拿不到 file_input ⇒ 上传无从发生 ⇒ 绝不静默降级成草稿。
+    const videoFileInputs = (config.selectors && config.selectors.file_input) || []
+    if (contentType === 'video') {
+      log.info('RpaView', '[xiaohongshu] video draft-only：填内容后等平台自动存草稿，不点发布')
+      if (!videoFileInputs.length) {
+        log.warn('RpaView', '[xiaohongshu] 视频草稿链缺 file_input 选择器 ⇒ fail-closed 拒绝')
+        return buildXhsVideoRefusal(win)
+      }
+    }
     const publishUrl = getPublishUrl('xiaohongshu', contentType)
     // 2026-09-29 图文模式：publish/publish?from=menu 默认落「上传视频」tab（实测 file input accept 全是视频格式）；
     // 图文须先点「上传图文」tab（switchImageTab hook，参考产品 renderImage 同款 children[1].click()），否则图片上传进视频通道必失败。
@@ -1305,11 +1331,11 @@ const rp = this._waitForResponse(win,['aweme/create_v2','aweme/create','aweme/po
       ...config,
       publish_url: publishUrl || config.publish_url,
       ...(isImageMode ? { preFill: 'switchImageTab' } : {}),
-      // 2026-09-29 需求调整（用户指定）：小红书图文只落到平台草稿箱，不点发布。
+      // 2026-09-29 需求调整（用户指定）：小红书只落到平台草稿箱，不点发布。
+      // 2026-10-18 扩展：视频模式同样只落草稿箱（原先是 fail-closed 拒绝）。
       // 小红书编辑页有自动草稿保存（页面「编辑于 刚刚」，侧边栏草稿箱计数 +1），
-      // 填完标题/正文/图片后等落库即可；用户回头扫码在草稿箱里自行发布。
-      // 视频模式保持原发布链路（草稿箱对视频无此约定）。
-      ...(isImageMode ? { draftOnly: true } : {}),
+      // 填完标题/正文/媒体后等落库即可；用户回头在草稿箱里自行发布。
+      draftOnly: true,
     })
   },
 

@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from database import init_db
-from routers import config, sync, secrets, snapshots, env, model_presets, auth, runtime, usage, licenses, health, feature_flags, platform_defs, content_templates, publish_metrics, redemption_codes, member_grant, keyword_watchlist, pipeline_dependencies, diagnostics, scheduler, scene_context, prompt_eval, feedback, pipeline_options, quality_eval, rewrite_strategies, app_menu, rewrite_hard_constraints, rewrite_ai_taste, content_categories, telemetry
+from routers import config, sync, secrets, snapshots, env, model_presets, auth, runtime, usage, licenses, health, feature_flags, platform_defs, content_templates, publish_metrics, redemption_codes, member_grant, keyword_watchlist, pipeline_dependencies, diagnostics, scheduler, scene_context, prompt_eval, feedback, pipeline_options, quality_eval, rewrite_strategies, app_menu, rewrite_hard_constraints, rewrite_ai_taste, content_categories, telemetry, story_text_limits
 
 
 
@@ -16,6 +16,7 @@ from services.key_service import ensure_official_key_columns
 from services.platform_def_service import ensure_platform_def_seeded
 from services.content_template_service import ensure_content_templates_seeded
 from services.content_category_service import ensure_content_categories_seeded
+from services.story_text_limit_service import ensure_story_text_limits_seeded
 from services.rewrite_strategy_service import ensure_rewrite_strategies_seeded
 from services.rewrite_hard_constraint_service import ensure_rewrite_hard_constraints_seeded
 from services.rewrite_ai_taste_service import ensure_rewrite_ai_taste_seeded
@@ -23,6 +24,7 @@ from services.pipeline_dependency_service import ensure_pipeline_deps_seeded
 from services.scheduler_service import ensure_scheduler_verification_table
 from services.usage_migration import ensure_usage_columns
 from services.prompt_eval_migration import ensure_prompt_eval_scene_columns, ensure_prompt_eval_dual_columns, ensure_prompt_eval_video_columns, ensure_provider_default_column
+from services.update_policy_migration import ensure_update_policy_columns
 from services.auth_service import ensure_admin_seeded
 from services.config_seed_service import ensure_feature_gates_seeded, ensure_projects_seeded
 from services.feature_flag_service import ensure_feature_flags_seeded
@@ -47,12 +49,14 @@ async def lifespan(app: FastAPI):
         await ensure_platform_def_seeded(db)
         await ensure_content_templates_seeded(db)
         await ensure_content_categories_seeded(db)
+        await ensure_story_text_limits_seeded(db)
         await ensure_rewrite_strategies_seeded(db)
         await ensure_rewrite_hard_constraints_seeded(db)
         await ensure_rewrite_ai_taste_seeded(db)
         await ensure_pipeline_deps_seeded(db)
         await ensure_scheduler_verification_table(db)
         await ensure_usage_columns(db)
+        await ensure_update_policy_columns(db)
         await ensure_prompt_eval_scene_columns(db)
         await ensure_prompt_eval_dual_columns(db)
         await ensure_prompt_eval_video_columns(db)
@@ -141,6 +145,7 @@ app.include_router(rewrite_hard_constraints.router)
 app.include_router(rewrite_ai_taste.router)
 app.include_router(app_menu.router)
 app.include_router(content_categories.router)
+app.include_router(story_text_limits.router)
 app.include_router(telemetry.router)
 
 

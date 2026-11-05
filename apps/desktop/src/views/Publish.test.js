@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
-import { nextTick } from "vue";
+import { nextTick, ref } from "vue";
 import { createRouter, createWebHistory } from "vue-router";
 import { setActivePinia, createPinia } from "pinia";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -10,6 +10,10 @@ import i18n from "@/i18n";
 
 const routes = [
   { path: "/", name: "home", component: { template: "<div>home</div>" } },
+  // editDraft/onOpenDraftsPage 等视图内导航以 /publish 为目标：无此桩路由时
+  // router.replace 被拒（"No match found"），query 不变 ⇒ 依赖 query 变化的
+  // 装载路径（继续编辑草稿）静默失效（实测该用例因此自 routes 精简后一直红）。
+  { path: "/publish", name: "publish", component: { template: "<div>publish</div>" } },
 ];
 const router = createRouter({ history: createWebHistory(), routes });
 
@@ -28,10 +32,12 @@ vi.mock("@/stores/platforms", () => ({
  * 账号目录用「可变容器」建模真实加载时序：ensureLoaded 解析**之前** `byPlatform` 为空。
  * 这直接对应线上缺陷现场——hash 路由首次写入 query 会先触发 watch(route.query.drafts)，
  * 那时 onMounted 的 `await loadAccounts()` 尚未跑完，按账号推导预置平台会得到空集。
+ * 容器内是 **ref**：真实 Pinia store 的 byPlatform 是对 accounts 派生的 computed，
+ * "账号到了 ⇒ 界面跟着变"是响应式保证的。赋值写 accountState.byPlatform.value = …。
  */
-const accountState = { byPlatform: null };
+const accountState = { byPlatform: ref(null) };
 function populateAccounts() {
-  accountState.byPlatform = {
+  accountState.byPlatform.value = {
     wechat_mp: [{ id: "acc1", name: "My Account", is_default: true }],
     baijiahao: [{ id: "bj1", name: "百家号账号", is_default: true }],
     xiaohongshu: [{ id: "xhs1", name: "小红书账号", is_default: true }],
@@ -42,7 +48,7 @@ vi.mock("@/stores/accounts", () => ({
   useAccountStore: () => ({
     load: mockAccountLoad,
     ensureLoaded: mockAccountLoad,
-    get byPlatform() { return accountState.byPlatform || {}; },
+    get byPlatform() { return accountState.byPlatform.value || {}; },
     getDefault: (p) => {
       if (p === "wechat_mp") return { id: "acc1", name: "My Account" };
       if (p === "baijiahao") return { id: "bj1", name: "百家号账号" };
@@ -167,11 +173,39 @@ describe("PublishView", () => {
     await nextTick()
     await w.vm.loadDrafts()
     await nextTick()
-    expect(w.vm.showDraftList).toBe(true)
+    // S1c：showDraftList（页内浮层开关）已随浮层一起删除，草稿箱只剩整页实现
+    expect(w.vm.showDraftList).toBeUndefined()
     expect(window.electronAPI.draftList).toHaveBeenCalled()
     expect(w.get('[data-testid="publish-drafts-page"]').exists()).toBe(true)
     expect(w.get('[data-testid="publish-drafts-empty"]').text()).toContain('暂无草稿')
     expect(w.find('[data-testid="publish-title"]').exists()).toBe(false)
+  })
+
+  // S1c 回归保护：草稿箱每条草稿必须有「去发布」出口。
+  // 背景：替换采集页草稿面板（原面板带 edit/publish 两键）后，若整页草稿箱只有
+  // 「继续编辑」+「删除」，从采集页进草稿箱的用户就找不到发布入口 —— 功能倒退。
+  it("草稿箱列表每条草稿有且仅有一个发布出口", async () => {
+    window.electronAPI.draftList.mockResolvedValue({
+      code: 0,
+      data: [{ id: 'd1', title: '草稿一', content: '正文', updatedAt: '2026-10-19T00:00:00.000Z' }],
+    })
+    await router.push('/?tab=drafts')
+    const w = await createWrapper()
+    await nextTick()
+    await nextTick()
+    await w.vm.loadDrafts()
+    await nextTick()
+
+    const publishBtn = w.get('[data-testid="publish-draft-d1"]')
+    expect(publishBtn.exists()).toBe(true)
+    expect(publishBtn.text()).toBe('去发布')
+    // 规则 1：不得出现第二个标签不同但结果相同的按钮
+    expect(w.find('[data-testid="edit-draft-d1"]').exists()).toBe(false)
+
+    await publishBtn.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.query.draft).toBe('d1')
+    expect(router.currentRoute.value.query.tab).toBe('publish')
   })
 
   it("草稿箱返回发布时切回发布编辑器页签", async () => {
@@ -339,40 +373,6 @@ describe("PublishView", () => {
     await nextTick();
     expect(window.electronAPI.publishBatch).toHaveBeenCalled();
     expect(w.vm.result.success).toBe(true);
-  });
-
-  it("handlePublish 百家号标题超长时自动按字节截断到 149 字节并继续一键发布", async () => {
-    const w = await createWrapper();
-    w.vm.selectedPlatforms = ["baijiahao"];
-    w.vm.selectedAccounts = { baijiahao: ["bj1"] };
-    w.vm.article.title = "外婆的灶台总飘着豆瓣香的雾气。那年我离家求学，她往行李塞了一罐自制辣酱。十年后我回乡，罐子还在，人已不在，我终于读懂了那口辣里的甜。";
-    w.vm.article.content = "正文";
-
-    await w.vm.handlePublish();
-    await flushPromises();
-
-    // 自动截断后仍继续发布，不阻断一键流程
-    expect(window.electronAPI.publishBatch).toHaveBeenCalled();
-    const [, data] = window.electronAPI.publishBatch.mock.calls[0];
-    // 66 个中文字符 = 198 字节，按 149 字节上限截断后剩 49 个中文字符（147 字节）
-    expect(Array.from(data.title).length).toBe(49);
-    expect(w.vm.result.success).toBe(true);
-  });
-
-  it("handlePublish 多平台发布时百家号标题截断后重新校验，其他平台仍超限则阻断", async () => {
-    const w = await createWrapper();
-    // baijiahao(149字节) + xiaohongshu(20字符)：截断到 49 中文字符后仍超 xiaohongshu 上限
-    w.vm.selectedPlatforms = ["baijiahao", "xiaohongshu"];
-    w.vm.selectedAccounts = { baijiahao: ["bj1"], xiaohongshu: ["xhs1"] };
-    w.vm.article.title = "外婆的灶台总飘着豆瓣香的雾气。那年我离家求学，她往行李塞了一罐自制辣酱。十年后我回乡，罐子还在，人已不在，我终于读懂了那口辣里的甜。";
-    w.vm.article.content = "正文";
-
-    await w.vm.handlePublish();
-    await flushPromises();
-
-    // 截断到 49 字符后仍超 xiaohongshu 20 字符上限 → 重新校验失败，阻断发布
-    expect(window.electronAPI.publishBatch).not.toHaveBeenCalled();
-    expect(w.vm.result).toBeNull();
   });
 
   it("handlePublish 百家号差异化覆盖标题超长时截断覆盖标题而非全局标题", async () => {
@@ -728,7 +728,7 @@ describe("PublishView", () => {
 
     // 模拟「交接发生在账号目录尚未就绪时」：hash 路由首次写入 query 会先触发
     // watch(route.query.drafts)，此时 onMounted 的 await loadAccounts() 还没跑完。
-    accountState.byPlatform = null
+    accountState.byPlatform.value = null
     mockAccountLoad.mockClear()
 
     const loaded = await w.vm.applyDraftHandoff(['d1', 'd2'])

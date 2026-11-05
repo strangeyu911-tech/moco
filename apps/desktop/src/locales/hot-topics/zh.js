@@ -28,6 +28,9 @@ export default {
       'baidu-finance': '百度财经榜', 'sina-finance': '新浪财经滚动', 'ithome-tech': 'IT之家热榜',
       'ithome-ai': 'IT之家(AI 专题筛)',
       'weibo-emotion': '微博情感垂类', 'weibo-health': '微博健康垂类',
+      // hot-topics-gyread-ai-source（2026-10-18）：GYREAD AI 情报日报。
+      // 两个键都要有：gyread 是条目 channel，gyread-ai 是补拉源 id（下拉显示后者）。
+      gyread: 'GYREAD AI 日报', 'gyread-ai': 'GYREAD AI 日报',
     },
     selectAll: '全选',
     deselectAll: '取消全选',
@@ -73,8 +76,24 @@ export default {
     sourceRank: (ctx) => '来源渠道内第 ' + ctx.named('rank') + ' 名（列表序号为当前筛选视图内顺序）',
     loadFailed: '选题获取失败，请稍后重试',
     generateVideo: '生成视频',
+    // hot-topics-pipeline-picker（2026-10-17）：行内下箭头 → 全流水线选择层
+    genVideoPipelinePickerAria: '选择视频创作流水线',
+    genVideoPipelinePickTitle: '选择视频创作流水线',
+    genVideoPipelineLoading: '正在加载流水线…',
+    genVideoPipelineLoadFailed: '流水线列表加载失败',
+    genVideoPipelineRetry: '重试',
+    genVideoPipelineEmpty: '暂无可用的视频创作流水线',
+    genVideoPipelineDefaultBadge: '默认',
+    genVideoPipelineHint: '点击一条流水线即可用该流水线开始生成视频',
+    genVideoPipelineLabel: (ctx) => '流水线：' + ctx.named('pipeline'),
+    genVideoPipelineNeedsMedia: '需先导入视频/音频素材',
+    genVideoPipelineDedicated: '需在专属页面使用',
+    genVideoPipelineInternal: '内部调试流水线',
+    genVideoPipelineUnavailable: '尚未实现执行引擎',
+    genVideoPipelineUnsupported: '暂不支持从选题直接生成',
+    genVideoDefaultPipelineHint: '使用默认流水线（故事讲述）生成；点右侧箭头可选择其它流水线',
     genVideoTitle: (ctx) => '一键生成视频 · ' + ctx.named('topic'),
-    genVideoStartToast: '已开始生成视频，改写文案后将自动启动故事讲述流水线',
+    genVideoStartToast: '已开始生成视频，改写文案后将自动启动所选流水线',
     genVideoRewriteFailed: '文案改写失败，请点击重试',
     genVideoPipelineFailed: '视频流水线启动失败，请点击重试',
     genVideoCancelled: '已取消生成视频',
@@ -88,6 +107,10 @@ export default {
     genVideoCancel: '取消',
     genVideoClose: '关闭',
     genVideoDone: '视频已生成，正在打开结果…',
+    // fix-hot-topics-genvideo-title（2026-10-17）：【去发布】的标题来源说明。
+    // 标题由默认文字推理模型按爆款元素生成；未配置模型或生成失败时降级为原始选题。
+    genVideoTitleHint: '点击「去发布」时，标题将由 AI 按爆款元素生成；若未配置文字推理模型或生成失败，将使用原始选题作为标题',
+    genVideoTitleGenerating: '正在生成标题…',
     // 收藏与标签页
     tabHot: '热门选题',
     tabFavorites: '收藏选题',

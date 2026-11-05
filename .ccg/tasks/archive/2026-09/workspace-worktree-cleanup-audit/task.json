@@ -1,0 +1,12 @@
+{
+  "id": "workspace-worktree-cleanup-audit",
+  "title": "调查所有工作区与工作树的可清理项（dry-run）",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "low",
+  "domain": "devops",
+  "currentPhase": "completed",
+  "nextAction": "归档",
+  "createdAt": "2026-08-24T18:10:20.192168+08:00",
+  "branch": "main"
+}

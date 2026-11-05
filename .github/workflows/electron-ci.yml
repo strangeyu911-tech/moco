@@ -23,7 +23,6 @@ on:
       - '.editorconfig'
       - '.ccg/**'
       - '.claude/**'
-      - '.hermes/**'
       - '.agents/**'
       - '.quality-rhythm/**'
       - 'openspec/**'
@@ -123,6 +122,19 @@ jobs:
           unset electron_use_remote_checksums npm_config_electron_use_remote_checksums
           node node_modules/electron/install.js
 
+      # 这 5 个受管构建产物已于 #3782 移出版本控制（.gitignore 吞掉），于是"干净检出里没有它们"。
+      # 下面那步桌面全量测试里有 9 个文件是**拿真实产物对账**的（preload-path / ipc-contract /
+      # build-preload / viral-pr2-preload / preload-variant / overlay-view-suspension / shell-mode-6b /
+      # podcast-plan-preview-ipc / podcast-script-ipc），缺这两步就 ENOENT 红。
+      # #3782 当时只给 quality-gate.yml 的三个消费 job 补了重建，漏了这里 —— 而本步 `if` 排除了
+      # pull_request，所以症状是"PR 全绿、main push 连红"，红只在 main 显形。
+      # `if` 与被配对的测试步**逐字相同**：不跑测试时也不白跑构建。
+      - name: Build preload bundles
+        if: github.event_name != 'pull_request'
+        run: |
+          pnpm --filter @multi-publish/desktop run build:preload
+          pnpm --filter @multi-publish/desktop run build:paginator
+
       # 2026-09-17：PR 上跳过本步（同一批桌面测试已由 QG desktop-shards 分片执行），
       # 仅在 main push / workflow_dispatch 运行，保留「单 worker 串行确定性模式」的 CI 覆盖与第二次独立运行的 flake 检出。
       - name: Unit tests (Vitest, non-Electron, single-worker deterministic)
@@ -141,6 +153,13 @@ jobs:
           BUDGET_SECONDS=2100
           LOG=electron-ci-unit-tests.log
           START=$(date +%s)
+          # ⛔ `set +e` 是必须的，不是风格（2026-10-20 follow-up，动因见 #2525 的反面）：
+          #    本 job 的 shell 是 `bash -e -o pipefail`，`timeout` 返回 124 时 `-e` 会**立刻
+          #    退出步骤**，于是后面的 PIPESTATUS 与整段自证诊断一次都不会执行。实测两次失败
+          #    attempt 的日志里都没有 `[electron-ci-timeout-budget] elapsed=… rc=…` 这行 ——
+          #    #2525 的标题是「让超时失败能自证」，但它专门为之设计的那个场景，恰恰是它唯一
+          #    不出现的场景。行内 `set -e` 只影响本步骤的子 shell，不波及其它步骤。
+          set +e
           timeout --signal=TERM --kill-after=30s ${BUDGET_SECONDS}s \
             pnpm --filter @multi-publish/desktop test -- \
             --maxWorkers=1 --no-file-parallelism --reporter=verbose \
@@ -148,6 +167,7 @@ jobs:
           # 必须读 PIPESTATUS：`cmd | tee` 的 $? 是 tee 的退出码（恒 0），
           # 直接判 $? 会把超时和断言失败一起吞成成功。
           RC=${PIPESTATUS[0]}
+          set -e
           END=$(date +%s)
           ELAPSED=$((END - START))
           echo "[electron-ci-timeout-budget] elapsed=${ELAPSED}s budget=${BUDGET_SECONDS}s rc=${RC}"

@@ -2,6 +2,9 @@
  * create 命名空间文案（locales 结构拆分，FRONTEND-FILE-SPLIT-PLAN-2026-10 v3）
  * 从 locales/zh.js 拆出，键名与拆出前完全一致；zh/en 成对维护（CI Gate 7）。
  */
+import avatarZh from './avatar/zh'
+import uiZh from './ui/zh'
+
 export default {
     story2video: {
       style: {
@@ -17,6 +20,8 @@ export default {
         cinematicDarkDesc: '深色电影感渲染',
       },
       configurationTitle: '故事讲述配置',
+      // 视频创作首页副标题（2026-10-19：由 CreateView.vue 硬编码迁入 locale，去「基于 OpenMontage」品牌字样）
+      engineSubtitle: '全能性流水线引擎，AI 驱动从脚本到成片的全流程',
       imageStyleHint: '控制每张生成图片的视觉外观。',
       promptStyleHint: '仅控制分镜图片提示词的写法与组织方式，不替代图片风格。',
       maxPromptLength: '提示词最大长度',
@@ -59,10 +64,10 @@ export default {
       subgroups: {
         splitTiming: '分句与时长',
         templateOutput: '模板与输出',
+        voiceNarration: '旁白设置', voiceBgm: '背景音乐', voiceClone: '音色复制 / 克隆',  // 声音区三子分区（s2v-voice-section-layout，2026-10-18）
       },
       startPipeline: '启动流水线',
       pause: '暂停',
-      backToHistory: '返回',
       selectionWait: {
         stageLabel: '等待选择素材',
         banner: (ctx) => '分镜素材已生成，请为每个分镜选择最终素材（共 ' + ctx.named('count') + ' 个场景）。',
@@ -111,6 +116,20 @@ export default {
         dialogTitle: '背景音乐素材库',
         noBgm: '不使用背景音乐',
         legacyBgm: '已选音频（未入库）',
+        // 历史路径核验（s2v-bgm-legacy-repair）：把「未入库」细分为可用 / 已丢失 / 不可用 / 未知
+        legacyAvailable: '已选音频（未入库，文件可用）',
+        legacyMissing: '已选音频（文件已丢失）',
+        legacyUnusable: '已选音频（无法使用）',
+        legacyHintChecking: '正在检查该音频文件是否仍可用…',
+        legacyHintAvailable: '该音频来自历史配置，当前不在素材库中；文件仍可用。建议加入素材库，避免系统清理临时目录后丢失。',
+        legacyHintMissing: '未找到该音频文件（可能已被系统临时目录清理或手动删除）。请重新选择背景音乐，或清除该选择后再启动，避免成片缺少背景音乐。',
+        legacyHintUnusable: '该音频存在但无法用于合成（格式、大小或所在位置不符合要求）。请重新选择或清除该选择后再启动。',
+        legacyHintUnknown: '当前环境无法核验该音频是否仍可用；合成时会按原路径尝试使用。',
+        adoptAction: '加入素材库',
+        adoptSuccess: '已将历史背景音乐保存到素材库',
+        clearAction: '清除背景音乐选择',
+        clearedToast: '已清除背景音乐选择',
+        verifyRetry: '重新检查',
         add: '添加音乐',
         addHint: '添加后将自动选中该音乐。',
         empty: '素材库为空。点击「添加音乐」导入本地音频文件，将自动加入素材库。',
@@ -215,6 +234,7 @@ export default {
         VOICE_CLONE_TOTAL_DURATION_EXCEEDED: '上传的音频总时长超出限制，请减少文件后重试。',
         VOICE_CLONE_PROVIDER_UNAVAILABLE: '音色克隆服务暂时不可用，请稍后重试。',
         VOICE_CLONE_UNAVAILABLE: '音色克隆服务暂时不可用，请稍后重试。',
+        VOICE_CLONE_PLAN_UNSUPPORTED: '当前 MiniMax 账号无法克隆音色：请注意，MiniMax 的音色复制需要另付费 9.9 元购买音色，不能直接使用订阅套餐。请前往 MiniMax 平台购买后重试，或改用内置音色/其它语音供应商。',
         VOICE_CLONE_UNSUPPORTED: '当前语音模型暂不支持音色克隆，已使用默认音色。',
         VOICE_CLONE_DIALOG_UNAVAILABLE: '无法打开本地音频文件选择窗口，请重试。',
         VOICE_CLONE_DUPLICATE_ID: '该克隆音色已存在，请更换名称后重试。',
@@ -252,9 +272,10 @@ export default {
         autoEdgeProvider: '自动 Edge TTS',
         multimodalSuffix: '（多模态）',
         // 2026-08-13 音色克隆进行中反馈（选择文件后自动克隆期间）
+        // 2026-10-18 文案只在实际添加阶段显示；浏览文件选择器期间按钮文案保持不变
         cloneSelectButton: '选择本地音频文件',
         cloneReselectButton: '重新选择音频文件',
-        cloneInProgressButton: '正在克隆…',
+        cloneInProgressButton: '正在添加…',
         cloneStatusPending: '已选择 {count} 个样本，正在上传并克隆音色…（通常需要 10~60 秒，请勿重复操作）',
         clonePendingLabel: '创建中…',
         cloneSuccessToast: '已添加克隆音色「{name}」',
@@ -263,73 +284,23 @@ export default {
         cloneDeleteConfirmMessage: '即将永久删除克隆音色「{name}」，其已保存的声音样本会一并移除，且不可恢复。',
         cloneDeleteConfirmButton: '确认删除',
       },
+      // 详情页模型信息（s2v-result-model-info，2026-10-18）：视频信息区「格式」同行展示本次生成调用的模型
+      // 中英必须成对维护：CI Gate 7 check-locale-sync.js --pair 硬拦截
+      modelInfo: {
+        textModel: '文本模型',
+        voiceModel: '语音模型',
+        imageModel: '图片模型',
+        videoModel: '视频模型',
+        // 「格式」标签随模型信息一并收口 locale：原在 ResultView.vue 硬编码，
+        // 抽成 ResultModelInfoRow.vue 后按文件匹配的 CJK 基线会失配
+        format: '格式',
+      },
       // 详情页视觉与交互精致化（story2video-detail-visual-refinement，2026-09-20）
       // 中英必须成对维护：CI Gate 7 check-locale-sync.js --pair 硬拦截
       ui: {
-        quickModeText: "文案生成",
-        quickModeGallery: "图片轮播",
-        profileCustomParams: "自定义参数",
-        providerCapSeconds: "（{seconds} 秒）",
-        providerCapabilityRetry: "检测到模型服务响应异常：{names}。流水线已自动重试；若反复出现，建议到【模型设置】切换模型或检查该服务商。",
-        mediaRequirementsImage: "支持 jpg / jpeg / png / webp 格式，单个文件最大 10MB。",
-        mediaRequirementsAudio: "支持 wav / m4a / mp3 格式，单个文件最大 50MB。",
-        mediaRequirementsBgm: "支持 wav / m4a / mp3 格式，单个文件最大 15MB。",
-        mediaRequirementsVideo: "支持 mp4 / mov / webm / mkv / avi 格式，单个文件最大 512MB。",
-        quickProfileYouTube: "YouTube 横屏 (1920x1080)",
-        quickProfileTikTok: "抖音/TikTok (1080x1920)",
-        quickProfileWechat: "微信视频号 (1080x1920)",
-        quickProfileXiaohongshu: "小红书 (1080x1440)",
-        loadingPipelineProgress: "正在加载流水线进度…",
-        sectionBasic: "基础",
-        sectionAppearance: "画面",
-        sectionVideoEnhance: "视频增强",
-        sectionVoice: "声音",
-        sectionAdvanced: "高级",
-        subgroupSplitTiming: "分句与时长",
-        subgroupTemplateOutput: "模板与输出",
-        imageStyleDefault: "电影感",
-        imageEffectNone: "无效果",
-        summaryPureImages: "纯图片轮播",
-        splitLanguageAuto: "自动识别",
-        splitModeBalanced: "均衡",
-        summaryPlatforms: "已选 {count} 个平台",
-        summaryNoPlatform: "不发布",
-        historyCompleted: "已完成",
-        historyFailed: "执行失败",
-        historyCancelled: "已取消",
-        historyRunning: "进行中",
-        historyPaused: "已暂停",
-        historyPending: "等待中",
-        historyUnknown: "未知",
-        loadFailed: "加载失败",
-        draftLoadFailed: "未找到要带入的草稿，请返回上一页重新发起",
-        providerAvailable: "可用",
-        providerInDev: "开发中",
-        pipelineAvailable: "该流水线可生成视频",
-        pipelineNoEngine: "该流水线尚未实现执行引擎，暂不能生成视频",
-        loginGateMessage: "启动流水线需要登录后使用，是否立即登录？",
-        backgroundRunNotice: "任务已启动并在后台运行，但当前无法实时跟踪进度，请在历史记录中查看。",
-        doubleResetHint: '双击滑杆可恢复默认值',
-        sectionDefaultSuffix: '（默认）',
-        estimatePlaceholder: '填写文案后自动预估分镜数、旁白时长与成本',
-        charLimitWarning: '接近字数上限',
-        charLimitReached: '（已达字数上限）',
-        flowGuide: '配置好参数后点击「启动流水线」，各阶段将自动串联执行，无需逐步确认。',
-        voiceSpeedLabel: '旁白语速',
-        voiceVolumeLabel: '旁白音量',
-        bgmVolumeLabel: '背景音乐音量',
-        videoFixedRatioLabel: 'AI 视频占比（前段）',
-        videoMinRatioLabel: 'AI 视频占比下限',
-        videoMaxRatioLabel: 'AI 视频占比上限',
-        blockedReason: {
-          noPipeline: '请先选择一条流水线',
-          unavailable: '该流水线尚未实现执行引擎，暂不能启动',
-          starting: '启动请求处理中，请稍候',
-          running: '已有流水线任务在运行中',
-          invalidRange: '部分数值参数超出允许范围，请检查语速、音量与分镜长度',
-          noAsset: '请先添加素材文件',
-          noText: '请先输入视频文案',
-        },
+        ...uiZh,
+        // 数字人（avatar-spokesperson）：唯一真源在 create/avatar/zh.js
+        ...avatarZh,
       },
       tpl: {
         navBack: "上一页",

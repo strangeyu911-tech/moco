@@ -1,0 +1,12 @@
+{
+  "id": "trellis-daily-development-integration",
+  "title": "接入 Trellis 作为日常开发的任务与规格层",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "low",
+  "domain": "documentation",
+  "currentPhase": "completed",
+  "nextAction": "已归档",
+  "createdAt": "2026-07-31T00:00:00Z",
+  "branch": "codex/trellis-daily-development"
+}

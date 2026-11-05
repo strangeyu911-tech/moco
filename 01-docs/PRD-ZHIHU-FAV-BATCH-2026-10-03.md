@@ -381,6 +381,156 @@
 2. **视觉回归不覆盖该改动**：被删 UI 在「知乎收藏文章」折叠组内，采集页默认态像素截图看不到 ⇒ `collection` 像素 0 回归（1/1 PASS）**不能**当作「删除正确」的证据，正确性由组件锁守。
 3. **无真机验证**：需在真实应用里确认「加载内容 → 勾选 → 采集并改写」可用，且旧按钮确实消失。
 
+### 4.3 阶段引导：加载出条目之前必须有路标（2026-10-17，change: zhihu-fav-step-hint）
+
+#### 4.3.1 问题（用户实测反馈触发）
+
+§4.2 删掉旧入口的两个**常驻**按钮后，出现了一个当时没预见的可用性空洞：
+
+> 用户原话：「在知乎收藏文章区域，没有「采集并改写」按钮啊，怎么操作？」
+
+**核因（代码位置，非猜测）**：「采集并改写」按钮位于 `v-if="zhihuFavItems.length"` 容器内（`BatchCollectPanel.vue` 模板块），而 `zhihuFavItems` 初始为 `ref([])`、**只在 `loadZhihuFavItems()` 成功后**才被填充。也就是说：
+
+- **加载收藏内容之前，那个按钮在 DOM 里根本不存在**（不是禁用、不是灰色，是没渲染）
+- 而在这一步之前，界面上**没有任何一个字**告诉用户「下一步该点『加载收藏内容』」
+
+**旧入口为什么没有这个问题**：它的两个按钮是**常驻**的（虽然一直不可点），旁边还配着两条提示，其中一条正是「请先获取收藏夹并选择要采集的收藏夹」。删按钮是对的，**把"路标"一起拆了是过头**。
+
+**同型性提醒**：2026-10-16 修的那个「按钮恒灰、点击无反应」故障，根因同样是**判据与引导缺失**。区别只是那次表现为「有按钮但不知道为何不能点」，这次表现为「按钮压根不出现且不知下一步」。
+
+#### 4.3.2 方案：只补纯文案路标，不恢复旧按钮
+
+| 阶段 | 判定条件 | 引导文案（zh） |
+|---|---|---|
+| A | 凭据可用 且 `zhihuFavlists.length === 0` | 下一步：点「获取收藏夹」拉取收藏夹列表，才能选择要采集的范围。 |
+| B | 凭据可用 且 有收藏夹 且 `zhihuFavItems.length === 0` | 下一步：选好范围与数量后点「加载收藏内容」——加载出来的条目才能勾选并「采集并改写」。 |
+| C | `zhihuFavItems.length > 0` | **不显示**（按钮已出现，不打扰） |
+| — | 凭据不可用（`!zhihuSecretAvailable`） | **不显示**（此时 `zhihuConfigHint` 已在讲「请先配置」，再叠一条会变成两条互相抢注意力的话） |
+
+**实现**：`zhihuFavStepHint` computed + 模板块 `<div v-if="zhihuFavStepHint" class="col-hint zb-mt6" data-testid="zhihu-fav-step-hint">`（纯文案，**内部不得有任何 button/a/input**）。文案 key `collection.zhihuFav.stepHintNoFavlists` / `stepHintNeedContents`（zh/en 成对）。
+
+#### 4.3.3 显示项与提示文字（locale 成对）
+
+| key（`collection.zhihuFav.*`） | zh | en |
+|---|---|---|
+| `stepHintNoFavlists` | 下一步：点「获取收藏夹」拉取收藏夹列表，才能选择要采集的范围。 | Next: click "Load Favorites" to fetch your favourites list — you need it before choosing a scope. |
+| `stepHintNeedContents` | 下一步：选好范围与数量后点「加载收藏内容」——加载出来的条目才能勾选并「采集并改写」。 | Next: pick a scope and count, then click "Load items" — only loaded items can be selected and collected & rewritten. |
+
+**文案约束**：文案中引用的按钮名**必须与 locale 里对应按钮逐字一致**（zh `loadBtn=获取收藏夹` / `loadContents=加载收藏内容`；en `Load Favorites` / `Load items`），否则用户会去找一个不存在的按钮。
+
+#### 4.3.4 验收标准
+
+| 编号 | 判据 |
+|---|---|
+| S1 | 阶段 A：`data-testid="zhihu-fav-step-hint"` 存在，文案含「获取收藏夹」；此时「采集并改写」不渲染 |
+| S2 | 阶段 B：文案含「加载收藏内容」；「采集并改写」仍不渲染 |
+| S3 | 阶段 C：路标消失，且「采集并改写」渲染 |
+| S4 | 凭据未配置：路标**不显示**，只留 `zhihu-config-hint` 一条 |
+| S5 | 路标是纯文案（内部 `button/a/input` 数量为 0），旧入口 testid 仍然一个都不出现 |
+
+#### 4.3.5 遗留
+
+1. **仍无真机验证**：路标出现/消失的逻辑由组件锁覆盖（5 条），但真实窗口里的**视觉位置**（是否紧跟在对应按钮下方）未截图确认。
+2. **像素门禁仍不覆盖**：路标同样在折叠组内，`collection` 默认态截图看不到 ⇒ 像素 PASS 不能证明路标位置合理。
+3. **文案里的按钮名与 locale 的耦合未做机械校验**（S1/S2 只断言包含关键词）：若将来改 `loadContents` 的文案而忘了改路标，锁不会红。~~列入 §9 范围外~~ ⇒ **已在 §4.3.6 闭环（2026-10-17 当日）**。
+
+#### 4.3.6 引导文案按钮名同步锁（2026-10-17，change: collected-results-fix）
+
+§4.3.5 第 3 条的遗留当日闭环：新增判据 `scripts/check-locale-button-name-sync.js`，接进 `quality-gate.yml` 的 **changes job**（不被 docs-only 短路、在非 PR 早退之前 ⇒ PR 档与 main push 档全覆盖）。
+
+**判据形态：显式登记表，非启发式**。本仓实测教训是启发式判据一次引入 5 个假阳、结局逼人清空登记表（AGENTS.md「spec-mirror-wiring-gate」）。因此：
+
+- 登记表 `REGISTRY` 声明「哪条引导文案引用了哪些按钮 key」，例如 `zhihuFav.stepHintNoFavlists → [zhihuFav.loadBtn]`；
+- 判据从 locale 源码按 key 抽值，**逐字比对**引导文案里第 n 个 `「…」`/`"…"` 引用段与被引用按钮的现值；
+- **登记之外的一律不管**（防假阳）；登记指向不存在的 key 也红（`missing-ref`）；key 被删而登记没跟也红（`missing-key`）；
+- **按语言可覆盖 refKeys**（en 文案的引用结构与 zh 不同时用 `locales: { zh:[...], en:[...] }`）。
+
+**接线锁**：自测 `scripts/check-locale-button-name-sync.test.js`（6 例）与判据同进 changes job；`check-unwired-tests.js` 全绿（30 例）。
+
+**当前登记**：
+
+| localeKey | refKeys（zh / en 相异处已按语言覆盖） |
+|---|---|
+| `zhihuFav.stepHintNoFavlists` | `zhihuFavlist.loadBtn`（zh+en 同；**获取收藏夹按钮的 key 在 zhihuFavlist 区块**，2026-10-17 修正归属） |
+| `zhihuFav.stepHintNeedContents` | zh：`zhihuFav.loadContents` + `zhihuFav.collectAndRewrite`；en：仅 `zhihuFav.loadContents`（en 里"采集并改写"以普通短语 `collected & rewritten` 出现，不构成按钮名引用，不做逐字核对） |
+
+**扩展规约**：将来**新增**任何引用按钮名的引导文案，必须同时把 `(localeKey, refKeys)` 登记进来；改按钮文案时判据会当场点名「引导现值 vs 按钮现值」两侧。
+
+#### 4.3.7 区块限定 key（同步锁的假绿修复）+ 主按钮改名 + 去重进度行（2026-10-17，change: fav-collect-ux）
+
+**同步锁的假绿（当日真实发生）**：主按钮改名「采集并改写」→「采集&改写」时，同步锁**应当红却 PASS**。追因：判据 `extractValue` 用**裸 key** 取值，而 `zhihuFavlist` 与 `zhihuFav` 是**同级**区块、内层同名 key 各一份——裸 key 恒取第一个匹配（旧区块的旧值），引导（旧名）vs 按钮（旧值）比对永远相等。**修法**：`extractValue` 支持区块限定（`zhihuFav.collectAndRewrite` = 先定位 `zhihuFav: {` 再找叶子），`text` 与 `refKey` 两处都传完整 key。**修后对真实仓库立刻 RED**（引导还引用旧名）⇒ 同步改引导文案 ⇒ PASS。登记表的 `loadBtn` 归属同步修正（它在 zhihuFavlist 区块）。
+
+**主按钮改名**：`collection.zhihuFav.collectAndRewrite` = `采集&改写`（zh）。en 维持 `Collect & rewrite`。`zhihuFavlist` 旧区块的未消费 key 保持原值不动（不扩大清理面）。
+
+**去重进度行（修「进度全完成但结果区 0 新增」的可归因性）**：C2 合同下已采集过的 URL 默认跳过是**正确行为**，此前缺陷在呈现——duplicate 与正常完成共用「完成」。现 done 事件 `res.duplicate` 分支显示：
+
+| key（`collection.zhihuFav.*`） | zh | en |
+|---|---|---|
+| `duplicateNote` | 已采集过，本次跳过（勾选「包含已采集」可强制重采） | Already collected — skipped this run (tick "Include collected" to force re-collection) |
+
+**用户指引**（对应「结果存哪去了」的疑问）：跳过的条目**上一轮已在采集结果里**（结果区按标题可查到）；本轮 0 新增是去重生效。要强制重采：勾选「包含已采集（强制重采）」。
+
+**验收**：done `duplicate:true` ⇒ 进度行含「已采集过」且不含「包含已采集」之外的旧「完成」尾缀；正常完成仍显示「完成」；按钮文字 = `采集&改写`；同步锁对真实仓库 PASS。
+
+#### 4.3.8 强制重采的语义穿透 + 采集失败可归因 + 收尾通知分级（2026-10-18，change: fav-force-recollect）
+
+§4.3.7 让「已采集被跳过」可见之后，用户按提示勾选 **「包含已采集（强制重采）」** 重试，**仍然全部显示「完成」且结果区 0 新增**。根因是三个独立缺陷叠加：
+
+**① 强制重采没有穿透到内容缓存（最核心）**
+
+`forceRecollect` 当时只被两处消费：跳过 duplicate 判断、覆盖时保留原 `id`/`createdAt`。但采集器 `UrlCollector.collect()` 还有一道 **L6 内容缓存**（`ContentCache`，内存 LRU），命中即返回空壳：
+
+```
+{ success: true, reason: 'cache_hit', title: '', content: '' }
+```
+
+该空壳被 `isSubstantive()` 判为不可采（防空壳合同 PRD §3.3.4）⇒ 计失败。于是「强制重采」名义生效、实际拿不到内容。
+
+**合同（新增，不可破）**：任何「强制刷新 / 强制重采 / 忽略缓存」类开关，必须逐层核对它是否真的穿透到每一处复用点——去重名单、内容缓存、进程内记忆（`knownEntryMeta`）、跨会话防线（`collectedUrls`）、磁盘快照。**只堵一层就会出现「勾了没反应」**，且这种失效在进度与结果上都与「正常执行」同形，极难自证。
+
+实现：`UrlCollector.collect(url, opts)` 新增 `opts.forceRefresh`；`zhihu-fav-batch:run` 在 `forceRecollect === true` 时传 `{ manual: false, forceRefresh: true }`（`manual` 语义不变，仍不豁免限流策略）。
+
+**② 采集失败在进度明细里被画成「完成」**
+
+后端的失败 done 事件只有 code（`unsubstantive` / `collect-throw` / `missing-url`），渲染层 done 分支又只处理 `registerOnly` / `duplicate` / `rewriteFailed` 三种，其余一律落到默认「完成」⇒ **失败与成功同形**。
+
+实现：
+- 后端 done 事件新增 `reason`（可读摘要，优先级：缓存命中说明 > 采集器自带 `error` > 兜底「内容不可提取」），并同步进 `results[].reason` 便于追溯；
+- 渲染层 done 分支新增**最高优先级** `res.ok === false` 判定：有 reason 显示「采集失败：{reason}」，无 reason 显示兜底话术（不得出现 `undefined`）。
+
+**③ 收尾通知无条件报成功**
+
+收尾原本是 `notifySuccess('collection.collectSuccess')` 一行，**不论结果**。整批全失败也弹「内容采集成功」——比进度明细更醒目，是同一误感知的第二个来源。
+
+**分级合同（新增）**：
+
+| 条件（优先级由高到低） | 通知 | 文案 key |
+|---|---|---|
+| `cancelled` | info | `collection.zhihuFav.cancelledNote` |
+| `completed > 0` | success | `collection.collectSuccess`（既有） |
+| `completed === 0 && failed > 0` | **warning** | `collection.zhihuFav.allFailedNote` |
+| `completed === 0 && failed === 0 && duplicateSkipped > 0` | info | `collection.zhihuFav.allSkippedNote` |
+| 其余（空批次兜底） | info | `collection.zhihuFav.allSkippedNote`（skipped=0） |
+
+**新增显示项与提示文字（zh/en 成对）**
+
+| key（`collection.zhihuFav.*`） | zh | en |
+|---|---|---|
+| `failedNote` | 采集失败：{reason} | Collection failed: {reason} |
+| `failedNoReason` | 采集失败（无详情，请查看日志） | Collection failed (no details; check the logs) |
+| `allFailedNote` | 全部采集失败（{failed} 条），详情见进度明细与日志 | All {failed} item(s) failed to collect — see the progress details and logs |
+| `allSkippedNote` | 这 {skipped} 条都已采集过，本次全部跳过（勾选「包含已采集」可强制重采） | All {skipped} item(s) were already collected — skipped this run (tick "Include collected" to force re-collection) |
+| `cancelledNote` | 已取消采集 | Collection cancelled |
+
+**交互与数据校验**
+
+- 勾选「包含已采集（强制重采）」⇒ 清单里已采集条目变为可选（既有）+ 采集时 `forceRefresh: true`（新增）；
+- 未勾选 ⇒ 缓存与去重名单照旧生效（`forceRefresh` 必须为假值，回归锁覆盖）；
+- 失败条目不进入 `collected_items`（既有合同不变），但**必须在进度明细与收尾通知上同时可见**；
+- `reason` 截断 ≤200 字符（与 `rewriteError` 同口径），不透传堆栈。
+
+**验收**：全失败批次 ⇒ 进度明细逐条含「采集失败」+ 原因、收尾弹 warning（`allFailedNote`）、**绝不弹 success**；全跳过批次 ⇒ 明细含「已采集过」、收尾 info（`allSkippedNote`）；勾强制重采 ⇒ `collect` 收到 `forceRefresh:true` 且缓存不再拦截；未勾 ⇒ 缓存照旧。
+
 ## 5. 显示项与提示文字（locale zh/en 成对）
 
 ### 5.1 显示项

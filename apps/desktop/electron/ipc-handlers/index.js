@@ -19,6 +19,8 @@ function registerAllHandlers(ipcMain, deps) {
   require('./analytics')(ipcMain, deps)
   require('./sync')(ipcMain, deps)
   require('./update')(ipcMain, deps)
+  // 强制升级阻断弹窗（forced-update-gate）：升级/重试/文案通道
+  require('./enforce-gate')(ipcMain, deps)
   require('./upload')(ipcMain, deps)
   require('./scheduler')(ipcMain, deps)
   require('./sensitive')(ipcMain, deps)
@@ -27,8 +29,15 @@ function registerAllHandlers(ipcMain, deps) {
   require('./templates')(ipcMain, deps)
   require('./license')(ipcMain, deps)
   require('./ai')(ipcMain, deps)
+  // 热门选题「生成视频 → 去发布」的爆款标题生成（fix-hot-topics-genvideo-title）。
+  // 必须注册：缺了它渲染层【去发布】拿不到 AI 标题，只能降级为原始选题。
+  require('./gen-video-title')(ipcMain, deps)
   require('./offline')(ipcMain, deps)
-  require('./payment')(ipcMain, deps)
+  // 注意：这里**不要**再注册 `./payment`。
+  // 买断授权模型已于 2026-10-17 移除（remove-buyout-license）：那条本地下单链路
+  // 在 S1 修复后已经断了（activate 只认 4-4-4 兑换码，订单 UUID 必不匹配 ⇒
+  // 支付成功也拿不到授权），且 ¥99 一次性买断与服务端 plan-matrix 的三档订阅互斥。
+  // 在线支付若要做，需接支付平台 + 回调 + 对账，是独立立项，不是恢复这个文件。
   require('./pipeline')(ipcMain, deps)
   // runImportedMediaGc 仅生产接线开启：selected-media 老化回收（>7 天）在注册时执行一次；
   // 测试环境不传该标记，避免 registerHandlers 触碰真实临时目录。
@@ -43,6 +52,8 @@ function registerAllHandlers(ipcMain, deps) {
   require('./rate-limit').registerHandlers(ipcMain, deps)
   require('./tts-voice-catalog')(ipcMain, deps)
   require('./tts-voice-clone')(ipcMain, deps)
+  // 数字人形象/音色目录（avatar-spokesperson 流水线接通 HeyGen）
+  require('./avatar-catalog')(ipcMain, deps)
   require('./prompt-eval')(ipcMain, deps)
   require('./generation-feedback')(ipcMain, deps)
   // 影视工程（film-engineering）流水线

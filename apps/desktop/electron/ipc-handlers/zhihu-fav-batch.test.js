@@ -135,6 +135,69 @@ describe("zhihu-fav-batch run 通道", () => {
     expect(r.data.items[0].rewriteFailed).toBe(true);
   });
 
+  // ── 改写失败必须可诊断（2026-10-17，用户实测反馈「改写失败用原文」看不到原因）──
+  // 旧实现 `catch {}` 把真实异常吞掉，用户只看到失败、不知道是后端没起还是接口报错。
+  it("改写抛异常 → 原因摘要落在条目 rewriteError + done 事件带 rewriteError（Q26C-D）", async () => {
+    deps.pythonBridge.requestBackend.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:8010"));
+    const r = await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    expect(r.data.rewriteFailed).toBe(1);
+    const item = r.data.items[0];
+    expect(item.rewriteFailed).toBe(true);
+    // 原因摘要必须落条目（截断到 200 字符以内），且包含真实错误关键字
+    expect(typeof item.rewriteError).toBe("string");
+    expect(item.rewriteError.length).toBeGreaterThan(0);
+    expect(item.rewriteError.length).toBeLessThanOrEqual(200);
+    expect(item.rewriteError).toContain("ECONNREFUSED");
+    // done 事件同步带原因，进度行才显示得出来（进度事件经 event.sends 收集，与本文件其他用例同式）
+    const prog = event.sends.filter((s) => s.ch === "zhihu-fav-batch:progress");
+    const doneEv = prog.map((s) => s.payload).filter((p) => p.phase === "done").pop();
+    expect(doneEv.result.rewriteFailed).toBe(true);
+    expect(doneEv.result.rewriteError).toContain("ECONNREFUSED");
+  });
+
+  it("改写返回空 result_content → rewriteError 说明「空结果」而不是笼统失败", async () => {
+    deps.pythonBridge.requestBackend.mockResolvedValueOnce({ result_content: "" });
+    const r = await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    const item = r.data.items[0];
+    expect(item.rewriteFailed).toBe(true);
+    expect(item.rewriteError).toContain("空");
+  });
+
+  it("改写成功 → 条目不得带 rewriteError 字段（避免旧数据误标）", async () => {
+    const r = await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    expect(r.data.rewriteFailed).toBe(0);
+    expect(r.data.items[0].rewriteError).toBeUndefined();
+  });
+
+  // ── QM-6 评审 #1/#6 回归锁（2026-10-17）：摘要脱敏 + 非 Error 抛出值可读 ──
+  it("rewriteError 内网端点脱敏：127.*/localhost:port 替换为通用说法，原文只在日志", async () => {
+    deps.pythonBridge.requestBackend.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:8010"));
+    const r = await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    const err = r.data.items[0].rewriteError;
+    expect(err).not.toMatch(/127\.\d+\.\d+\.\d+/);
+    expect(err).not.toMatch(/:\d{2,5}/);
+    expect(err).toContain("后端服务");
+    expect(deps.log.warn).toHaveBeenCalled(); // 完整原文保留在日志侧
+  });
+
+  it("非 Error 抛出值（对象/字符串）也能产出可读摘要，不出现 [object Object]", async () => {
+    deps.pythonBridge.requestBackend.mockRejectedValueOnce({ code: -1, message: "后端返回错误码" });
+    const r = await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    const err = r.data.items[0].rewriteError;
+    expect(err).not.toContain("[object Object]");
+    expect(err).toContain("后端返回错误码");
+  });
+
   it("视频型条目：跳过采集与改写，登记 kind=video（B4）", async () => {
     const r = await handlers["zhihu-fav-batch:run"](event, {
       items: [ITEM("https://www.zhihu.com/zvideo/1", "video")],
@@ -180,6 +243,72 @@ describe("zhihu-fav-batch run 通道", () => {
     expect(r.data.failed).toBe(1);
     expect(r.data.completed).toBe(0);
     expect(r.data.items).toHaveLength(0);
+  });
+
+  // ── 强制重采必须绕过内容缓存（2026-10-18，change: fav-force-recollect）──
+  // 用户实测：勾「包含已采集（强制重采）」后仍「完成」但无结果。
+  // 第一性原因：forceRecollect 只绕过了 duplicate 名单（knownEntryMeta ∪ collectedUrls），
+  // 没有绕过 UrlCollector 的 ContentCache —— 缓存命中返回 {success:true,title:'',content:''}
+  // 空壳，被判 unsubstantive 失败。语义上「强制重采」必须真去采。
+  it("forceRecollect → collect 收到 forceRefresh:true（真正绕过内容缓存）", async () => {
+    const url = "https://zhuanlan.zhihu.com/p/1";
+    await handlers["zhihu-fav-batch:run"](event, { items: [ITEM(url, "article")], forceRecollect: true });
+    expect(deps.urlCollector.collect).toHaveBeenCalled();
+    const [calledUrl, opts] = deps.urlCollector.collect.mock.calls[0];
+    expect(calledUrl).toBe(url);
+    expect(opts.forceRefresh).toBe(true);
+    expect(opts.manual).toBe(false); // 批量路径仍非手动（不豁免限流策略）
+  });
+
+  it("未勾强制重采时不得带 forceRefresh（保持既有缓存语义）", async () => {
+    await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/2", "article")],
+    });
+    const [, opts] = deps.urlCollector.collect.mock.calls[0];
+    expect(opts.forceRefresh).toBeFalsy();
+  });
+
+  // ── 采集失败必须可归因（2026-10-18，change: fav-force-recollect）──
+  // 进度行的 done 事件此前只带 error code（unsubstantive/collect-throw），渲染层也没有
+  // ok:false 分支 ⇒ 失败一律显示「完成」，用户完全无法判断「为什么没结果」。
+  it("采集失败（success:false）→ done 事件带可读 reason，不是只有 code", async () => {
+    deps.urlCollector.collect.mockResolvedValueOnce({ success: false, error: "知乎页面结构变化，正文节点未找到" });
+    const r = await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    expect(r.data.failed).toBe(1);
+    const done = event.sends.map((s) => s.payload).filter((p) => p.phase === "done").pop();
+    expect(done.result.ok).toBe(false);
+    expect(done.result.reason).toBeTruthy();
+    // 采集器给了具体 error 就用它，不要塌成泛泛的「内容不可提取」
+    expect(done.result.reason).toContain("知乎页面结构变化");
+    expect(r.data.results[0].reason).toBe(done.result.reason);
+  });
+
+  it("cache_hit 空壳失败 → reason 说明是「重复缓存命中」（区分于真采不到）", async () => {
+    deps.urlCollector.collect.mockResolvedValueOnce({ success: true, reason: "cache_hit", title: "", content: "" });
+    await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    const done = event.sends.map((s) => s.payload).filter((p) => p.phase === "done").pop();
+    expect(done.result.ok).toBe(false);
+    expect(done.result.reason).toContain("缓存");
+  });
+
+  // reason 直接透传到 UI（进度行 + 结果徽标）⇒ 与 rewriteError 同口径脱敏（2026-10-18 自评发现）
+  it("采集器 error 里的内网端点 → reason 脱敏，不把内网拓扑带到 UI", async () => {
+    deps.urlCollector.collect.mockResolvedValueOnce({
+      success: false,
+      error: "connect ECONNREFUSED 10.12.34.56:8899 (proxy) for https://zhuanlan.zhihu.com/p/1",
+    });
+    await handlers["zhihu-fav-batch:run"](event, {
+      items: [ITEM("https://zhuanlan.zhihu.com/p/1", "article")],
+    });
+    const done = event.sends.map((s) => s.payload).filter((p) => p.phase === "done").pop();
+    expect(done.result.reason).not.toMatch(/10\.12\.34\.56/);
+    expect(done.result.reason).not.toMatch(/:8899/);
+    // 仍要保留可读性（不能整条抹掉）
+    expect(done.result.reason).toContain("ECONNREFUSED");
   });
 
   it("任务互斥：进行中再发起 → code -3", async () => {

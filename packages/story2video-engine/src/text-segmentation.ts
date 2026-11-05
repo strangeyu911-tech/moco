@@ -17,7 +17,9 @@
 
 // 字幕分割规则单源（subtitle-rules.json，与 smart-sentence-splitter Python 共享同一份规则）
 import subtitleRules from './subtitle-rules.json';
+import { isUnitInterior } from './subtitle-unit-guard';
 import { segmenterSpans } from './segment';
+import { isPhraseBoundary, PHRASE_BOUNDARY_MIN_HEAD_RELAX } from './subtitle-phrase-boundary';
 // ==================== 通用工具 ====================
 
 /** 数字字符判定（v1.2.3 小数点豁免）：对齐 Python str.isdigit 的常用子集（Unicode 十进制数字）。 */
@@ -628,6 +630,18 @@ export class SubtitleSegmenter {
       // v1.2.3：数字中的小数点（如 713.3）不是切分标点
       if (isPunct && cur.length >= this.config.minCharsPerBlock
         && !(ch === '.' && SubtitleSegmenter.isDecimalPointAt(text, sourceIndex))) {
+        // v1.4 unit_guard：标点切点同样不得落在 数字│单位 或 引导字│数字 之间
+        //（实测：'风速每秒 8 米' 的空格切点把 8│米 劈开）。拒绝时退回下个分支（短语边界/MAX 兜底重找）。
+        if (isUnitInterior(text, sourceIndex + 1)) {
+          // 不在此切；落入后续短语边界/MAX 分支处理
+        } else {
+          blocks.push(cur);
+          cur = '';
+          lastHardCut = false;
+        }
+      } else if (stack.length === 0 && isPhraseBoundary(text, sourceIndex + 1)
+        && cur.length >= Math.max(1, this.config.minCharsPerBlock - PHRASE_BOUNDARY_MIN_HEAD_RELAX)) {
+        // v1.3 短语边界与优先级标点等价：累积阶段即兑现切分，不等 MAX 分支的裸切兜底。
         blocks.push(cur);
         cur = '';
         lastHardCut = false;
@@ -1024,6 +1038,7 @@ export class SubtitleSegmenter {
     if (this.protectedPhraseSpanAtBoundary(text, i)) return false;
     if (!SubtitleSegmenter.isLeBoundaryAllowed(text, i)) return false;
     if (this.isDecimalInterior(text, i)) return false;
+    if (isUnitInterior(text, i)) return false;
     return true;
   }
 
@@ -1093,6 +1108,8 @@ export class SubtitleSegmenter {
     if (!this.isSafeCutPosition(text, i)) return false;
     if (this.isSemanticLeadAt(text, i)) return true;
     if (SubtitleSegmenter.WORD_GOOD_LEAD.has(text[i])) return true;
+    // v1.3：短语右边界（块尾短语末字 + 块首短语首字同时命中）。
+    if (isPhraseBoundary(text, i)) return true;
     // v1.2.2：块尾收束路径额外要求切点后首字符非强黏着后缀（good_tail_blockers），
     // 避免 "…保持个|性独立" 类劈词（"个" 入 good_tail 后 "个性" 被拆）。
     return i > 0

@@ -19,7 +19,7 @@
             :placeholder="$t('collection.rssPlaceholder')"
             class="col-input col-input--grow"
           />
-          <button class="cohere-btn-primary" @click="collectBatch('rss')" :disabled="batchCollecting">
+          <button class="col-btn col-btn--primary" @click="collectBatch('rss')" :disabled="batchCollecting">
             {{ batchCollecting ? $t('collection.batchCollecting') : $t('collection.batchCollect') }}
           </button>
         </div>
@@ -44,7 +44,7 @@
           class="col-input col-input--block col-textarea"
         ></textarea>
         <div class="col-url-actions">
-          <button class="cohere-btn-primary" @click="collectBatch('batch')" :disabled="batchCollecting || !urlListInput.trim()">
+          <button class="col-btn col-btn--primary" @click="collectBatch('batch')" :disabled="batchCollecting || !urlListInput.trim()">
             {{ batchCollecting ? $t('collection.batchCollecting') : $t('collection.batchCollect') }}
           </button>
           <span class="col-hint">{{ $t('collection.urlListHint') }}</span>
@@ -76,10 +76,10 @@
             class="col-hint"
             data-testid="zhihu-config-masked"
           >{{ zhihuConfig.maskedSecret }}</span>
-          <button class="cohere-btn-secondary" @click="loadZhihuFavlists" :disabled="zhihuFavlistLoading || !zhihuSecretAvailable">
+          <button class="col-btn col-btn--secondary" @click="loadZhihuFavlists" :disabled="zhihuFavlistLoading || !zhihuSecretAvailable">
             {{ zhihuFavlistLoading ? $t('collection.zhihuFavlist.loading') : $t('collection.zhihuFavlist.loadBtn') }}
           </button>
-          <button class="cohere-btn-ghost" data-testid="zhihu-go-settings" @click="openZhihuSettings">
+          <button class="col-btn col-btn--ghost" data-testid="zhihu-go-settings" @click="openZhihuSettings">
             {{ $t('collection.zhihuFavlist.goSettings') }}
           </button>
         </div>
@@ -110,12 +110,17 @@
           />
           <label class="zb-check"><input v-model="zhihuFavFullMode" type="checkbox" data-testid="zhihu-fav-fullmode" />{{ $t('collection.zhihuFav.fullMode') }}</label>
           <label class="zb-check"><input v-model="zhihuFavIncludeCollected" type="checkbox" data-testid="zhihu-fav-include-collected" />{{ $t('collection.zhihuFav.includeCollected') }}</label>
-          <button class="cohere-btn-secondary" @click="loadZhihuFavItems" :disabled="zhihuFavListLoading || (zhihuFavScope === 'favlist' && !zhihuSelectedFavlist)">
+          <button class="col-btn col-btn--secondary" @click="loadZhihuFavItems" :disabled="zhihuFavListLoading || (zhihuFavScope === 'favlist' && !zhihuSelectedFavlist)">
             {{ zhihuFavListLoading ? $t('collection.zhihuFav.loadingContents') : $t('collection.zhihuFav.loadContents') }}
           </button>
         </div>
         <div v-if="zhihuFavScopeHint" class="col-hint zb-mt6" data-testid="zhihu-fav-scope-hint">
           {{ zhihuFavScopeHint }}
+        </div>
+        <!-- 阶段路标：加载出条目之前告诉用户下一步点哪个按钮（纯文案，不含任何可点控件）。
+             这是删掉旧整夹直采两个常驻按钮后补的引导，见 zhihuFavStepHint 的注释。 -->
+        <div v-if="zhihuFavStepHint" class="col-hint zb-mt6" data-testid="zhihu-fav-step-hint">
+          {{ zhihuFavStepHint }}
         </div>
         <!-- 收藏夹清单（直选） -->
         <div v-if="zhihuFavItems.length" class="zb-list" data-testid="zhihu-fav-items">
@@ -123,10 +128,10 @@
             <label class="zb-check"><input type="checkbox" :checked="zhihuFavAllSelected" @change="toggleZhihuFavAll($event.target.checked)" />{{ $t('collection.zhihuFav.selectAll') }}</label>
             <span class="col-hint">{{ $t('collection.zhihuFav.selectedCount', { count: String(zhihuFavSelectedItems.length) }) }}</span>
             <span class="zb-flex1"></span>
-            <button class="cohere-btn-primary" @click="runZhihuFavCollectRewrite" :disabled="zhihuFavBatching || !zhihuFavSelectedItems.length" data-testid="zhihu-fav-collect-rewrite">
+            <button class="col-btn col-btn--primary" @click="runZhihuFavCollectRewrite" :disabled="zhihuFavBatching || !zhihuFavSelectedItems.length" data-testid="zhihu-fav-collect-rewrite">
               {{ zhihuFavBatching ? $t('collection.zhihuFav.collecting') : $t('collection.zhihuFav.collectAndRewrite') }}
             </button>
-            <button v-if="zhihuFavBatching" class="cohere-btn-secondary" @click="cancelZhihuFavBatch">{{ $t('collection.cancelBatch') }}</button>
+            <button v-if="zhihuFavBatching" class="col-btn col-btn--secondary" @click="cancelZhihuFavBatch">{{ $t('collection.cancelBatch') }}</button>
           </div>
           <div v-for="(it, idx) in zhihuFavItems" :key="it.url + idx" class="zb-list-row">
             <input
@@ -461,6 +466,29 @@ const zhihuFavProgressPercent = computed(() => {
 })
 const zhihuFavScopeHint = computed(() => zhihuFavScopeNote.value || '')
 
+/**
+ * 阶段引导（2026-10-17，change: zhihu-fav-step-hint）
+ *
+ * 动因：zhihu-fav-entries-consolidate 删掉旧整夹直采的两个**常驻**按钮后，
+ * 在「加载收藏内容」之前界面上没有任何「下一步做什么」的路标 —— 而「采集并改写」
+ * 按钮位于 `v-if="zhihuFavItems.length"` 内，未加载内容时根本不存在。用户看到的是一个
+ * 会「沉默」的界面（旧入口虽然不可点，但配着「请先获取收藏夹…」的提示，路标是常驻的）。
+ *
+ * 这里只补**纯文案路标**，不恢复旧按钮（旧入口下线仍是既定结论）：
+ *   ① 还没有收藏夹列表 → 指向「获取收藏夹」
+ *   ② 有收藏夹但没有条目 → 指向「加载收藏内容」
+ *   ③ 已有条目 → 返回空（按钮已出现，不打扰）
+ * 凭据未配置时也返回空：那种情况下 zhihuConfigHint 已经在讲「请先配置」，
+ * 再叠一条会让用户面对两条互相抢注意力的话。
+ */
+const zhihuFavStepHint = computed(() => {
+  if (zhihuFavItems.value.length) return ''
+  if (!zhihuSecretAvailable.value) return ''
+  return zhihuFavlists.value.length
+    ? resolveNotifyText('collection.zhihuFav.stepHintNeedContents').text
+    : resolveNotifyText('collection.zhihuFav.stepHintNoFavlists').text
+})
+
 function zhihuKindLabel (kind) {
   const keyMap = { answer: 'kindAnswer', article: 'kindArticle', column: 'kindColumn', pin: 'kindPin', video: 'kindVideo', unknown: 'kindUnknown' }
   const key = keyMap[kind] || 'kindUnknown'
@@ -603,7 +631,33 @@ async function runZhihuFavCollectRewrite () {
     }).text
       + (data.cancelled ? resolveNotifyText('collection.zhihuFavlist.batchDoneCancelledSuffix').text : '')
       + (data.circuitBroken ? resolveNotifyText('collection.zhihuFavlist.batchDoneCircuitBrokenSuffix').text : '')
-    notifySuccess('collection.collectSuccess')
+    // 收尾通知必须与实际结果一致（2026-10-18，change: fav-force-recollect）：
+    // 原实现**无条件** notifySuccess('collection.collectSuccess')，即使整批采集失败或全部被
+    // 去重跳过也弹「内容采集成功」——这是用户「显示完成但结果区 0 新增」感知的第二个来源。
+    // 分级：取消 > 有成功 > 全失败 > 全跳过（最后的兜底不给成功语）。
+    const completedN = data.completed || 0
+    const failedN = data.failed || 0
+    const skippedN = data.duplicateSkipped || 0
+    if (data.cancelled) {
+      notifyInfo('collection.zhihuFav.cancelledNote')
+    } else if (completedN > 0) {
+      notifySuccess('collection.collectSuccess')
+    } else if (failedN > 0) {
+      notifyWarning('collection.zhihuFav.allFailedNote', {
+        params: { failed: String(failedN) },
+        fallback: zhihuFavSummary.value,
+      })
+    } else if (skippedN > 0) {
+      notifyInfo('collection.zhihuFav.allSkippedNote', { params: { skipped: String(skippedN) } })
+    } else if (data.circuitBroken) {
+      // 熔断与「全部已采集」是两件事（2026-10-18 自评发现）：上一版把它们并进同一个
+      // else 兜底，熔断批次会显示「这 0 条都已采集过」——语义完全错误，且掩盖了
+      // 真正该做的动作（等限流窗口过去再试）。
+      notifyWarning('collection.zhihuFav.circuitBrokenNote')
+    } else {
+      // 真·空批次（清单为空/全部被跳过而未计 skipped）：给中性说明，不给成功语。
+      notifyInfo('collection.zhihuFav.nothingCollectedNote')
+    }
     loadZhihuFavItems().catch(() => {})
   } catch (e) {
     zhihuFavlistError.value = String(e && e.message || e)
@@ -623,9 +677,30 @@ function subscribeZhihuFavProgress () {
         zhihuFavProgressDone.value = Math.min((p.index ?? 0) + 1, p.total || zhihuFavProgressTotal.value)
         const res = p.result || {}
         let note = resolveNotifyText('collection.zhihuFav.doneNote').text
-        if (res.registerOnly) note = resolveNotifyText('collection.zhihuFav.registerOnlyNote').text
-        else if (res.rewriteFailed) note = resolveNotifyText('collection.zhihuFav.collectOkRewriteFailNote').text
-        else if (res.fallbacks) note += resolveNotifyText('collection.zhihuFav.fallbackSuffix', { count: String(res.fallbacks) }).text
+        if (res.ok === false) {
+          // 采集失败必须可归因（2026-10-18，change: fav-force-recollect）：
+          // 后端 done 事件在失败时是 { ok:false, error:'unsubstantive'|'collect-throw', reason }，
+          // 而本分支此前**完全没有 ok:false 处理** ⇒ 失败被渲染成「完成」，
+          // 用户勾了「包含已采集（强制重采）」后看到「完成」却 0 新增，无从判断。
+          // 优先级最高：失败时不可能同时是 registerOnly/duplicate/成功改写。
+          note = res.reason
+            ? resolveNotifyText('collection.zhihuFav.failedNote', { reason: String(res.reason) }).text
+            : resolveNotifyText('collection.zhihuFav.failedNoReason').text
+        }
+        else if (res.registerOnly) note = resolveNotifyText('collection.zhihuFav.registerOnlyNote').text
+        else if (res.duplicate) {
+          // 去重跳过（2026-10-17，change: fav-collect-ux）：C2 合同下已采集过的 URL 默认跳过，
+          // 这是正确行为；缺陷在呈现——此前与正常完成一样显示「完成」，用户面对
+          // 「进度 2/2 全完成、结果区 0 新增」完全无法归因。明确说跳过 + 指路强制重采。
+          note = resolveNotifyText('collection.zhihuFav.duplicateNote').text
+        }
+        else if (res.rewriteFailed) {
+          note = resolveNotifyText('collection.zhihuFav.collectOkRewriteFailNote').text
+          // 失败原因可诊断（2026-10-17，change: collected-results-fix）：
+          // 后端把真实异常摘要（≤200 字符）放进 rewriteError；没有原因就保持原文案，
+          // 有原因就追加，让用户分清「后端没起 / 接口报错 / 空结果」三种该做不同事的情况。
+          if (res.rewriteError) note += '：' + String(res.rewriteError)
+        } else if (res.fallbacks) note += resolveNotifyText('collection.zhihuFav.fallbackSuffix', { count: String(res.fallbacks) }).text
         zhihuFavProgressLines.value.push(`[${(p.index ?? 0) + 1}/${p.total}] ${note}`)
       } else if (p.phase === 'summary') {
         zhihuFavProgressTotal.value = p.total || zhihuFavProgressTotal.value
@@ -654,66 +729,59 @@ defineExpose({ expandBatch })
 </script>
 
 <style scoped>
+/* 采集页控件规范层（collection-page-ui-ue-refine）：按钮三档/输入控件一档/
+   徽标一档/间距阶梯（zb-mt* 已收敛为 spacing 阶梯）统一在那里持有。 */
+@import './collection-page.css';
+
 /* 折叠组标题（互斥手风琴，Q10-b） */
 .col-group-title {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: center; gap: var(--spacing-2);
   width: 100%;
-  padding: 8px 10px;
+  min-height: var(--col-btn-h);
+  padding: 0 var(--spacing-3);
   border: 1px solid var(--color-border);
-  border-radius: var(--r-xs, 6px);
+  border-radius: var(--radius-xs);
   background: var(--color-bg-inset);
+  font-family: inherit;
   font-size: var(--font-size-sm);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   color: var(--color-text-primary);
   cursor: pointer;
   text-align: left;
+  transition: border-color var(--duration-fast) var(--ease-default), color var(--duration-fast) var(--ease-default);
 }
 .col-group-title:hover { border-color: var(--color-primary); }
 .col-group-title[aria-expanded="true"] { border-color: var(--color-primary); color: var(--color-primary); }
-.zb-panel { padding-top: 8px; }
+.zb-panel { padding-top: var(--spacing-2); margin-bottom: var(--spacing-3); }
 
-/* 知乎区块内联样式类化（zb-* 前缀，T1-3d 先例延续） */
-.zb-row { display: flex; gap: var(--space-sm); align-items: center; flex-wrap: wrap; }
-.zb-panel { margin-bottom: var(--space-sm); }
-.zb-mt4 { margin-top: 4px; }
-.zb-mt6 { margin-top: 6px; }
-.zb-mt8 { margin-top: 8px; }
+/* 知乎区块行布局钩子（zb-* 前缀，T1-3d 先例延续；间距已收敛为 spacing 阶梯） */
+.zb-row { display: flex; gap: var(--spacing-2); align-items: center; flex-wrap: wrap; }
 .zb-flex1 { flex: 1; }
 /* 凭据状态徽标（zhihu-api-settings）：中性=未配置、成功色=可用；旧版明文态由下方 hint 说明。
    色值一律走语义令牌（collection-tokens.test.js 禁止本区块出现 hex 字面量）。 */
 .zb-config-badge {
-  padding: 2px 8px;
-  border-radius: 10px;
+  padding: 1px var(--spacing-2);
+  border-radius: var(--radius-xs);
   background: var(--color-bg-inset);
   border: 1px solid var(--color-border);
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
-  font-weight: 500;
+  font-weight: var(--font-weight-medium);
 }
 .zb-config-badge.ok {
   border-color: var(--color-success);
   color: var(--color-success);
   background: var(--color-success-soft);
 }
-/* ghost 按钮在本仓是各组件自带的局部类（见 components/PersonalKnowledgePanel.vue），
-   这里显式自带一份，避免「引用了不存在的全局类」导致的裸样式按钮 */
-.cohere-btn-ghost {
-  padding: 6px 10px;
-  background: none;
-  border: 1px solid var(--color-border);
-  border-radius: var(--r-xs, 6px);
-  cursor: pointer;
-  font-size: var(--font-size-xs);
-  color: var(--color-text-primary);
-}
-.cohere-btn-ghost:hover { border-color: var(--color-primary); color: var(--color-primary); }
-.zb-select { border: 1px solid var(--color-border); border-radius: var(--r-xs, 6px); padding: 8px 10px; font-size: var(--font-size-sm); }
+/* ghost 按钮：统一走规范层 col-btn--ghost（原 cohere-btn-ghost 是各组件自带的
+   局部副本，本仓至少有 3 份同语义定义——PRD §4.1 收敛为一档）。 */
+.zb-select { height: var(--col-field-h); padding: var(--col-field-pad); border: 1px solid var(--color-border); border-radius: var(--radius-xs); background: var(--color-bg-card); color: var(--color-text-primary); font-family: inherit; font-size: var(--font-size-sm); }
 .zb-select-grow { flex: 1; min-width: 200px; }
-.zb-count { width: 130px; }
-.zb-check { display: flex; align-items: center; gap: 4px; font-size: var(--font-size-xs); }
-.zb-list { margin-top: 10px; border: 1px solid var(--color-border); border-radius: 8px; max-height: 320px; overflow-y: auto; }
-.zb-list-head { display: flex; gap: 8px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--color-border); font-size: var(--font-size-xs); }
-.zb-list-row { display: flex; gap: 8px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--color-border-soft, var(--color-border)); font-size: var(--font-size-xs); }
+.zb-count { width: 130px; height: var(--col-field-h); padding: var(--col-field-pad); border: 1px solid var(--color-border); border-radius: var(--radius-xs); background: var(--color-bg-card); color: var(--color-text-primary); font-family: inherit; font-size: var(--font-size-sm); }
+.zb-check { display: flex; align-items: center; gap: var(--spacing-1); font-size: var(--font-size-xs); color: var(--color-text-primary); }
+.zb-list { margin-top: var(--spacing-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); max-height: 320px; overflow-y: auto; }
+.zb-list-head { display: flex; gap: var(--spacing-2); align-items: center; padding: var(--spacing-2) var(--spacing-3); border-bottom: 1px solid var(--color-border); font-size: var(--font-size-xs); }
+.zb-list-row { display: flex; gap: var(--spacing-2); align-items: center; padding: var(--spacing-2) var(--spacing-3); border-bottom: 1px solid var(--color-border); font-size: var(--font-size-xs); }
 .zb-item-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .zb-kind { font-size: var(--font-size-xs); }
 </style>

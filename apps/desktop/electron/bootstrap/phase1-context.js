@@ -214,6 +214,14 @@ function extractContext(container) {
   if (opsCenterSync && typeof opsCenterSync.getUpdatePolicy === 'function' && autoUpdater.applyPolicy) {
     autoUpdater.applyPolicy(opsCenterSync.getUpdatePolicy())
   }
+  // ─── 强制升级门（forced-update-gate，2026-10-19）───
+  // 劝导层：enforce 策略判定 + 独立置顶弹窗（服务端版本门 426 是执法层）。
+  // 全部装配细节（含 enforce-gate require）抽至 services/enforce-gate-assembly.js
+  //（债务熔断 filesOver500 基线约束：phase1 主文件 507 行不得净增）。
+  // 接线契约锁（enforce-gate.contract.test.js）锁定 assembleEnforceGate 调用行存在。
+  require('../services/enforce-gate-assembly').assembleEnforceGate({
+    app: require('electron').app, opsCenterSync, autoUpdater, log,
+  })
   // 官方内容模板库运行时下发 → TemplateManager.applyRemote（先注入再启动自动同步）
   if (opsCenterSync && typeof opsCenterSync.setTemplateManager === 'function') {
     opsCenterSync.setTemplateManager(templateManager)
@@ -245,6 +253,12 @@ function extractContext(container) {
   const { setFeatureFlagProvider } = require('../core/container.setup')
   if (opsCenterSync && typeof opsCenterSync.getFeatureFlag === 'function' && typeof setFeatureFlagProvider === 'function') {
     setFeatureFlagProvider((key) => opsCenterSync.getFeatureFlag(key))
+  }
+  // 故事讲述文案字数上限（story-text-limit-control，2026-10-18）：运营中心 storyTextLimit
+  // 运行时下发 → 主进程最后一道闸惰性读取（未接线/非法值回落内置默认 10000，与渲染端同一判据）。
+  const { setStoryTextLimitProvider } = require('../services/story2video-text-config')
+  if (opsCenterSync && typeof opsCenterSync.getRuntimeState === 'function' && typeof setStoryTextLimitProvider === 'function') {
+    setStoryTextLimitProvider(() => opsCenterSync.getRuntimeState().storyTextLimit)
   }
   // 模型调用用量脱敏上报（P0 第二批）：聚合 model_provider_logs → ops-center /usage/ingest
   const { UsageReporter } = require('../services/usage-reporter')

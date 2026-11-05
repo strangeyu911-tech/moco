@@ -182,6 +182,9 @@ def _update_policy_to_dict(row) -> dict | None:
         "min_version": row.min_version or "",
         "force_version": row.force_version or "",
         "gray_ratio": row.gray_ratio if row.gray_ratio is not None else 100,
+        # forced-update-gate：存量库补列前 row 上可能没有这两列（迁移前读旧快照），getattr 兜底
+        "enforce_min_version": getattr(row, "enforce_min_version", None) or "",
+        "enforce_enabled": bool(getattr(row, "enforce_enabled", 0)),
         "enabled": bool(row.enabled),
         "note": row.note or "",
         "updated_at": row.updated_at,
@@ -286,16 +289,33 @@ async def upsert_update_policy(db: AsyncSession, body: dict) -> dict:
     gray_ratio = _validate_gray_ratio(body.get("gray_ratio"))
     enabled = 1 if str(body.get("enabled", "true")).lower() in ("true", "1") else 0
     note = str(body.get("note") or "").strip()[:200]
+    # ── forced-update-gate：强制阻断字段（2026-10-19）──
+    enforce_enabled = 1 if str(body.get("enforce_enabled", "false")).lower() in ("true", "1") else 0
+    enforce_min_version = _validate_version(body.get("enforce_min_version"))
+    if enforce_enabled:
+        if not enforce_min_version:
+            raise ValueError("启用强制阻断时必须填写 enforce_min_version（低于此版本的客户端将被阻断）")
+        if min_version and _cmp_version(enforce_min_version) >= _cmp_version(min_version):
+            raise ValueError("强制阻断版本必须低于最低提示版本（阻断线必须严于提示线）")
+        # QM-6 i4 修复：min_version 为空时 enforce 无上界 → 误配 99.0.0 会全员硬锁。
+        # 上界回落 force_version；两者都空则拒绝启用（先配置提示/强制线再开阻断）。
+        if not min_version and force_version and _cmp_version(enforce_min_version) >= _cmp_version(force_version):
+            raise ValueError("强制阻断版本必须低于强制下载版本（min_version 为空时以 force_version 为上界）")
+        if not min_version and not force_version:
+            raise ValueError("启用强制阻断前必须先配置 min_version 或 force_version 作为阻断线上界（防误配全员硬锁）")
     now = _now()
     row = (await db.execute(sa.select(UpdatePolicy).order_by(UpdatePolicy.id).limit(1))).scalar_one_or_none()
     if row is None:
         row = UpdatePolicy(min_version=min_version, force_version=force_version,
-                           gray_ratio=gray_ratio, enabled=enabled, note=note, updated_at=now)
+                           gray_ratio=gray_ratio, enforce_min_version=enforce_min_version,
+                           enforce_enabled=enforce_enabled, enabled=enabled, note=note, updated_at=now)
         db.add(row)
     else:
         row.min_version = min_version
         row.force_version = force_version
         row.gray_ratio = gray_ratio
+        row.enforce_min_version = enforce_min_version
+        row.enforce_enabled = enforce_enabled
         row.enabled = enabled
         row.note = note
         row.updated_at = now
@@ -386,6 +406,20 @@ async def _get_content_categories(db: AsyncSession) -> dict:
     return await content_category_service.get_bootstrap_content_categories(db)
 
 
+async def _get_story_text_limit(db: AsyncSession) -> dict | None:
+    """故事讲述文案字数上限下发（2026-10-18）——运营中心「字数控制」的唯一载荷。
+
+    形状固定为 ``{"story2video": {"maxChars": <int>, "warnPercent": <int>}}``；
+    enabled=0 的 scope 整键不出现；整块不可用（读库异常 / 全部禁用）时为 ``None``，
+    桌面端据此回落内置默认（10000 字 / 90%）。
+
+    与 appMenu / contentCategories 同点位：位于 bootstrap 响应的 Ed25519 签名覆盖范围内，
+    因此运营值不可被中间人改写。数值只能是整数，否则 compute_config_hash 会 fail-closed。
+    """
+    from services import story_text_limit_service
+    return await story_text_limit_service.get_bootstrap_story_text_limit(db)
+
+
 async def get_runtime_bootstrap(db: AsyncSession) -> dict:
     from services.feature_flag_service import list_runtime_feature_flags
     from services.platform_def_service import list_runtime_platform_defs
@@ -409,6 +443,7 @@ async def get_runtime_bootstrap(db: AsyncSession) -> dict:
         "pipelineOptions": await _get_pipeline_options(db),
         "appMenu": await _get_app_menu(db),
         "contentCategories": await _get_content_categories(db),
+        "storyTextLimit": await _get_story_text_limit(db),
         "synced_at": _now(),
     }
     # 配置版本号 + 内容指纹（2026-10-08 ops-center-resilience）。

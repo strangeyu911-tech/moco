@@ -28,6 +28,7 @@ export const S2V_PANEL_STATE = [
   's2vImageProviderOptions',
   's2vImageProviders',
   's2vLegacyBgmPath',
+  's2vLegacyBgmStatus',
   's2vMaxPromptLengthHint',
   's2vMaxPromptLengthLabel',
   's2vMaxPromptLengthOptions',
@@ -56,8 +57,7 @@ export const S2V_PANEL_STATE = [
   's2vVoiceCloneRequirements',
   's2vVoiceCloneSelection',
   's2vVoiceClones',
-  's2vVoiceModelHidden',
-  's2vVoiceModelOptions',
+  's2vVoiceContextModel',
   's2vVoiceOptions',
   's2vVoiceProviderOptions',
   's2vVoiceProviders',
@@ -69,12 +69,13 @@ export const S2V_PANEL_STATE = [
 
 // 父级 CreateView 的方法转发（按字母序）。
 export const S2V_PANEL_METHODS = [
+  'adoptS2VLegacyBgm',
   'applyS2VTemplate',
   'cancelS2VVoiceCloneRename',
   'chooseS2VVoiceCloneSamples',
+  'clearS2VLegacyBgm',
   'deleteS2VVoiceClone',
   'handleS2VVideoProviderChange',
-  'handleS2VVoiceModelChange',
   'handleS2VVoiceProviderChange',
   'handleS2VVoiceSelection',
   'isOrchestratedPipeline',
@@ -96,6 +97,7 @@ export const S2V_PANEL_METHODS = [
   'setS2VSectionOpen',
   'startS2VVoiceCloneRename',
   'translateWithLocaleFallback',
+  'verifyS2VLegacyBgm',
 ];
 
 /**

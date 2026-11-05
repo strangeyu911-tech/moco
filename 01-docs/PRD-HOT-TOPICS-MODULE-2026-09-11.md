@@ -128,6 +128,8 @@ ${topic}
 
 每条选题新增【生成视频】按钮（与【创作文案】并列，data-testid="hot-topic-generate-video-{id}"）。点击后弹出与视频创作页流水线进度弹窗同样 UI 的进度弹窗（UiModal variant=progress + StageProgress），自动执行完整编排：
 
+> 2026-10-17（hot-topics-pipeline-picker）：主按钮右侧新增下箭头流水线选择器，可选**任意可执行视频创作流水线**并以该流水线启动；主按钮本身仍使用默认流水线 `story2video-compose`。选择器的完整规格见 §3.13，本节描述的是默认流水线（故事讲述）路径。
+
 1. **文案改写阶段**（stage 名 rewrite_copy）：调用 aiRewrite(mode='create', content=buildRewriteInput(topic))，输入构造与一键发布一致（<20 字补引导前缀）。改写产物自动存入草稿箱（draftSave，source='hot-topics'，草稿保存失败不阻断视频生成）。
 2. **自动启动故事讲述流水线**：读取用户已保存的默认选项（settings key story2video.lastOptions.v1，owner-scoped SQLite；缺失/非法回退内置默认值），用共享纯函数 buildStory2VideoTextConfigFromSnapshot 构建 story2videoTextConfig，调用 pipelineStartOrchestrated('story2video-compose', params)。params 与创作页 startOrchestratedPipeline 完全一致（text=改写产物、inputMode='text'、checkpointPolicy='none'、autoAdvance=true、background=true、uiLocale）。
 3. **进度实时跟踪**：启动成功后订阅 onPipelineUpdate 实时推送 + 3s 轮询 pipelineGetRunContext 兜底（双通道，与创作页 startOrchestrationForeground 同口径）。runId 快照守卫防竞态。
@@ -206,6 +208,262 @@ ${topic}
 **权益门禁说明**：`publish:batch` 在 `CHANNEL_FEATURE_MAP` 映射 `cloud_publish` 权益；但开发/未打包模式（`app.isPackaged === false`）跳过业务权益校验（license-access-control.js L271-288 注释：本地验证发布流程不应被产品权益阻塞），因此本机 E2E 可直接发布。
 
 **环境变量（均向后兼容，缺省保持原生成-only 行为）**：`E2E_PUBLISH=1` 启用发布阶段；`E2E_PUBLISH_PLATFORMS=baijiahao,kuaishou` 平台白名单；`E2E_PUBLISH_TIMEOUT_MS` 单条终态等待上限（默认 900000）。
+
+### 3.13 生成视频的流水线选择器（P0，2026-10-17 新增，hot-topics-pipeline-picker）
+
+#### 3.13.1 背景与目标
+
+在此之前，热门选题行内的【生成视频】按钮把流水线**写死**为 `story2video-compose`（故事讲述）。视频创作页的流水线清单由主进程 `pipelineList` 下发（当前内置 15 条），但热门选题这条最短创作路径无法选择它们；用户要换流水线必须先去视频创作页重选流水线、重填文案，选题上下文（改写产物）随之丢失。
+
+本期目标：在**不改变**主【生成视频】按钮语义（默认流水线）的前提下，紧邻它新增一个**小的下箭头图标按钮**；点击打开下拉选择层，**列出所有的视频创作流水线**；点击其中某一条可执行的流水线后，**立即以该流水线开始生成视频流程**（沿用同一次文案改写产物与同一个进度弹窗）。
+
+#### 3.13.2 入口与显示项
+
+| 位置 | 元素 | 规格 |
+|------|------|------|
+| 热门选题行右侧按钮区 | 主按钮 | 文案 `hotTopics.generateVideo`（生成视频），`data-testid="hot-topic-generate-video-{topicId}"`，`cohere-btn-primary`；行为与 §3.10 完全一致（默认 `story2video-compose`）；`title` = `hotTopics.genVideoDefaultPipelineHint`（使用默认流水线；点右侧箭头可选择其它流水线） |
+| 主按钮右侧（紧邻） | 下箭头按钮 | 文案/图形 `▾`，`data-testid="hot-topic-gen-video-picker-{topicId}"`，`cohere-btn-primary`；`aria-haspopup="menu"`、`aria-expanded`、`aria-label`/`title` = `hotTopics.genVideoPipelinePickerAria`；打开时箭头旋转 180° |
+| 收藏选题行 | 同一按钮组 | 复用同一组件，testid 前缀改为 `hot-topic-favorite-generate-video-{favKey}` / `hot-topic-favorite-gen-video-picker-{favKey}`；`topic` 损坏（null）的行两个按钮都禁用，但【取消收藏】仍可用 |
+| 下拉面板（行内绝对定位） | 标题 | `hotTopics.genVideoPipelinePickTitle`（选择视频创作流水线） |
+| 下拉面板 | 菜单项 | 每项：本地化流水线名 + 默认项「默认」徽标 + 不可执行项的原因文案；`role="menuitem"`；`title` = 流水线描述（来自 `pipelines.descriptions.*`） |
+| 下拉面板底部 | 操作提示 | `hotTopics.genVideoPipelineHint`（点击一条流水线即可用该流水线开始生成视频）；仅在存在可执行项时显示 |
+| 生成视频弹窗 | 流水线标识 | 弹窗内容区顶部一行「流水线：{名称}」（`data-testid="hot-topics-gen-video-pipeline"`，文案 `hotTopics.genVideoPipelineLabel`），让用户明确本次跑的是哪条流水线 |
+
+**布局约束**：下箭头按钮内边距收窄（4px 6px）、与主按钮间距 2px；下拉面板 `position: absolute; right: 0; top: calc(100% + 6px)`，不参与行 flex 布局，因此**不改变行高、不引起列表跳动**；面板 `min-width 260px / max-width 340px / max-height 320px`（超出滚动）。
+
+#### 3.13.3 数据源与可执行性分类（唯一真源）
+
+- **数据源**：主进程 IPC `pipelineList()`（`PipelineEngine.listPipelines()`），与视频创作页流水线卡片、`PipelineBrowser` 同源。前端**不得**另造流水线枚举；下拉只负责「展示 + 可执行性分类」。
+- **加载时机**：首次打开某行下拉时懒加载（不在页面 `onMounted` 预取，避免首屏多一次 IPC）；同一组件生命周期内缓存结果，重复打开不再请求。
+- **分类规则**（`apps/desktop/src/features/hot-topics/gen-video-pipelines.js`，纯函数，fail-closed）：
+
+| 分类 | 流水线 | 是否可点击 | 原因文案 key |
+|------|--------|-----------|-------------|
+| 默认故事讲述 | `story2video-compose` | ✅（带「默认」徽标） | — |
+| 文本驱动自动流水线 | `animated-explainer` / `documentary-montage` / `animation` / `avatar-spokesperson` / `character-animation` / `hybrid` | ✅ | — |
+| 需先导入素材 | `talking-head` / `cinematic` / `clip-factory` / `localization-dub` / `podcast-repurpose` | ❌（保留可见） | `hotTopics.genVideoPipelineNeedsMedia` |
+| 专属页面 | `film-engineering` | ❌ | `hotTopics.genVideoPipelineDedicated` |
+| 内部调试 | `framework-smoke` | ❌ | `hotTopics.genVideoPipelineInternal` |
+| 未实现执行引擎 | `available === false` 的条目（如 `screen-demo`） | ❌ | `hotTopics.genVideoPipelineUnavailable` |
+| 未知/动态注册 | 其余名字 | ❌ | `hotTopics.genVideoPipelineUnsupported` |
+
+- **排序**：可执行项在前、不可执行项在后，各自保持主进程返回顺序（`story2video-compose` 天然第一）；不使用不稳定排序（按 index 兜底）。
+- **失败回退**：`pipelineList` 返回非 0、抛错或结构非法 → 面板展示 `hotTopics.genVideoPipelineLoadFailed` + 【重试】按钮 + **回退项「故事讲述（默认）」**（仍可点击启动）；主【生成视频】按钮不依赖该 IPC，永远可用。
+- **空清单**：`code === 0` 且 `data: []` → 展示 `hotTopics.genVideoPipelineEmpty`，不产生可点击项。
+
+#### 3.13.4 数据校验与防御
+
+1. **清单归一化**：`data` 非数组按加载失败处理；条目非对象、`name` 非字符串/空白、重名 → 丢弃（保序去重）；`available` 非布尔 → 按「需进一步判定」处理（已知文本驱动项视为可用，其余不可用）。
+2. **可点击二次校验**：菜单项 `disabled` 之外，点击处理函数再判 `opt.enabled`（防程序化 `dispatchEvent` 绕过 disabled）；`startGenerateVideo` 方法内再用 `isPipelineRunnableFromTopic` 拒绝不可执行流水线（第三道防线）。
+3. **非法文字/空改写产物**：`buildGenVideoStartParams` 对空 `text` 返回 `null`，编排层按「流水线启动失败」处理（不调用 IPC）。
+4. **阶段名来源**：本地 `i18n/pipeline-labels.js` 的 Registry（与视频创作页同源）；未知流水线不会进入可执行集合，因此弹窗阶段不会为空。
+5. **不新增 IPC 参数、不改主进程**：选择器只调用只读 `pipelineList`；启动仍走既有 `pipelineStartOrchestrated`。
+
+#### 3.13.5 交互逻辑
+
+| 操作 | 结果 |
+|------|------|
+| 点击下箭头（关闭态） | 打开该行面板；若未加载则显示「正在加载流水线…」并请求清单；加载完成后焦点落在第一个可执行项 |
+| 点击下箭头（打开态） | 关闭面板 |
+| 点击面板外区域 | 关闭面板（`document` pointerdown 捕获，判断 target 是否在组件根内） |
+| 按 `Esc` | 关闭面板，焦点回到下箭头 |
+| 按 `↑` / `↓` | 焦点在**可执行项**之间循环移动，跳过禁用项 |
+| 按 `Home` / `End` | 焦点到第一个 / 最后一个可执行项 |
+| 点击可执行项 | 关闭面板 → `startGenerateVideo(topic, pipelineName)`：改写 → 以所选流水线启动 → 打开进度弹窗 |
+| 点击禁用项 | 无任何副作用（不改写、不打开弹窗、不启动流水线），面板保持打开，用户可继续选择 |
+| 打开另一行的下箭头 | 前一面板自动关闭（模块级单实例指针，保证同一时刻至多一个面板） |
+| 面板下方空间不足 | 面板翻转到按钮**上方**展开；若翻转后高度仍不足，按可用空间压缩为 **160–320px** 的可滚动区域（不裁切、不消失） |
+| 页面发生滚动 | 自动关闭面板（面板绝对定位在行内，滚动后易与按钮脱位或被滚动容器裁切） |
+| 编排在途（`genVideoBusy`） | 所有行的主按钮与下箭头同时禁用；已打开的面板被强制关闭 |
+| 点击主按钮 | 与本次改造前一致：默认 `story2video-compose` |
+
+#### 3.13.6 选择后的启动分支（按流水线类型）
+
+1. **`story2video-compose`**：沿用 §3.10 完整链路——`aiRewrite` → 草稿保存（失败不阻断）→ 读取 `story2video.lastOptions.v1` → `buildStory2VideoTextConfigFromSnapshot` → `pipelineStartOrchestrated('story2video-compose', { text, inputMode:'text', checkpointPolicy:'none', autoAdvance:true, background:true, uiLocale, story2videoTextConfig })`。
+2. **文本驱动自动流水线**（animated-explainer / documentary-montage / animation / avatar-spokesperson / character-animation / hybrid）：同一改写产物作为 `params.text`，参数与视频创作页 `startExplainerPipeline` 同口径：
+   `{ text, inputMode:'text', checkpointPolicy:'none', autoAdvance:true, background:true, uiLocale, storyboardMode:'auto', style:'clean-professional', resolution, aspectRatio, fps, format }`；
+   其中 `resolution/fps/format` 取用户上次保存的 S2V 输出配置（快照缺失/非法回退 `720x1280 / 30 / mp4`），`aspectRatio` 由分辨率映射（720x1280→9:16、1920x1080→16:9 等）。
+3. **弹窗阶段** = `rewrite_copy` + 所选流水线的真实阶段（来自 Registry）。示例：
+   - 故事讲述：`rewrite_copy, split, scene_context, optimize, select_video_scenes, generate_assets, compose, publish`（8）
+   - AI 讲解：`rewrite_copy, research, proposal, script, scenes, assets, editing, compose, publish`（9）
+   - 动画：`rewrite_copy, concept, storyboard, animate, render`（5）
+   总进度分母 = 阶段总数（动态）；启动前把第一个非改写阶段置 `running`，启动失败把它置 `failed`（不再写死 `split`）。
+4. **成片提取**：终态从 run context 的 `publish → compose → export → render → report` 依序取 `videoPath/path`（共享纯函数 `extractRunContextVideoPath`，与视频创作页同一实现）。非 S2V 流水线没有 `story2videoProject` → 【去发布】**只带 `type=video` + `video_path`**（既有 run-only 语义，不注入空标题正文）；【查看】仍跳视频创作历史「已完成」标签。
+5. **重试**：沿用本次所选流水线；改写产物已缓存时跳过改写，只重跑流水线启动；非改写阶段先复位 pending。
+
+#### 3.13.7 提示文字（新增 key 见 §7.1）
+
+| 场景 | key | zh 文案 |
+|------|-----|---------|
+| 下箭头 aria/标题、面板标题 | `genVideoPipelinePickerAria` / `genVideoPipelinePickTitle` | 选择视频创作流水线 |
+| 加载中 | `genVideoPipelineLoading` | 正在加载流水线… |
+| 加载失败 + 重试 | `genVideoPipelineLoadFailed` / `genVideoPipelineRetry` | 流水线列表加载失败 / 重试 |
+| 空清单 | `genVideoPipelineEmpty` | 暂无可用的视频创作流水线 |
+| 默认徽标 | `genVideoPipelineDefaultBadge` | 默认 |
+| 禁用原因（4 类 + 未知） | `genVideoPipelineNeedsMedia` / `genVideoPipelineDedicated` / `genVideoPipelineInternal` / `genVideoPipelineUnavailable` / `genVideoPipelineUnsupported` | 需先导入视频/音频素材 / 需在专属页面使用 / 内部调试流水线 / 尚未实现执行引擎 / 暂不支持从选题直接生成 |
+| 面板底部提示 | `genVideoPipelineHint` | 点击一条流水线即可用该流水线开始生成视频 |
+| 主按钮 title | `genVideoDefaultPipelineHint` | 使用默认流水线（故事讲述）生成；点右侧箭头可选择其它流水线 |
+| 弹窗流水线标识 | `genVideoPipelineLabel` | 流水线：{pipeline} |
+| 改写阶段摘要 | `genVideoStartToast`（本次改为通用表述） | 已开始生成视频，改写文案后将自动启动所选流水线 |
+
+#### 3.13.8 边界情况
+
+1. 清单加载失败后用户直接点主按钮 → 不受影响，仍以默认流水线正常启动。
+2. 清单返回含未知/动态注册流水线 → 显示为禁用项并标注「暂不支持从选题直接生成」，不崩溃、不误启动。
+3. 同一行重复快速点击下箭头 → 仅打开/关闭一次，不重复请求清单。
+4. 面板打开时列表被刷新/筛选导致该行消失 → 组件卸载时关闭面板并移除 document 监听（无泄漏）。
+5. 面板打开时开始编排（例如键盘触发主按钮）→ busy 上升后面板自动关闭。
+6. 收藏行 `topic` 损坏 → 两个按钮禁用但不影响取消收藏。
+7. 非 S2V 流水线完成后成片路径只出现在 `render` → 【查看】【去发布】正常解锁（本轮新增测试锚定）。
+8. 流水线在启动阶段失败（如并发超限）→ 弹窗错误摘要 + 【重试】，失败阶段为**该流水线的第一个阶段**而非 `split`。
+
+#### 3.13.9 非目标
+
+- 不在下拉内提供流水线配置面板/参数编辑（仍由视频创作页承担）；
+- 不做「记住上次选择的流水线」作为主按钮默认值（本期主按钮固定默认流水线，避免隐式状态）；
+- 不为媒体型流水线在热门选题内提供素材选择入口；
+- 不改变 `pipelineList` / `pipelineStartOrchestrated` 的 IPC 契约。
+
+#### 3.13.10 【去发布】标题生成与降级（fix-hot-topics-genvideo-title，2026-10-17）
+
+##### 3.13.10.1 问题与根因
+
+用户实测：热门选题页对某条选题执行【生成视频】→ run 成功 → 点【去发布】，发布页带入的标题是**改写正文的前 100 字**，而不是一个可用标题。第二形态：非 `story2video-compose` 流水线不产出 `story2videoProject`，【去发布】走 run-only 分支只带 `video_path`，**标题为空**。
+
+根因是标题在整条链路上从来不是一个独立生成物，它只是四级静默回退链的末端：
+
+| # | 位置 | 事实 | 后果 |
+| --- | --- | --- | --- |
+| 1 | `apps/desktop/src/features/hot-topics/gen-video-pipelines.js` `buildGenVideoStartParams` | 启动参数不含 `title` | 主进程 `run.params.title` 为空 |
+| 2 | `apps/desktop/src/story2video/s2v-config-snapshot.js` `buildStory2VideoTextConfigFromSnapshot` | `publish.title = config.title \|\| ''`，而 `S2V_CONFIG_DEFAULTS.title = ''` 且热门选题链路从不写该字段 | `publish.title` 为空 |
+| 3 | `apps/desktop/electron/services/story2video-project-service.js:1010` | `project.title = safeText(run.params?.title \|\| publish.title \|\| sourceText, 160)` | 落到 `sourceText`（= 改写全文，上限 100000） |
+| 4 | `apps/desktop/src/features/publish/publish-from-project.js` `buildPublishFromProject` | 取 `project.title`，再 `truncateTitle(rawTitle, 100)` | 标题 = **正文前 100 字** |
+
+##### 3.13.10.2 修复方案
+
+标题改为**由默认文字推理模型按爆款元素独立生成**，与文案改写分离（改写 prompt 不附带标题指令，避免两类任务互相污染——改写引擎 2026-09-18 已因「create 模式注入爆款要素诱导模型把要素名写成小节标题」踩过同类坑）。
+
+**三级降级链**（纯函数 `resolveGenVideoTitle`，单一真源）：
+
+```
+topicText trim 为空            → { title:'',    source:'none'  }  （不注入 query、不调 AI）
+aiAvailable !== true           → { title:topic, source:'topic' }  （不调 AI）
+AI 标题清洗后非空              → { title:ai,    source:'ai'    }
+其余（空/非字符串/仅思维链）   → { title:topic, source:'topic' }
+```
+
+| 触发条件 | title | title_source | title_reason |
+| --- | --- | --- | --- |
+| AI 生成成功 | AI 标题（≤100 字硬限，prompt 约束 30 字） | `ai` | 不带 |
+| 未配置默认文字推理模型（`getDefault('llm')` 空 / 无可用模型 / 无 API Key） | 原始选题文本 | `topic` | `no-model` |
+| LLM 调用失败 / 超时 / 返回空 / 清洗后为空 | 原始选题文本 | `topic` | `failed` |
+| 选题文本为空 | 不注入 title | — | — |
+
+##### 3.13.10.3 时序与交互
+
+标题生成放在**点击【去发布】时**而不是改写时或 run 完成时：
+
+| 候选时点 | 评估 | 结论 |
+| --- | --- | --- |
+| 改写阶段顺手产出 | 与改写混在一次调用，任务混淆，改写输出会被标题指令污染 | ❌ |
+| run completed 时自动生成 | 用户可能只想【查看】，不需要标题；浪费一次 LLM 调用 | ❌ |
+| **点击【去发布】时按需生成** | 用户意图明确；失败只影响标题不影响跳转 | ✅ |
+
+流程：
+
+```
+用户点【去发布】
+  → genVideoBusy = true（按钮禁用，防重复点击）
+  → ① modelProviderGetDefault('llm') 查默认文字推理模型
+  →      不可用 → 跳过 ②，titleSource = 'topic'（reason='no-model'）
+  → ② aiGenerateGenVideoTitle({ topicText, bodyText, max:100 })
+  →      code!==0 / success:false / 抛错 → titleSource = 'topic'（reason='failed'）
+  → ③ resolveGenVideoTitle({ topicText, aiTitle, aiAvailable, max })
+  → ④ 拼 query（有项目：沿用 publishDataToQuery；run-only：只带 video_path），
+  →    再用决策结果覆盖 title 并写 title_source / title_reason
+  → ⑤ resetGenVideoFrontendState() + router.push('/publish', query)
+```
+
+- **busy 守卫**：标题生成期间重复点击不发起第二次 LLM 调用、不发生第二次跳转。
+- **降级不阻断**：任何降级路径都照常跳转，标题降级不影响发布。
+
+##### 3.13.10.4 显示项与提示文字
+
+| 页面 | 元素 | 文案 key | zh |
+| --- | --- | --- | --- |
+| 热门选题·生成视频弹窗（完成态、未点击） | 标题来源说明行 | `hotTopics.genVideoTitleHint` | 点击「去发布」时，标题将由 AI 按爆款元素生成；若未配置文字推理模型或生成失败，将使用原始选题作为标题 |
+| 热门选题·生成视频弹窗（busy） | 生成中提示 | `hotTopics.genVideoTitleGenerating` | 正在生成标题… |
+| 发布页（视频模式，标题输入框下方） | `title_source=ai` | `publishPage.videoTitleFromAi` | 标题由 AI 按爆款元素生成 |
+| 发布页 | `title_source=topic&title_reason=no-model` | `publishPage.videoTitleFromTopicNoModel` | 未配置文字推理模型，标题已使用原始选题 |
+| 发布页 | `title_source=topic&title_reason=failed` | `publishPage.videoTitleFromTopicFailed` | AI 标题生成失败，标题已使用原始选题 |
+
+发布页提示**条件渲染**：无 `title_source` 不渲染；非视频模式忽略；`title_source=topic` 但缺 `title_reason`（异常/手改 query）按失败态提示，不静默。
+
+##### 3.13.10.5 LLM 输出清洗（10 条规则，主进程 `normalizeGeneratedTitle`）
+
+按序执行：① 剥离思维链（`<think>` 闭合块 + 未闭合尾部，`finish_reason=length` 截断形态）；② 剥离 markdown 代码围栏；③ 取首个非空行；④ 清洗控制字符；⑤ 剥「标题：/Title:」前缀标签；⑥ 剥列表编号前缀（`1.` / `1、` / `1)` / `-` / `*`）；⑦ 剥**成对**引号与书名号（单边保留，可能是标题内容）；⑧ 剥尾部标点与空白；⑨ 按 Unicode 码点截断；⑩ 任一步后为空即返回空串（调用方据此降级）。
+
+##### 3.13.10.6 数据校验
+
+| 输入 | 校验 | 失败行为 |
+| --- | --- | --- |
+| `topicText` | trim 后非空；≤ 100000 | `VALIDATION_ERROR`，不浪费 LLM 调用 |
+| `bodyText` | 仅取前 200 字进 prompt；非字符串按 `''` | prompt 摘要段为空，不抛错 |
+| `max` | 默认 100（百家号 `titleMax`）；非有限数/≤0 回退默认 | 用默认值 |
+| LLM 原始输出 | 10 条清洗规则 | 清洗后为空 → `reason:'failed'` |
+
+##### 3.13.10.7 接口契约
+
+**IPC `ai:generate-gen-video-title`**（`electron/ipc-handlers/gen-video-title.js`）：
+
+| 项 | 值 |
+| --- | --- |
+| 参数 | `{ topicText: string, bodyText: string, max?: number }` |
+| 成功 | `{ code: 0, data: { success: true, title: string } }` |
+| 无模型 | `{ code: 0, data: { success: false, reason: 'no-model' } }` |
+| LLM 失败 | `{ code: 0, data: { success: false, reason: 'failed', message: string } }` |
+| 参数非法 | `{ code: EC.VALIDATION_ERROR, message }` |
+| sender 校验 | `withSenderCheck`（拒绝外部网页） |
+| 模型解析 | 主进程 `aiGenerator._modelProviderManager.getDefault('llm')` + `resolveProviderDefaultModel`（用户默认 > 运营默认 > `capability_models.llm` > `models[0]`） |
+| API Key | 只在主进程边界读取，不出渲染层、不落日志（与 `prompt-bridge.resolveLlmBind` 同契约） |
+| 推理模型预算 | `isReasoningLlmModel` 命中时 `max_tokens` 放大到 5000，否则 1600（与 `videogen-stages.callDefaultLlm` 一致） |
+| 渲染层封装 | `aiGenerateGenVideoTitle`（`src/api/publisher.js`）+ preload `aiGenerateGenVideoTitle` |
+
+**路由 query 扩展**（`/publish`）：`title`（encodeURIComponent）、`title_source`（`ai`|`topic`）、`title_reason`（`no-model`|`failed`，仅 `title_source='topic'` 时）。
+
+##### 3.13.10.8 分层决策：prompt 为什么在主进程
+
+渲染层 `apps/desktop/src/` 受 `--cjk` 门禁全量字符串扫描（基线 1374 条），中文 prompt 指令放在渲染层会撞门禁；且全仓渲染层此前**没有任何 LLM prompt 构造先例**（都在 `electron/services/*-stages.js`）。因此：
+
+- **主进程**：`buildGenVideoTitlePrompt`（prompt 构造）+ `normalizeGeneratedTitle`（输出清洗）+ `resolveDefaultLlm`（模型解析）+ LLM 调用；
+- **渲染层**：只保留 `resolveGenVideoTitle`（降级链决策纯函数）+ 状态编排。
+
+##### 3.13.10.9 测试锚点
+
+| 文件 | 用例 |
+| --- | --- |
+| `apps/desktop/src/features/publish/gen-video-title.test.js` | 15 例：降级链六格、空/纯空白 AI 标题、非字符串 AI 标题、超长截断（选题与 AI 标题双向）、max 非法回退、`aiAvailable` 非 `true` 保守降级、emoji 码点截断、无参调用 |
+| `apps/desktop/electron/ipc-handlers/gen-video-title.test.js` | 31 例：正常返回、无默认 LLM、无可用模型、LLM 抛错、空 content、参数非对象、空 topicText、max 非法、推理/普通模型预算、sender 校验、输出清洗、prompt 构造（含爆款元素要求与摘要截断） |
+| `apps/desktop/src/views/HotTopics.test.js` | 8 例新增：AI 成功、无模型（不调 AI）、`modelProviderGetDefault` 抛错、LLM 返回空、LLM 抛错仍跳转、run-only 带标题、标题取自原始选题、重复点击幂等、完成态提示行 |
+| `apps/desktop/src/views/Publish.test.js` | 6 例新增：三态来源提示、无 `title_source` 不渲染、图文模式不渲染、缺 `title_reason` 按失败态 |
+
+##### 3.13.10.10 逃逸分析（QM-5）
+
+| 层级 | 修复前现状 | 为什么没拦住 |
+| --- | --- | --- |
+| 单元测试 | `publish-from-project.test.js` 覆盖「publish.title → project.title → sourceText」回退链 | 夹具让 `project.title` 与 `sourceText` **取同值且都只有 38 字**，「title 回退到 sourceText」这条生产缺陷路径在测试中表现为「正确行为」 |
+| 组件测试 | `HotTopics.test.js`【去发布】断言 `title === '发布标题'` | 夹具直接给定 `story2videoTextConfig.config.publish.title = '发布标题'`，而真实链路该字段恒为空串 |
+| 代码审查 | `hot-topics-pipeline-picker` 评审记录了「run-only 发布只能交接成片路径」 | 把「不伪造标题」当成合规终态，**没有继续问「那标题应该是什么」**——规则写的是「不得注入空标题」，没人验证「注入的标题从哪来」 |
+
+**系统性漏洞**：`buildPublishFromProject` 的回退链在**测试夹具层被自证**——夹具把前几级回退填满，使「前几级全空」的生产形态从未被断言。同类风险：任何「多级回退 + 夹具填满前几级」的纯函数，都需要至少一例**前几级全部为空**的生产形态夹具。本期 `mountCompletedRun` 夹具显式把 `publish.title` 置为空串（对齐真实链路）。
+
+##### 3.13.10.11 兼容性
+
+- 不改 `buildPublishFromProject` 的通用回退链（历史记录/结果页/播客三条入口的标题语义不变）。
+- 不改主进程 `story2videoProject.title` 落库（历史卡片标题回退链不变）。
+- 新增 query 字段为可选；旧链接（不含 `title_source`）行为完全不变。
+- 发布页来源提示为条件渲染，无 `title_source` 时 DOM 不变（视觉基线路径不受影响）。
+
 
 ## 4. 数据校验
 
@@ -350,24 +608,28 @@ onUnmounted → clearInterval
 ### 5.6 一键生成视频流程
 
 ```
-用户点击某选题的【生成视频】
-  → busy 守卫（进行中则忽略）→ 初始化 8 阶段弹窗（全部 pending）
+用户点击某选题的【生成视频】（默认流水线）
+  → 或点击下箭头 → 选择层 → 点击某条可执行流水线（pipelineName，§3.13）
+  → busy 守卫（进行中则忽略）→ 初始化弹窗阶段（rewrite_copy + 所选流水线真实阶段，全部 pending）
   → 阶段 rewrite_copy: running
   → aiRewrite(mode=create, content=引导语+topic)
     ├─ 成功 → 产物存草稿（失败不阻断）→ rewrite_copy: completed
     │   → 读取 story2video.lastOptions.v1（缺失回退默认）
-    │   → buildStory2VideoTextConfigFromSnapshot(text, snapshot)
-    │   → pipelineStartOrchestrated('story2video-compose', params)
-    │     ├─ 成功 → runId 记录 → split: running → 开启双通道跟踪
+    │   → buildGenVideoStartParams({ pipelineName, text, snapshot })（§3.13.6）
+    │     ├─ pipelineName=story2video-compose → 附带 story2videoTextConfig（完整配置）
+    │     ├─ pipelineName=文本驱动自动流水线 → text + 输出参数（resolution/fps/format/aspectRatio…）
+    │     └─ 其它（不可执行）→ 拒绝启动（process 内二次校验，正常 UI 路径不可达）
+    │   → pipelineStartOrchestrated(pipelineName, params)
+    │     ├─ 成功 → runId 记录 → 所选流水线第一个阶段: running → 开启双通道跟踪
     │     │   → onPipelineUpdate 推送 / 3s 轮询 getRunContext
     │     │     ├─ 阶段推进 → mergeGenStages 更新弹窗各阶段状态/子进度
-    │     │     ├─ completed + videoPath → 弹窗关闭 → 跳 /create/result?path=...
+    │     │     ├─ completed + videoPath（publish/compose/export/render/report）→ 弹窗保留完成态
     │     │     ├─ failed/cancelled → 终态处理，弹窗提供重试/关闭
     │     │     ├─ 用户点【后台运行】按钮 / 关闭弹窗 → 后台脱离 + 全局居中提示，run 继续执行
-    │     │     │   → 前端态复位（busy 释放、runId/stages 清空）→ 可立即对其它选题发起并行任务
+    │     │     │   → 前端态复位（busy 释放、runId/stages/pipelineName 清空）→ 可立即发起并行任务
     │     │     │   → 并行上限由主进程并发门禁判定（超限 → 启动失败 + 【重试】）
     │     │     └─ 改写/启动阶段点关闭（×）→ 中止前端编排，不启动流水线、无后台任务
-    │     └─ 失败 → split: failed → 弹窗错误提示 + 重试（跳过改写）
+    │     └─ 失败 → 所选流水线第一个阶段: failed → 弹窗错误提示 + 重试（跳过改写）
     └─ 失败 → rewrite_copy: failed → 弹窗错误提示 + 重试（从改写开始）
 ```
 
@@ -681,6 +943,17 @@ fetchTopics({ force })
 - 解锁判据：`genVideoResultReady = genVideoPhase === 'completed' && genVideoCompletedVideoPath.trim() 非空`；成片缺失时置 failed 并保持灰显。
 - 新编排（`startGenerateVideo`）与重试（`retryGenVideo`）必须清零 `genVideoCompletedVideoPath/ProjectId/Project`，避免新 run 未完成时误解锁。
 
+**流水线选择器（2026-10-17 新增，完整规格见 §3.13）**：
+
+- 位于每条选题行【生成视频】按钮右侧的下箭头按钮，打开行内下拉面板；收藏 tab 行复用同一组件。
+- 面板数据来自 `pipelineList()`（首开懒加载、组件内缓存）；全量列出，可执行项在前、禁用项在后并附原因；默认项 `story2video-compose` 带「默认」徽标。
+- 点击可执行流水线 = 关闭面板 + `startGenerateVideo(topic, pipelineName)`；主按钮仍走默认流水线。
+- 弹窗内容区顶部显示「流水线：{名称}」；阶段集合与总进度按所选流水线动态计算（不再是固定 8 阶段）。
+- busy 期间：所有行主按钮 + 下箭头同时禁用，已打开面板被关闭。
+- 加载失败：面板展示错误 +【重试】+ 回退项「故事讲述（默认）」，主按钮不受影响。
+- 交互细节：外点关闭、Esc 关闭并回焦、↑/↓/Home/End 在可执行项间移动、同一时刻只允许一个面板打开。
+
+
 **【后台运行】按钮交互逻辑**：
 
 1. 显示条件：genVideoCanBackground = genVideoPhase === 'running' 且持有 runId——只有主进程 run 确实存在且正在执行时才提供脱离入口（spec 前端规则 2：可逆操作方法内重校验状态，不依赖模板条件）；
@@ -845,7 +1118,22 @@ fetchTopics({ force })
 | hotTopics.hotValue | 热度 | Heat |
 | hotTopics.generateVideo | 生成视频 | Generate video |
 | hotTopics.genVideoTitle | 一键生成视频 · {topic} | One-click video · {topic} |
-| hotTopics.genVideoStartToast | 已开始生成视频，改写文案后将自动启动故事讲述流水线 | Video generation started. The storytelling pipeline will start after copy rewriting |
+| hotTopics.genVideoStartToast | 已开始生成视频，改写文案后将自动启动所选流水线（2026-10-17 通用化，原「故事讲述流水线」） | Video generation started. The selected pipeline will start after copy rewriting |
+| hotTopics.genVideoPipelinePickerAria | 选择视频创作流水线（2026-10-17 新增） | Choose a video creation pipeline |
+| hotTopics.genVideoPipelinePickTitle | 选择视频创作流水线 | Choose a video creation pipeline |
+| hotTopics.genVideoPipelineLoading | 正在加载流水线… | Loading pipelines… |
+| hotTopics.genVideoPipelineLoadFailed | 流水线列表加载失败 | Failed to load pipelines |
+| hotTopics.genVideoPipelineRetry | 重试 | Retry |
+| hotTopics.genVideoPipelineEmpty | 暂无可用的视频创作流水线 | No video creation pipelines available |
+| hotTopics.genVideoPipelineDefaultBadge | 默认 | Default |
+| hotTopics.genVideoPipelineHint | 点击一条流水线即可用该流水线开始生成视频 | Click a pipeline to start generating with it |
+| hotTopics.genVideoPipelineLabel | 流水线：{pipeline} | Pipeline: {pipeline} |
+| hotTopics.genVideoPipelineNeedsMedia | 需先导入视频/音频素材 | Requires video/audio input |
+| hotTopics.genVideoPipelineDedicated | 需在专属页面使用 | Use its dedicated page |
+| hotTopics.genVideoPipelineInternal | 内部调试流水线 | Internal diagnostic pipeline |
+| hotTopics.genVideoPipelineUnavailable | 尚未实现执行引擎 | Execution engine not available yet |
+| hotTopics.genVideoPipelineUnsupported | 暂不支持从选题直接生成 | Not supported from a topic yet |
+| hotTopics.genVideoDefaultPipelineHint | 使用默认流水线（故事讲述）生成；点右侧箭头可选择其它流水线 | Generate with the default pipeline (Story Telling); click the arrow to choose another pipeline |
 | hotTopics.genVideoRewriteFailed | 文案改写失败，请点击重试 | Copy rewrite failed, please retry |
 | hotTopics.genVideoPipelineFailed | 视频流水线启动失败，请点击重试 | Failed to start the video pipeline, please retry |
 | hotTopics.genVideoCancelled | 已取消生成视频 | Video generation cancelled |
@@ -923,6 +1211,12 @@ fetchTopics({ force })
 15. **保留态可自愈**（2026-09-14 新增）：保留态下缓存 `fetchedAt` 未被刷新，因此下一次非 force 刷新（含 30 分钟定时刷新）必定重新发起网络请求；网络恢复后自动覆盖为最新选题，无需用户手动干预。
 16. **保留态字段契约**（2026-09-14 新增）：`hot-topics:fetch` 返回的 `data.preservedStaleCache === true`、`data.topics` 非空、`data.fetchedAt` 等于保留的旧时间（早于当前时间）、`data.channelStats` 逐渠道四字段齐全；上一批为空时上述标记**不得**出现。
 17. **缓存内容不因失败被改写**（2026-09-14 新增）：全渠道失败后读取 `hot_topics_cache`（SQLite settings）应仍为保留内容（`topics` 非空 + `preservedStaleCache: true`），重启应用后依然可读。
+18. **下箭头入口**（2026-10-17 新增）：每条热门选题行与每条收藏行在【生成视频】按钮右侧都有一个下箭头按钮（`hot-topic-gen-video-picker-{id}` / `hot-topic-favorite-gen-video-picker-{key}`），带 `aria-haspopup="menu"` 与动态 `aria-expanded`；busy 时与主按钮一起禁用。
+19. **全量列出**（2026-10-17 新增）：打开下拉后，`pipelineList` 返回的**全部**流水线都被列出；可执行项在前（story2video-compose 带「默认」徽标），媒体型/专属/内部/未实现/未知项在后且 disabled + 原因文案。
+20. **选择即启动**（2026-10-17 新增）：点击 `animated-explainer` 后面板关闭，改写完成后 `pipelineStartOrchestrated('animated-explainer', params)`，`params.text` 为改写产物并含 `inputMode/text/checkpointPolicy/autoAdvance/background/uiLocale/resolution/aspectRatio/fps/format`；弹窗阶段为 `rewrite_copy + research…publish`（9 个）且显示「流水线：AI 讲解」类标识；点击主按钮仍启动 `story2video-compose`。
+21. **非 S2V 成片出口**（2026-10-17 新增）：非故事讲述流水线完成且成片位于 `context.render.videoPath` 时，弹窗进入 completed、【查看】【去发布】解锁；【去发布】只带 `type=video` + `video_path`（无 `story2videoProject` 时不注入空标题正文）。
+22. **加载失败韧性**（2026-10-17 新增）：`pipelineList` 失败时面板显示错误 +【重试】+「故事讲述（默认）」回退项；回退项可正常启动；主【生成视频】按钮不受影响。
+23. **交互与可访问性**（2026-10-17 新增）：点击面板外/再次点击下箭头/Esc 关闭；Esc 后焦点回到下箭头；↑/↓/Home/End 在可执行项间移动且跳过禁用项；同一时刻至多一个面板打开；禁用项点击不产生任何启动副作用。
 
 ## 9. 测试覆盖
 
@@ -931,7 +1225,13 @@ fetchTopics({ force })
 | 测试文件 | 覆盖 |
 |---------|------|
 | `hot-topics-service.test.js` | 渠道解析（7 渠道各一 fixture）、分类映射（原生+规则+综合兜底）、去重、缓存读写 fail-closed、限流/熔断调用断言、SSRF 拒绝。**缓存保留回归 4 例（2026-09-14 新增）**：①全渠道失败 → 保留旧 `topics` 与旧 `fetchedAt`、落盘为保留值、`preservedStaleCache: true`、失败原因仍如实上报（`channelStats.zhihu.ok === false`）；②缓存本就为空 → 仍写空结果且无 `preservedStaleCache` 标记；③部分渠道成功 → 正常覆盖且无保留标记；④全渠道被限流/熔断跳过（`skipped: true`）→ 同样保留旧缓存 |
-| `HotTopics.test.js` | 渲染（菜单/标题/空态）、勾选与批量按钮态、筛选过滤、刷新交互（mock IPC）、一键发布进度流（mock aiRewrite）、一键生成视频全流程（改写/启动/进度/完成/取消/后台运行按钮与脱离语义，2026-09-13 补充）。**并发回归 4 例**（2026-09-13 修正）：①运行中关闭 → 后台脱离并复位前端态（busy 释放、runId 清空、不取消 run）；②改写阶段关闭 → 中止前端编排（不启动流水线）；③弹窗在途 busy 守卫仍拦截第二次编排；④【后台运行】脱离后另一选题可立即启动并行流水线（按钮可用 + 第二次 pipelineStartOrchestrated 使用第二条选题的改写产物 + runId 切换） |
+| `HotTopics.test.js` | 渲染（菜单/标题/空态）、勾选与批量按钮态、筛选过滤、刷新交互（mock IPC）、一键发布进度流（mock aiRewrite）、一键生成视频全流程（改写/启动/进度/完成/取消/后台运行按钮与脱离语义，2026-09-13 补充）。**并发回归 4 例**（2026-09-13 修正）：①运行中关闭 → 后台脱离并复位前端态（busy 释放、runId 清空、不取消 run）；②改写阶段关闭 → 中止前端编排（不启动流水线）；③弹窗在途 busy 守卫仍拦截第二次编排；④【后台运行】脱离后另一选题可立即启动并行流水线（按钮可用 + 第二次 pipelineStartOrchestrated 使用第二条选题的改写产物 + runId 切换）。**流水线选择器回归 7 例（2026-10-17 新增）**：①每行下箭头 + 全量流水线/禁用原因；②选择 animated-explainer → 该流水线启动 + 9 阶段 + 弹窗流水线标识；③主按钮仍默认 S2V + 8 阶段；④禁用项点击无副作用；⑤清单失败回退项可启动且主按钮不受影响；⑥非 S2V 完成后从 context.render 提取成片并只带 video_path 去发布；⑦收藏行选择动画流水线并以该流水线启动 |
+| `HotTopicsGenVideoPicker.test.js` | 选择器组件 13 例（2026-10-17 新增）：按钮组与 aria、收藏 testid、busy 禁用、首开懒加载/缓存、全量列出 + 禁用原因 + 默认徽标、选中 emit、禁用项不 emit、加载失败回退 + 重试、空清单、外点/Esc 关闭与焦点回焦、↑↓/Home/End 键盘导航、跨行单面板、页面滚动关闭 |
+| `gen-video-pipelines.test.js` | 流水线目录纯函数 11 例（2026-10-17 新增）：运行模式分类、可执行判定（含 available=false）、禁用原因 key、阶段名、清单归一化/去重/排序、启动参数两分支（S2V 完整配置 vs 文本驱动自动流水线；非法输入返回 null） |
+| `gen-video-stage-tracking.test.js` | 阶段跟踪纯函数 6 例（2026-10-17 新增）：动态阶段创建与回退、首个非改写阶段 running/failed、重试复位、完成归一、终态归并、取消、null 安全 |
+| `gen-video-view-model.test.js` | 展示派生纯函数 6 例（2026-10-17 新增）：标题截断、流水线标识、改写摘要、终态/重试/取消/后台/结果解锁判据、动态总阶段进度公式 |
+| `gen-video-picker-state.test.js` | 选择器状态纯函数 6 例（2026-10-17 新增）：跨实例 uid 递增、面板展开方向（下方足/不足/两侧都不足）、可用高度夹取（160–320px）、几何缺失回退 |
+| `run-context-video-path.test.js` | 成片提取共享纯函数 5 例（2026-10-17 新增）：publish 优先、compose/export/render/report、`{data}` 包裹、无效 context 返回 null |
 | `pipeline-background-toast.test.js` | 全局居中提示状态机：show 立即可见、4s 自动消失、重复触发重置计时、hide 立即清除定时器 |
 | `PipelineBackgroundToast.test.js` | 全局居中提示组件渲染：zh/en 文案、隐藏后 DOM 移除、key 未命中回退空串不泄漏 |
 | `RewriteView.test.js`（补充） | query.topic 填充、模式切换 create、自动 startRewrite、<20 字补引导语 |
@@ -939,6 +1239,7 @@ fetchTopics({ force })
 ### 9.2 视觉回归
 
 - `all-views.visual.test.js` 注册 `hot-topics` 视图（需 dev server + mock 数据，随实现落地）。
+- **2026-10-17 盲区登记（hot-topics-pipeline-picker）**：CI 像素门禁的执行清单 `run-pixel-tests.js` 的 `pixelTests` **不包含 `hot-topics`**（该页在 CI 取不到外部热搜，基线不稳定，见 `test-runner.js` 继承浮层注释）。因此本次新增的下拉面板**不在像素门禁覆盖范围内**，其正确性由 `HotTopicsGenVideoPicker.test.js` + `HotTopics.test.js` 的组件/集成锁保证（含按钮顺序、testid、禁用态、aria、菜单项文本、点击副作用）；视觉样式人工截图取证并记录在执行记录中。**不得**把「像素门禁绿」当作本改动的视觉证据；后续若要把 hot-topics 纳入像素套件，需先补 IPC mock + 稳定基线，属独立变更。
 
 ### 9.3 契约测试
 
@@ -1061,6 +1362,13 @@ npx vitest run tests/hot-video-publish-plan.test.js
 
 - `HotTopics.vue`：列表 + 筛选 + 批量操作 + 进度 UI；IPC 调用经 `api/hot-topics.js`（invokeWithFallback）。
 - `RewriteView.vue`：新增 query.topic 消费逻辑（约 15 行）。
+- **流水线选择器（2026-10-17 新增）**：
+  - `components/HotTopicsGenVideoPicker.vue`：行内「生成视频 + 下箭头」按钮组与下拉面板（热门/收藏共用；自建菜单，不新增 Element Plus 组件注册）；
+  - `features/hot-topics/gen-video-pipelines.js`：流水线分类/排序/标签/启动参数/阶段名（纯函数）；
+  - `features/hot-topics/gen-video-stage-tracking.js`：弹窗阶段创建/标记/终态归并（纯函数）；
+  - `features/hot-topics/gen-video-view-model.js`：标题/流水线标识/按钮可用性/进度公式（纯函数）；
+  - `features/hot-topics/gen-video-picker-state.js`：跨实例「同一时刻一个面板」单例指针；
+  - `features/pipeline/run-context-video-path.js`：run context → 成片路径（与视频创作页共享）。
 
 ### 10.5 渠道清单与间隔配置
 
@@ -1174,4 +1482,19 @@ this._writeCache(newCache)
 **为什么不合并新旧批次**：`id = channel + ':' + rank` 在新旧批次之间含义会漂移（同一 `zhihu:1` 在不同时间指向不同话题），合并会产出语义混乱的列表；同时 UI 的 `:key="topic.id"` 复用与勾选 `Set<id>` 也会错乱。因此只在「本轮零结果」时整体保留，不做逐条 merge。
 
 **改动边界**：**零渲染层改动、零新增 i18n key、零 IPC 契约变更**（`hot-topics:fetch` 返回结构只在零结果且保留时多一个可选字段 `preservedStaleCache`）。`HotTopics.vue` 的 `refresh()` 已按 `res.data.topics` 渲染，保留态返回的即上一次的选题数组，可直接渲染；顶部告警条依据 `channelStats` 计算，无需改动。
+
+### 10.9 流水线选择器实现要点（2026-10-17 新增，对应 §3.13）
+
+**为什么自建菜单而不是 `el-dropdown`/`el-popover`**：本仓 Element Plus 按需注册有机械锁（`plugins/element-plus.js` 组件/样式清单 + `element-plus.test.js`），新增一个全局下拉组件会带来注册表与样式闭包变更；行内场景只需要一个绝对定位的按钮列表。自建 DOM 只有约 70 行模板 + 120 行交互/样式，且天然支持 `disabled`/焦点/回车。
+
+**跨实例单面板**：`<script setup>` 顶层声明的 `ref` 是**每实例一份**的，用它做「只开一个面板」会失效（实测两行可同时打开）。因此把指针放到模块文件 `features/hot-topics/gen-video-picker-state.js`（模块作用域的 `ref` + 自增 uid），组件只读 `activePickerUid === uid`。
+
+**为什么把阶段/标签/进度拆成三个纯函数模块**：`useHotTopicsGenVideo.js` 改造后一度到 559 行，触发 `check-max-lines` 的 `NEW_OVER_LIMIT`。拆分后：阶段操作 → `gen-video-stage-tracking.js`（6 例）、展示派生 → `gen-video-view-model.js`（6 例）、流水线目录/启动参数 → `gen-video-pipelines.js`（11 例）。composable 回落到 494 行，且新增逻辑全部可脱离 Vue 单测。
+
+**成片提取共享**：`extractRunContextVideoPath` 是 `CreateView.extractOrchestrationVideoPath` 的原样搬出（publish → compose → export → render → report，兼容 `{data}` 包裹）；`CreateView` 改为一行委托，既有 296 条用例仍全绿。这样非 S2V 流水线（终态在 `render`）才能被【查看】【去发布】识别。
+
+**失败语义**：`buildGenVideoStartParams` 对不可执行流水线/空文本返回 `null`（纯函数 fail-closed）；`runGenVideoPipelineStart` 在调用 IPC 前再判 `isPipelineRunnableFromTopic`；`startGenerateVideo` 入口再判一次。三层防线保证「UI 被绕过」时也不会以媒体型流水线启动必然失败的 run。
+
+**与既有 PRD 的关系**：§3.10 的默认路径、§6.6 的四按钮与完成出口、§6.7 的并发/复位规格**均不变**；本节的改动只扩展「用哪条流水线」这一维，动态阶段数与流水线标识是新增显示项，`genVideoStartToast` 文案改为通用表述（原「故事讲述」）。
+
 

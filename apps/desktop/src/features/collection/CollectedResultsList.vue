@@ -5,7 +5,7 @@
       <label class="col-check-label">
         <input type="checkbox" :checked="allSelected" @change="$emit('toggleSelectAll', $event.target.checked)" data-testid="batch-select-all" />{{ $t('collection.zhihuFavlist.selectAll') }}
       </label>
-      <button class="cohere-btn-secondary col-btn-clear" @click="$emit('clear')">{{ $t('collection.clearResults') }}</button>
+      <button class="col-btn col-btn--secondary col-btn-clear" @click="$emit('clear')">{{ $t('collection.clearResults') }}</button>
     </div>
 
     <!-- 空态（Q10-e：旧行为为整块不渲染，现补统一空态引导） -->
@@ -38,9 +38,9 @@
           </label>
         </template>
         <span class="zb-flex1"></span>
-        <button class="cohere-btn-primary" :disabled="batchPublishing" @click="$emit('batchPublishImages')" data-testid="batch-publish-images">{{ $t('collection.batch.publishImages') }}</button>
-        <button class="cohere-btn-primary" :disabled="batchPublishing" @click="$emit('batchGenerateVideos')" data-testid="batch-generate-videos">{{ $t('collection.batch.generateVideos') }}</button>
-        <button class="cohere-btn-primary" :disabled="batchPublishing || !batchVideoPoolCount" @click="$emit('batchPublishVideos')" data-testid="batch-publish-videos">
+        <button class="col-btn col-btn--primary" :disabled="batchPublishing" @click="$emit('batchPublishImages')" data-testid="batch-publish-images">{{ $t('collection.batch.publishImages') }}</button>
+        <button class="col-btn col-btn--primary" :disabled="batchPublishing" @click="$emit('batchGenerateVideos')" data-testid="batch-generate-videos">{{ $t('collection.batch.generateVideos') }}</button>
+        <button class="col-btn col-btn--primary" :disabled="batchPublishing || !batchVideoPoolCount" @click="$emit('batchPublishVideos')" data-testid="batch-publish-videos">
           {{ $t('collection.batch.publishVideos') }}{{ batchVideoPoolCount ? `（${batchVideoPoolCount}）` : '' }}
         </button>
       </div>
@@ -73,8 +73,14 @@
               :data-testid="'batch-item-check-' + item.id"
               @change="$emit('toggleSelect', item)"
             />
-            <div class="card-icon"><el-icon><component :is="item.mediaType === 'video' ? VideoCamera : Document" /></el-icon></div>
-            <div class="card-info">
+            <!-- 卡片主体可点（2026-10-17，change: collected-results-fix）：
+                 用户实测「点结果内容有链接光标但没反应」。修法：整个信息区绑定 select
+                 （与「查看」按钮同语义——选中该条并展示详情），并加 pointer 光标，
+                 让「看着像链接」的区域真的可点。card-info 当前无交互子元素，故直接 @click；
+                 若将来往里面加按钮，须同步改为 @click.self 或在子元素上 stopPropagation
+                 （QM-6 评审 #5：注释曾承诺 .self 而代码未加，两处必须一致）。 -->
+            <div class="card-icon card-icon--click" :data-testid="'card-icon-' + item.id" @click="$emit('select', item)"><el-icon><component :is="item.mediaType === 'video' ? VideoCamera : Document" /></el-icon></div>
+            <div class="card-info card-info--click" :data-testid="'card-info-' + item.id" @click="$emit('select', item)">
               <!-- 一级：标题 + 元信息（Q10-c 层级重排） -->
               <div class="card-platform">{{ item.title || $t('collection.recordsUntitled') }}</div>
               <div class="card-account">
@@ -83,17 +89,19 @@
                 <template v-if="item.mediaType === 'video' && item.platform && platformKeys.includes(item.platform)"> · {{ platformLabel(item.platform) }}</template>
               </div>
               <!-- 二级：徽标区 -->
-              <div v-if="item.rewriteFailed" class="card-badge card-badge--warning">{{ $t('collection.zhihuFav.rewriteFailedBadge') }}</div>
+              <div v-if="item.rewriteFailed" class="card-badge card-badge--warning" :title="item.rewriteError || ''" :data-testid="'badge-rewrite-failed-' + item.id">{{ $t('collection.zhihuFav.rewriteFailedBadge') }}<template v-if="item.rewriteError">：{{ item.rewriteError }}</template></div>
               <div v-else-if="item.rewrittenContent" class="card-badge" :title="item.rewrittenContent">{{ $t('collection.zhihuFav.rewrittenBadge') }}：{{ item.rewrittenContent.slice(0, 40) }}</div>
               <div v-if="item.imageFallbacks && item.imageFallbacks.length" class="card-badge">{{ $t('collection.zhihuFav.imageFallbackBadge', { count: String(item.imageFallbacks.length) }) }}</div>
             </div>
           </div>
-          <!-- 三级：操作主次分级（创建草稿/发布 primary；查看/视频创作 secondary） -->
-          <div class="card-actions">
-            <button class="is-primary" :data-testid="'result-draft-' + item.id" @click="$emit('createDraft', item)">{{ $t('collection.recordsCreateDraft') }}</button>
-            <button class="is-primary" :data-testid="'result-publish-' + item.id" @click="$emit('publish', item)">{{ $t('collection.recordsPublish') }}</button>
-            <button :data-testid="'result-view-' + item.id" @click="$emit('select', item)">{{ $t('collection.recordsEdit') }}</button>
-            <button :data-testid="'result-video-' + item.id" @click="$emit('toVideo', item)">{{ $t('collection.recordsToVideo') }}</button>
+          <!-- 三级：操作主次分级（创建草稿/发布 primary；查看/视频创作 secondary）
+               2026-10-17 collection-page-ui-ue-refine：原 is-primary 是全仓零样式定义的
+               死类（分级在视觉上不成立），统一改 col-btn--primary；规范层持有真实声明。 -->
+          <div class="col-card-actions">
+            <button class="col-btn col-btn--primary" :data-testid="'result-draft-' + item.id" @click="$emit('createDraft', item)">{{ $t('collection.recordsCreateDraft') }}</button>
+            <button class="col-btn col-btn--primary" :data-testid="'result-publish-' + item.id" @click="$emit('publish', item)">{{ $t('collection.recordsPublish') }}</button>
+            <button class="col-btn col-btn--secondary" :data-testid="'result-view-' + item.id" @click="$emit('select', item)">{{ $t('collection.recordsEdit') }}</button>
+            <button class="col-btn col-btn--secondary" :data-testid="'result-video-' + item.id" @click="$emit('toVideo', item)">{{ $t('collection.recordsToVideo') }}</button>
           </div>
         </div>
       </div>
@@ -155,14 +163,25 @@ defineExpose({ platformScope, videoPlatformScope })
 </script>
 
 <style scoped>
-.batch-bar { display: flex; gap: var(--space-sm); align-items: center; flex-wrap: wrap; margin: 8px 0; padding: 10px 12px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-bg-card); }
-.batch-bar--video { margin: 0 0 8px; padding: 8px 12px; border-style: dashed; }
+/* 采集页控件规范层（collection-page-ui-ue-refine）：按钮三档/输入控件一档/
+   徽标一档/间距阶梯统一在那里持有；本文件只留结果列表特有项。 */
+@import './collection-page.css';
+
+/* 卡片主体可点（2026-10-17，change: collected-results-fix）：
+   用户实测「点结果内容有链接光标但没反应」。此前 card-info 无点击绑定，
+   但继承了链接形态的光标样式（全局 a/.card-* 类），形成"假可点"。
+   现在 card-info / card-icon 绑定 select 并显式给 pointer 光标 —— 看着能点就真能点。 */
+.card-info--click { cursor: pointer; }
+.card-icon--click { cursor: pointer; display: flex; align-items: center; }
+.card-info--click:hover .card-platform { color: var(--color-primary); }
+.batch-bar { display: flex; gap: var(--spacing-2); align-items: center; flex-wrap: wrap; margin: var(--spacing-2) 0; padding: var(--spacing-2) var(--spacing-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-bg-card); }
+.batch-bar--video { margin: 0 0 var(--spacing-2); padding: var(--spacing-2) var(--spacing-3); border-style: dashed; }
 .batch-bar-count { font-size: var(--font-size-sm); }
-.batch-pool-note { margin: 4px 0; }
-.card-check { margin-right: 6px; }
-.card-badge { font-size: var(--font-size-xs); color: var(--color-text-secondary); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-pool-note { margin: var(--spacing-1) 0; }
+.card-check { margin-right: var(--spacing-2); }
+.card-badge { font-size: var(--font-size-xs); color: var(--color-text-secondary); margin-top: var(--spacing-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-badge--warning { color: var(--color-warning); }
-.zb-select { border: 1px solid var(--color-border); border-radius: var(--r-xs, 6px); padding: 6px 8px; font-size: var(--font-size-xs); }
-.zb-check { display: flex; align-items: center; gap: 3px; font-size: var(--font-size-xs); }
+.zb-select { height: var(--col-field-h-sm); padding: 0 var(--spacing-2); border: 1px solid var(--color-border); border-radius: var(--radius-xs); background: var(--color-bg-card); color: var(--color-text-primary); font-family: inherit; font-size: var(--font-size-xs); }
+.zb-check { display: flex; align-items: center; gap: var(--spacing-1); font-size: var(--font-size-xs); }
 .zb-flex1 { flex: 1; }
 </style>

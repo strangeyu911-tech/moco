@@ -12,30 +12,129 @@
 #   sh scripts/plan-review.sh <方案文件>       # 对方案跑对抗评审
 #   sh scripts/plan-review.sh <方案文件> --dry-run
 #   sh scripts/plan-review.sh <方案文件> --force   # 忽略 mode=skip，强制跑
+#   sh scripts/plan-review.sh <方案文件> --critic codex    # 临时换评审主力后端
+#   sh scripts/plan-review.sh <方案文件> --proposer gemini # 临时换出方案后端
+#   优先级：旗标 > MP_QM6_CRITIC/MP_QM6_PROPOSER > scripts/ccg-review-backends.list
+#   ⚠ 决策层（本脚本，objectType=plan）这条路径**确实应用**覆盖参数；
+#     验证层（deep-review.sh 评审 diff）那条路径驱动当前不应用，见其文件头说明。
 #
 # 退出码：0 收敛可动手 / 1 有阻断或已升级给人 / 2 环境问题
 
 set -u
 
-ROOT="$(cd "$(dirname -- "$0")/.." && pwd)"
+# 与 deep-review.sh 同一形态：不依赖 dirname（git 钩子/贫瘠 PATH 下会丢工具目录），
+# 且必须认 Windows 绝对路径 —— 只匹配 `*/` 的话，调用方传 `D:\...\plan-review.sh`
+# 会落到 `_self_dir="."`，ROOT 变成**仓库的父目录**，之后每一处仓库相对读都错位。
+# 旧版靠 dirname 也是同一结果（无 `/` 时返回 "."），只是从前脚本里没有仓库相对读，
+# 于是错位的 cwd 被 `[ -f ... ]` 挡成「不存在」，看起来一切正常。
+_self_dir="$0"
+case "$_self_dir" in
+  */*) _self_dir="${_self_dir%/*}" ;;
+  *\\*) _self_dir="${_self_dir%\\*}" ;;
+  *)   _self_dir="." ;;
+esac
+ROOT="$(cd "$_self_dir/.." && pwd)"
+_self_dir_abs="$(cd "$_self_dir" 2>/dev/null && pwd)" || _self_dir_abs="$_self_dir"
 cd "$ROOT" || exit 2
+
+# say() 必须定义在参数解析之前：参数错误分支要用它出声（deep-review.sh 同一形态，
+# 那里实测漏过一次 —— `--critic` 缺值时报的是 "say: command not found"）。
+say() { printf '%s\n' "$1"; }
+
+# 后端对的 shell 侧读取方（单一实现，与 deep-review.sh 共用同一份）。
+# 两个入口不得各抄一份名单 —— 那正是 2026-10-18「六份字面量互不认账」的病灶。
+# 找不到就当场 fail-closed（与 deep-review.sh 同形）：后续那些
+# "resolve_review_backends: command not found" 会把真因（没 source 上）伪装成功能故障。
+[ -f "$_self_dir_abs/lib/ccg-backends.sh" ] || {
+  say "✗ 找不到评审后端读取方：$_self_dir_abs/lib/ccg-backends.sh"
+  say "  入口必须由仓库内路径调用（sh scripts/plan-review.sh），不得经符号链接复制出去跑。"
+  exit 2
+}
+. "$_self_dir_abs/lib/ccg-backends.sh"
 
 PROPOSAL=""
 FORCE=0
 DRY=0
-for a in "$@"; do
-  case "$a" in
+CRITIC_ARG=""
+PROPOSER_ARG=""
+# 改成 while+shift：原来的 `for a in "$@"` 只认无值旗标，带值旗标会把它的值
+# 当成一个陌生参数**静默丢掉** —— 那是「传了等于没传」的直接成因。
+while [ $# -gt 0 ]; do
+  case "$1" in
     --force) FORCE=1 ;;
     --dry-run) DRY=1 ;;
+    --critic|--proposer)
+      _v="${2:-}"
+      case "$_v" in
+        ""|-*)
+          say "✗ 旗标 $1 缺值（必须紧跟一个后端名，例如 --critic codex）"
+          exit 2 ;;
+      esac
+      if [ "$1" = "--critic" ]; then CRITIC_ARG="$_v"; else PROPOSER_ARG="$_v"; fi
+      shift ;;
     --help|-h)
-      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,/^set -u/{/^set -u/!p}' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
-    -*) ;;
-    *) [ -z "$PROPOSAL" ] && PROPOSAL="$a" ;;
+    -*)
+      # 不再静默吞掉未知旗标：出声但不拒（本入口历史上对 -\* 是宽容的，
+      # 直接改判红会把别的会话的调用一起打死）。
+      say "⚠ 忽略未知旗标：$1（本入口不认它；本脚本只认 --dry-run / --force / --critic <名> / --proposer <名>）" ;;
+    *) [ -z "$PROPOSAL" ] && PROPOSAL="$1" ;;
   esac
+  shift
 done
 
 say() { printf '%s\n' "$1"; }
+
+# ==========================================================================
+#  产物目录碰撞拦截（仓侧守卫；根因在仓外引擎）
+# ==========================================================================
+# 引擎（用户级技能 ~/.claude/skills/adversarial-review-loop/scripts/ccg-deep-review.js）
+# 把决策层产物写到 .adversarial/ccg-plan-<slug>/，而 slug = "ccg-plan-" + basename(方案文件去扩展名)
+# + "-" + critic —— **只用文件名，不带所在目录**。两个 change 的规划文件都叫 design.md ⇒ 同一 slug
+# ⇒ 后跑的静默覆盖先跑的评审现场（critique-v1.md / proposal-v1.md / adjudication.json 全没）。
+#
+# 实测事故（2026-10-17）：本会话评审 gate-record-sync-derived-status/design.md 时，覆盖了
+# commit f66081aec 中另一会话 B1 RPA 反检测评审的 critique-v1.md；那份产物是 tracked 的，
+# 靠 git restore 精确路径才救回。引擎住在 git 之外（改它=影响所有会话且下次技能升级会漂移），
+# 所以守卫装在仓侧调用点：**先看目的地有没有别人的东西**，有就拒绝运行并给出路。
+#
+# MP_ARTIFACT_ROOT 仅供回归测试与例外场景覆盖，默认仓库根（与引擎的 REPO 同义）。
+ART_ROOT="${MP_ARTIFACT_ROOT:-$ROOT}"
+# 覆盖时必须出声（评审 F5）：把 MP_ARTIFACT_ROOT 指到一个空目录就能让守卫看不见任何东西，
+# 静默覆盖等于把守卫改成"愿意被摘的锁"。默认路径不打印，避免每次跑都刷一行噪声。
+if [ -n "${MP_ARTIFACT_ROOT:-}" ] && [ "$MP_ARTIFACT_ROOT" != "$ROOT" ]; then
+  echo "plan-review: 产物根被 MP_ARTIFACT_ROOT 覆盖为 $MP_ARTIFACT_ROOT（碰撞守卫只在被覆盖后的目录里检查；仅供测试）" >&2
+fi
+# 方案文件不可达时守卫整块被跳过——那正是一条"愿意被摘的锁"。本脚本在第 21 行就
+# cd 到 $ROOT，所以从子目录传进来的相对路径到此处已解不进原文件（外部评审 F5 命中，
+# 本机实测：守卫一声不吭地放行）。判据不看 rc 也不看内容，只看这一行有没有出声。
+if [ -n "$PROPOSAL" ] && [ ! -f "$PROPOSAL" ]; then
+  echo "plan-review: 方案文件在仓库根下不可达（$PROPOSAL）⇒ 产物目录碰撞守卫已跳过，请改传绝对路径" >&2
+fi
+if [ -n "$PROPOSAL" ] && [ -f "$PROPOSAL" ] && [ -d "$ART_ROOT/.adversarial" ]; then
+  _pb=$(basename -- "$PROPOSAL"); _pb=${_pb%.*}
+  _pb=$(printf '%s' "$_pb" | tr 'A-Z' 'a-z')
+  _collide=""
+  for _d in "$ART_ROOT/.adversarial/ccg-plan-$_pb-"*; do
+    [ -d "$_d" ] || continue
+    _stored="$_d/proposal-v1.md"
+    [ -f "$_stored" ] || continue
+    # 同一份方案（重跑/续跑）不算碰撞；内容不同才是别人的东西。
+    cmp -s "$_stored" "$PROPOSAL" || _collide="$_collide ${_d#$ART_ROOT/}"
+  done
+  if [ -n "$_collide" ]; then
+    say "✗ 产物目录碰撞：${_collide# }（方案名「$_pb」在别的方案里已被用过）"
+    say "  那些目录里的 proposal-v1.md 与本次方案不是同一份 ⇒ 引擎会按同一个 slug 覆盖别人的评审现场。"
+    say "  根因：引擎 slug 只用方案文件名、不带所在目录（2026-10-10 那次修复加了 critic，没加目录维度）。"
+    say "  出路：①方案文件起唯一名（推荐，如 design-<change>.md 或直接用 change 目录里的路径名）；"
+    say "        ②确属同一方案 ⇒ 先把旧产物目录归档再重跑；"
+    say "        ③知情放行：MP_ALLOW_PLAN_COLLISION=1（会在 stderr 留痕，不会静默）。"
+    echo "plan-review: 拒绝运行，产物目录碰撞:$_collide" >&2
+    [ "${MP_ALLOW_PLAN_COLLISION:-}" = "1" ] || exit 2
+    echo "plan-review: 已按 MP_ALLOW_PLAN_COLLISION=1 放行，将覆盖:$_collide" >&2
+  fi
+fi
 
 # ==========================================================================
 #  环境闸：拒绝 WSL
@@ -263,16 +362,19 @@ EOF
   return 1
 }
 
-# 逐后端体检并打印。退出码三档：0 双后端齐备 / 2 有缺失（含 0 个）。
-# 必须按**计数**分档（0/1 标志会让「2/2 可用」与「1/2 可用」长得一样）。
+# 逐后端体检并打印。退出码两档：0 配置名单里的后端全部解析到 / 2 有缺失（含 0 个）。
+# 必须按**计数**分档（0/1 标志会让「2/2 可用」与「1/2 可用」长得一样），
+# 而分母取自 backend_table 的行数，不是写死的 2 —— 同族单后端配置下只有一行，
+# 拿 1 当降级会把一份显式配置读成故障。
 report_backends() {
   _rb_rc=0
   _rb_n=0
-  for _rb_b in claude opencode; do
-    case "$_rb_b" in
-      claude)   _rb_why="评审后端（主力）"; _rb_pkg='@anthropic-ai/claude-code' ;;
-      opencode) _rb_why="出方案后端 / 跨家族校验"; _rb_pkg='opencode-ai' ;;
-    esac
+  _rb_total=0
+  # 名单来自单一真源（scripts/ccg-review-backends.list + 覆盖），不再写死 claude/opencode。
+  # heredoc 而不是管道：管道会把循环体推进子 shell，PATH 的修复就留在子 shell 里了。
+  while IFS='|' read -r _rb_b _rb_why _rb_pkg; do
+    [ -n "$_rb_b" ] || continue
+    _rb_total=$((_rb_total + 1))
     resolve_backend "$_rb_b" || true
     say "  · $_rb_b  [$_RB_CODE] $_RB_MSG（$_rb_why）"
     case "$_RB_CODE" in
@@ -283,18 +385,32 @@ report_backends() {
         say "        或把它所在目录写进系统 PATH 后重开终端；"
         say "        也可用 CCG_BACKEND_BIN_DIRS 显式指一个目录" ;;
     esac
-  done
+  done <<EOF
+$(backend_table)
+EOF
   case "$_rb_n" in
     0)
       say ""
       say "  ✗ 没有任何评审后端可用 —— 对抗评审根本起不来。" ;;
-    1)
+    "$_rb_total")
+      if [ "$RB_CRITIC" = "$RB_PROPOSER" ]; then
+        say ""
+        say "  ℹ 同族单后端（critic=proposer=$RB_CRITIC）：能跑，但按配置**不参与**跨家族交叉验证。"
+      fi ;;
+    *)
       say ""
-      say "  ⚠ 只剩单后端可用 —— 评审能跑，但跨家族交叉验证会缺失。" ;;
+      say "  ⚠ 仅 $_rb_n/$_rb_total 个后端可用 —— 评审能跑，但跨家族交叉验证会缺失。" ;;
   esac
   _RB_OK=$([ "$_rb_n" -ge 1 ] && echo 1 || echo 0)
   return "$_rb_rc"
 }
+
+# 先解析后端对再体检：体检消费解析结果，顺序反了就会按老名单出结论
+# （六份字面量互不认账就是这个顺序造成的）。解析失败一律早退，不得读成「没配」。
+resolve_review_backends || exit 2
+if [ -n "$RB_OVERRIDE_NOTE" ]; then
+  say "ℹ 评审后端已覆盖：$RB_OVERRIDE_NOTE（critic 来源 $RB_FROM_CRITIC，proposer 来源 $RB_FROM_PROPOSER）"
+fi
 
 report_backends || true
 say ""
@@ -307,7 +423,19 @@ say "开始跨家族对抗评审（出方案 → 挑刺 → 逐条回应 → 收
 say ""
 
 # ---------- 5. 跑引擎（objectType=plan） ----------
+# 决策层这条路径**是**驱动真正应用 --proposer/--critic 的地方（覆盖块就挂在
+# objectType:"plan" 分支里），所以这里转发即生效。
+# 参数逐个加引号、按是否覆盖分成两条 exec（与 deep-review.sh 同一形态，
+# 取自 QM-6 外部评审的 Critical 建议）：不拼串就不会把安全性押在字符集正则那一道上。
 if [ "$DRY" -eq 1 ]; then
+  if [ -n "$RB_OVERRIDE_NOTE" ]; then
+    say "→ 已向后端请求覆盖：--proposer $RB_PROPOSER --critic $RB_CRITIC"
+    exec node "$DRIVER" --dry-run --proposal "$PROPOSAL" --proposer "$RB_PROPOSER" --critic "$RB_CRITIC"
+  fi
   exec node "$DRIVER" --dry-run --proposal "$PROPOSAL"
+fi
+if [ -n "$RB_OVERRIDE_NOTE" ]; then
+  say "→ 已向后端请求覆盖：--proposer $RB_PROPOSER --critic $RB_CRITIC"
+  exec node "$DRIVER" --proposal "$PROPOSAL" --proposer "$RB_PROPOSER" --critic "$RB_CRITIC"
 fi
 exec node "$DRIVER" --proposal "$PROPOSAL"

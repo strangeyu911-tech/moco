@@ -43,6 +43,11 @@ export async function aiGenerate(type, provider, params) { return invokeWithFall
 // ─── 改写引擎 API（rewrite-engine）────────────────────
 export async function aiRewrite(params) { return invokeWithFallback("aiRewrite", { code: -1, data: null }, params) }
 
+// ─── 热门选题视频发布标题（fix-hot-topics-genvideo-title，2026-10-17）────
+// 契约：{ code:0, data:{ success:true, title } } | { code:0, data:{ success:false, reason:'no-model'|'failed' } }
+// 「无模型」与「调用失败」都返回 code:0 —— 调用方据此走降级，不当成错误弹窗。
+export async function aiGenerateGenVideoTitle(payload) { return invokeWithFallback("aiGenerateGenVideoTitle", { code: -1, message: 'electronAPI not available' }, payload) }
+
 export async function aiListRewriteStrategies() { return invokeWithFallback("aiListRewriteStrategies", { code: -1, data: [] }) }
 
 export async function aiGetRecommendedStrategies(userSettings) { return invokeWithFallback("aiGetRecommendedStrategies", { code: -1, data: [] }, userSettings) }
@@ -366,16 +371,13 @@ export async function batchCancel(id) { return invokeWithFallback("batchCancel",
 
 export function onBatchProgress(callback) { return bridgeOn("BatchProgress", callback) }
 
-// ─── 支付 API ─────────────────────────────
-export async function paymentCreateOrder(options) { return invokeWithFallback("paymentCreateOrder", {  code: -1  }, options) }
-
-export async function paymentListOrders() { return invokeWithFallback("paymentListOrders", {  code: 0, data: []  }) }
-
-export async function paymentGetOrder(orderId) { return invokeWithFallback("paymentGetOrder", {  code: -1  }, orderId) }
-
-export async function paymentSimulate(orderId) { return invokeWithFallback("paymentSimulate", {  code: -1  }, orderId) }
-
-export async function paymentCancel(orderId) { return invokeWithFallback("paymentCancel", {  code: -1  }, orderId) }
+// ─── 支付 API 已移除（2026-10-17 remove-buyout-license）─────────────────
+// 原先这里封装了 paymentCreateOrder / paymentListOrders / paymentGetOrder /
+// paymentSimulate / paymentCancel。整条本地下单链路已随买断授权模型移除：
+// 它在 S1 修复后已经断了（activate 只认 4-4-4 兑换码，订单 UUID 必不匹配 ⇒
+// 支付成功也拿不到授权），且 ¥99 一次性买断与服务端 plan-matrix 的三档订阅互斥。
+// 授权唯一入口是服务端：POST /api/v1/redeem + entitlement 下发。
+// 若要做在线支付，需接支付平台 + 回调 + 对账，是独立立项，不要在这里"恢复"封装。
 
 
 // ─── 首次运行引导 API ──────────────────────
@@ -520,6 +522,11 @@ export async function story2videoBgmLibraryRename(id, name) {
 }
 export async function story2videoBgmLibraryDelete(id) {
   return invokeWithFallback("story2videoBgmLibraryDelete", { code: -1, message: 'electronAPI not available' }, id)
+}
+// 历史 BGM 路径只读核验（存在性/可读性/是否在库）。失败返回 code -1，
+// 调用方必须按「未知」处理（失败开放），不得当作“文件已丢失”。
+export async function story2videoBgmLibraryStatus(filePath) {
+  return invokeWithFallback("story2videoBgmLibraryStatus", { code: -1, message: 'electronAPI not available' }, filePath)
 }
 // ─── 流水线「保存配置」API（openspec s2v-pipeline-config-profiles） ───
 export async function story2videoConfigProfileList() {

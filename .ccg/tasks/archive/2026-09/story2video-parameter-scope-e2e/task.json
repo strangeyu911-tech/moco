@@ -1,0 +1,13 @@
+{
+  "id": "story2video-parameter-scope-e2e",
+  "title": "清理 Story2Video 无关参数并验证真实视频生成流程",
+  "status": "in_progress",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "desktop-story2video",
+  "currentPhase": "review",
+  "nextAction": "用户在已启动 Electron 中重新保存三项有效 API Key 后，执行真实 Provider 与 Story2Video 最小流程验收",
+  "createdAt": "2026-08-01T12:00:00Z",
+  "branch": "codex/story2video-scope-e2e",
+  "externalValidation": "provider_keys_require_reentry_before_authenticated_e2e"
+}

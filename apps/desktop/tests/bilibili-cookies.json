@@ -1,0 +1,5 @@
+[
+  { "name": "SESSDATA", "value": "<REDACTED_PLACEHOLDER>", "domain": ".bilibili.com", "path": "/", "httpOnly": true, "secure": true },
+  { "name": "bili_jct", "value": "<REDACTED_PLACEHOLDER>", "domain": ".bilibili.com", "path": "/", "httpOnly": true, "secure": true },
+  { "name": "DedeUserID", "value": "<REDACTED_PLACEHOLDER>", "domain": ".bilibili.com", "path": "/", "httpOnly": false, "secure": false }
+]

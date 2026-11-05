@@ -1089,10 +1089,18 @@ test('Gate 7 必须按退出码 3 阻断就绪故障（捕获而不判定的回�
   assert.match(body, /\$suitesNotReady = ''/, '名单必须显式初始化为空串：$null -ne 空串在 PowerShell 里为真')
   assert.match(body, /if \(\$suitesNotReady -ne ''\)/, '就绪名单非空必须触发拦截')
   assert.match(body, /\[GATE-7\] FATAL.*就绪/, '拦截必须点名这是就绪类故障')
-  assert.match(body, /exit 3/, '拦截退出码必须是 3（与套件侧 ERR_VISUAL_NOT_READY 同档）')
+  // 退出码 3 的承载形态在 2026-10-19 改为「判定值」（见下方新锁），所以这里锁的是码值本身而不是
+  // `exit 3` 这一行字面量——后者会把"收敛出口"这一正当修复读成"阻断被删掉"。
+  assert.match(body, /\$gateVerdict = 3/, '拦截退出码必须是 3（与套件侧 ERR_VISUAL_NOT_READY 同档）')
 
-  const idxReady = body.indexOf("if ($suitesNotReady -ne '')")
-  const idxPixel = body.indexOf('if ($pixelExit -ne 0)')
+  // 定位有两个要求：① 形状无关 —— `if ($pixelExit -ne 0)` 与 `} elseif ($pixelExit -ne 0) {` 都合法，
+  //    否则本条顺序锁会把自己的修复路径焊死（存在性锁必须同时锁住合规路径能绿）；
+  // ② 行锚定到语句 —— 正文里有一处散文注释原样写着 "$pixelExit -ne 0"（Gate 7 环境缺失那段），
+  //    裸短语 search 会先命中它，把顺序锁判成"像素判定在就绪拦截之前"——那是注释的位置不是判据的位置。
+  // 否则本条顺序锁会把自己的修复路径焊死（见「存在性锁必须同时锁住合规路径能绿」）。
+  const idxReady = body.search(/^\s*(?:} elseif|if) \(\$suitesNotReady -ne ''\)/m)
+  const idxPixel = body.search(/^\s*(?:} elseif|if) \(\$pixelExit -ne 0\)/m)
+
   assert.ok(idxReady >= 0, '未找到就绪拦截块 —— 上面的正则与这里的 indexOf 口径不一致')
   assert.ok(idxPixel >= 0, '未找到像素判定块 —— Gate 7 既有阻断被改名，本条顺序锁失效')
   assert.ok(idxReady < idxPixel, '就绪拦截必须排在像素判定之前')
@@ -1100,3 +1108,292 @@ test('Gate 7 必须按退出码 3 阻断就绪故障（捕获而不判定的回�
   const assigns = (body.match(/\$LASTEXITCODE/g) || []).length
   assert.ok(assigns >= 7, 'Gate 7 每个套件都必须显式取 $LASTEXITCODE（当前 ' + assigns + ' 处，不得退回 || x=$?）')
 })
+
+// ⛔ Gate 7 的步骤退出码必须由判定值决定（2026-10-19，branch: ux-audit-phase34）。
+//
+// 事故（判据取产物，非推断）：PR #3992 的 QG Visual 报红，而该步骤日志末行是
+// `[GATE-7] All visual tests passed`。四条 `exit` 分支各管一种失败，**通过路径没有任何 exit**，
+// 于是 pwsh 步骤的退出码取自「最后一条原生命令」的残留 $LASTEXITCODE —— 这里是 finally 里
+// 清理 dev server 的 `taskkill /PID ... /T /F`（进程已退出时返回非零）。一个守门步骤的成败由
+// 清理动作决定，是「装饰性门禁」的反向形态：不是恒绿，而是**恒不可信**。
+//
+// 本锁三件事都配正向对偶（禁令单独存在会把「删掉被禁物」与「删掉需求」判成同形）：
+// ① 判定值单点初始化 `$gateVerdict = 0`，四条分支各自赋码（3 / $pixelExit / 1 / $judgeExit）；
+// ② 唯一出口 `exit $gateVerdict` 必须排在通过文案之前；
+// ③ 通过路径必须以**显式 `exit 0`** 收尾（删掉它必须变红 —— 那正是本次修复的本体）。
+test('Gate 7 的步骤退出码必须由判定值决定，不得取自清理动作的残留 $LASTEXITCODE', () => {
+  const wf = yaml.load(fs.readFileSync(qualityGatePath, 'utf8'))
+  const g7 = wf.jobs.visual.steps.find((s) => /Gate 7 - Visual regression/.test(String(s.name || '')))
+  assert.ok(g7, 'Gate 7 步骤必须存在（改名会静默废掉本条锁）')
+  const body = String(g7.run || '')
+
+  assert.match(body, /^\s*\$gateVerdict = 0\s*$/m, '判定值必须在判定链之前单点初始化为 0')
+  for (const v of ['$gateVerdict = 3', '$gateVerdict = $pixelExit', '$gateVerdict = 1', '$gateVerdict = $judgeExit']) {
+    assert.ok(body.includes(v), `判定链必须保留「${v}」 —— 少一格等于该故障不再阻断，退出码退回清理动作的余值`)
+  }
+  assert.doesNotMatch(
+    body,
+    /^\s*exit (?:3|1|\$pixelExit|\$judgeExit)\s*$/m,
+    '四条分支不得退回各自 exit：出口必须收敛到判定值一处（本步的 playwright/build 早退是单行 if，不受本条约束）',
+  )
+
+  const iGateExit = body.search(/if \(\$gateVerdict -ne 0\)[\s\S]*?exit \$gateVerdict/)
+  assert.ok(iGateExit >= 0, '缺少「判定值非零 ⇒ exit $gateVerdict」的唯一出口')
+  // 锚点取"可执行的那一行"而不是裸短语：散文注释里出现同名字样会让 indexOf 先命中注释，
+  // 于是顺序锁量的是"我写注释的位置"（2026-10-19 本 PR 自己踩过一次，当场红）。
+  const iPassed = body.indexOf('Write-Host "[GATE-7] All visual tests passed"')
+  const iExit0 = body.indexOf('exit 0')
+  assert.ok(iPassed >= 0 && iExit0 >= 0, '通过文案与显式 exit 0 都必须存在')
+  assert.ok(iGateExit < iPassed, '非零出口必须排在通过文案之前')
+  assert.ok(iPassed < iExit0, 'exit 0 必须排在通过文案之后 —— 它就是「通过路径不再取清理动作余值」的那一格')
+})
+
+// ⛔ 视觉**校验域**的阻断面锁（2026-10-17，visual-checks-must-block）。
+//
+// 事故（判据取产物，非推断）：main 上 `collection-confirm-dialog` 断言失败（页面区块标题 /
+// 删除入口消失）在 Gate 7 里只留一行 `suite exits: ... views-supplement=1`，**QG Visual 照常
+// pass**；唯一红的地方是 `visual-test.yml`，而它自 2026-09-17 起不在 PR 上跑、也不是 required
+// 上下文 ⇒ 连红 60+ 次无人发现。
+//
+// 根因：`views` / `views-supplement` 跑的是 runViewTest（截图 + 逐条 `checks` 断言，**不做像素
+// 比对**），而 Gate 7b 的判据是「基线 == 本次渲染 0 px」—— 对校验域**没有判定面**。于是这两个
+// 套件的退出码 1 在设计上"只留痕"，等于**永远没有阻断面**。
+//
+// 本锁钉住三件事：① 非零必须当场重跑一次（两轮甄别，避免把偶发采集抖动变成所有 PR 的常量红）；
+// ② 两轮都非零必须 exit 非零；③ 该判定必须排在「All visual tests passed」之前。
+test('QG Visual 的校验域套件（views / views-supplement / workflows / workflows-supplement）失败必须阻断', () => {
+  const wf = yaml.load(fs.readFileSync(qualityGatePath, 'utf8'));
+  const step = wf.jobs.visual.steps.find(s => /Gate 7 - Visual regression/.test(String(s.name || '')));
+  assert.ok(step, 'quality-gate.yml 的 visual job 必须有「Gate 7 - Visual regression」步骤');
+  const body = String(step.run || '');
+
+  // ① 四套各自：非零分支之后必须紧跟同一套件的重跑。
+  // workflows 两套是 2026-10-17（visual-gate-full-coverage）补进来的——它们此前**只**在
+  // `visual-test.yml` 的 run-all-visual 里跑，而那个 workflow 不在 PR 上触发 ⇒ PR 侧零覆盖。
+  for (const [guard, rerun, label] of [
+    ['if ($viewsExit -ne 0)', 'pnpm.cmd run test:visual', 'views'],
+    ['if ($viewsSuppExit -ne 0)', 'pnpm.cmd run test:visual:supplement', 'views-supplement'],
+    ['if ($workflowsExit -ne 0)', 'pnpm.cmd run test:workflow', 'workflows'],
+    ['if ($workflowsSuppExit -ne 0)', 'pnpm.cmd run test:workflow:supplement', 'workflows-supplement'],
+  ]) {
+    const iGuard = body.indexOf(guard);
+    assert.ok(iGuard >= 0, `${label} 必须有「非零 ⇒ 重跑」的两轮甄别分支（判据：${guard}）`);
+    const iRerun = body.indexOf(rerun, iGuard);
+    assert.ok(iRerun > iGuard, `${label} 的重跑调用必须在该分支内（判据：${rerun}）`);
+    // 每一套都必须**真的跑过**（guard 存在也可能是从没执行过的死分支）
+    assert.ok(
+      body.indexOf(`${rerun}`) >= 0,
+      `${label} 的套件命令必须在 Gate 7 里出现（否则守卫是死代码）`,
+    );
+  }
+  // 每条重跑都必须是「两次都非零才收进名单」的形态，不得写成一次就阻断
+  for (const label of ['views', 'views-supplement', 'workflows', 'workflows-supplement']) {
+    assert.match(
+      body,
+      new RegExp(`\\$checksFailSuites \\+= '${label}'`),
+      `${label} 两轮均失败时必须收进 \$checksFailSuites`,
+    );
+  }
+
+  // ② 两轮均失败必须阻断，且必须点名"校验型"（与像素抖动分流，便于排障）
+  assert.match(body, /\$checksFailSuites = @\(\)/, '名单必须显式初始化为空数组（$null 与 @() 的 .Count 行为不同）');
+  assert.match(
+    body,
+    /if \(\$checksFailSuites -and \$checksFailSuites\.Count -gt 0\)/,
+    '两轮均失败必须进入阻断分支（缺这一格 = 校验域失败仍然只留痕）',
+  );
+  assert.match(body, /\[GATE-7\] FATAL.*校验型断言/, '阻断输出必须点名这是校验型故障');
+
+  // ③ 顺序：阻断必须排在通过收尾之前（否则"pass"先命中，阻断成死代码）
+  const iBlock = body.indexOf('$checksFailSuites -and $checksFailSuites.Count -gt 0');
+  // 同上一条：锚点必须取可执行行，否则散文注释里的同名字样会顶掉真实锚点（2026-10-19 实测）。
+  const iPassed = body.indexOf('Write-Host "[GATE-7] All visual tests passed"');
+  assert.ok(iBlock >= 0, '未找到校验域阻断块');
+  assert.ok(iPassed >= 0, '未找到 Gate 7 的通过收尾');
+  assert.ok(iBlock < iPassed, '校验域阻断必须排在「All visual tests passed」之前');
+})
+
+// ⛔ 覆盖面平价锁（2026-10-17，visual-gate-full-coverage 的续做）。
+//
+// **它替谁守**：`tests/visual-testing/scripts/run-all-visual.js` 是四套 registry 的**单一真源**，
+// 但它只输出 0/1（源码 `process.exitCode = failed>0||aborted>0 ? 1 : 0`），**丢掉了每个套件的
+// 退出码语义**（3=视图从未渲染出来 / 1=断言或像素失败）。而 Gate 7 必须保住这个区分（就绪超时
+// 要当场 `exit 3`），也要保住「只重跑失败那一套」的粒度。
+//
+// 所以 QG Visual 选择**逐套单独调用**，而不是把 `run-all-visual` 整只搬进来。代价是两条路并存：
+// 有人给注册表加了第 5 套却忘了接进 QG Visual，那套会在 PR 侧**静默零覆盖**——2026-10-17 之前
+// 的 49 例（workflows / supplementary-workflows）正是这样漏的。
+//
+// 本锁把「注册表」与「QG Visual 的接法表」绑成一对：注册表多一套而接法表没跟上 ⇒ 当场红。
+// 这样既拿到 `run-all-visual` 唯一能给的额外收益（新增套件自动被追责），又不用付
+// 「重复跑 56 例 + 丢退出码语义 + 失败时重跑整套」的代价。
+test('QG Visual 的套件接法表必须与 run-all-visual 的注册表平价', () => {
+  const runnerPath = path.join(
+    __dirname, '..', '..', 'apps', 'desktop', 'tests', 'visual-testing', 'scripts', 'run-all-visual.js',
+  );
+  const runnerSrc = fs.readFileSync(runnerPath, 'utf8');
+  const suites = [...runnerSrc.matchAll(/require\('\.\.\/(views|workflows)\/([a-z-]+)\.visual\.test'\)/g)]
+    .map(m => `${m[1]}/${m[2]}`);
+  // 命中数下界：解析式判据必须先证明自己看得见东西，否则"0 条 ⇒ 全通过"是假绿
+  assert.ok(suites.length >= 4,
+    `run-all-visual 的注册表解析命中 ${suites.length} 条（期望 ≥4）—— 解析式或文件结构变了，本锁已失明`);
+
+  // 注册表模块 → QG Visual 里对应的 package 脚本。改映射必须两边同改，靠这条锁强制。
+  const SCRIPT_OF = {
+    'views/all-views': 'test:visual',
+    'views/supplementary-views': 'test:visual:supplement',
+    'workflows/all-workflows': 'test:workflow',
+    'workflows/supplementary-workflows': 'test:workflow:supplement',
+  };
+
+  const wf = yaml.load(fs.readFileSync(qualityGatePath, 'utf8'));
+  const step = wf.jobs.visual.steps.find(s => /Gate 7 - Visual regression/.test(String(s.name || '')));
+  assert.ok(step, 'quality-gate.yml 的 visual job 必须有「Gate 7 - Visual regression」步骤');
+  const body = String(step.run || '');
+
+  for (const suite of suites) {
+    const script = SCRIPT_OF[suite];
+    assert.ok(script,
+      `run-all-visual 注册了套件「${suite}」，但 QG Visual 的接法表没有它 —— ` +
+      `该套件在 PR 侧会静默零覆盖。请同时在 quality-gate.yml 接上、并在此登记映射。`);
+    // 词边界匹配：`test:visual` 是 `test:visual:supplement` 的前缀，裸 includes 会假绿
+    const re = new RegExp(`pnpm\\.cmd run ${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`);
+    assert.match(body, re, `QG Visual 必须执行 ${script}（对应 run-all-visual 的 ${suite}）`);
+  }
+})
+
+// ===== 桌面测试与「不再受版本控制的构建产物」的配对锁（change: electron-ci-preload-build-step）=====
+// 背景（实测，不是推测）：#3782 把 5 个受管构建产物移出版本控制后，"干净检出里没有它们"成为新前提；
+// 而 Electron CI 里跑桌面全量的那一步带 `if: github.event_name != 'pull_request'`（只在 main push 跑），
+// 于是 push 连红 15 次、PR 全绿，9 个"与真实产物对账"的测试文件报 ENOENT / Cannot find module。
+// 当时 #3782 只给 quality-gate.yml 的三个消费 job 补了重建，漏了 electron-ci.yml —— 本锁守的是**配对关系**，
+// 不是那一次修复：任何 job 只要跑桌面全量，就必须有一步**同时**重建这两个脚本，且排在测试之前。
+const DESKTOP_SUITE_BUILD_SCRIPTS = ['build:preload', 'build:paginator'];
+// 消费者谓词由现场两条真实命令行形态推导（见 .tools 清点，不是凭 API 名字猜）：
+//   单行：`pnpm --filter @multi-publish/desktop test -- \` / `... desktop test:coverage -- ...`；
+//   PowerShell 参数数组：`"@multi-publish/desktop",` 换行 `"test",`（desktop-shards 用这种）。
+// `test:startup` 刻意排除：build.yml 的 build job 没有重建步骤而 push 实测 success，
+// 说明该入口不读这 5 个产物；把它纳进来就是拿没验过的因果当判据。
+const DESKTOP_SUITE_ONE_LINE_RE = /--filter @multi-publish\/desktop\s+(?:test(?![\w:-])|test:all(?![\w:-])|test:coverage(?![\w:-]))/;
+const DESKTOP_SUITE_ARRAY_RE = /"@multi-publish\/desktop",\s*\n\s*"test(?![\w:-])"/;
+const DESKTOP_SUITE_NO_BUILD_ACK = []; // 承认清单：起始为空、只能缩小；新增必须带原因
+
+function desktopStepsRunSuite(steps) {
+  return steps.some(step => {
+    const run = String(step.run || '');
+    return DESKTOP_SUITE_ONE_LINE_RE.test(run) || DESKTOP_SUITE_ARRAY_RE.test(run);
+  });
+}
+
+// 判据函数与"从盘上取 job"分离：顺序这一支必须由合成 steps 直接喂，否则收集器只扫 testIdx 之前的步骤，
+// `buildIdx > testIdx` 永不可达 —— 那就是又一道装饰性判据（写得出、点不到火）。
+function judgeDesktopSuiteJob(steps) {
+  const isSuite = step => {
+    const run = String(step.run || '');
+    return DESKTOP_SUITE_ONE_LINE_RE.test(run) || DESKTOP_SUITE_ARRAY_RE.test(run);
+  };
+  const hasBothBuilds = step => DESKTOP_SUITE_BUILD_SCRIPTS.every(script => String(step.run || '').includes(script));
+  const testIdx = steps.findIndex(isSuite);
+  const buildIdx = steps.findIndex(hasBothBuilds);
+  if (testIdx < 0) return { verdict: 'NOT_A_CONSUMER', testIdx, buildIdx };
+  if (buildIdx < 0) return { verdict: 'MISSING_BUILD', testIdx, buildIdx };
+  if (buildIdx > testIdx) return { verdict: 'BUILD_AFTER_TEST', testIdx, buildIdx };
+  return { verdict: 'OK', testIdx, buildIdx };
+}
+
+test('跑桌面 vitest 全量的每个 job 都必须在测试前重建那 5 个不再受版本控制的产物', () => {
+  const wfDir = path.join(__dirname, '..', 'workflows');
+  const rows = [];
+  for (const name of fs.readdirSync(wfDir).filter(n => /\.ya?ml$/.test(n)).sort()) {
+    const wf = yaml.load(fs.readFileSync(path.join(wfDir, name), 'utf8'));
+    for (const [jobName, job] of Object.entries(wf.jobs || {})) {
+      const steps = job.steps || [];
+      if (!desktopStepsRunSuite(steps)) continue;
+      rows.push({ key: `${name}:${jobName}`, judge: judgeDesktopSuiteJob(steps), steps });
+    }
+  }
+  // 反失明：谓词被改窄/解析退化会让 rows 变空，而"全部合规"读起来完全像通过
+  assert.ok(rows.length >= 3, `消费者覆盖面下界 3，实测 ${rows.length} ⇒ 谓词或扫描域退化：` +
+    JSON.stringify(rows.map(r => r.key)));
+  const offenders = rows.filter(r => r.judge.verdict !== 'OK' && !DESKTOP_SUITE_NO_BUILD_ACK.includes(r.key));
+  assert.deepEqual(
+    offenders.map(r => `${r.key} ⇒ ${r.judge.verdict}（test@${r.judge.testIdx} build@${r.judge.buildIdx}）`),
+    [],
+    '构建产物已移出版本控制 ⇒ 跑桌面全量的 job 必须有一步同时重建 build:preload 与 build:paginator 且排在测试之前',
+  );
+  const electronCi = rows.find(r => r.key === 'electron-ci.yml:electron-tests');
+  assert.ok(electronCi, 'electron-ci.yml:electron-tests 必须仍落在本锁覆盖面内（整片删掉测试步来"修好"本锁不算修）');
+  const buildStep = electronCi.steps[electronCi.judge.buildIdx];
+  const testStep = electronCi.steps[electronCi.judge.testIdx];
+  // 配对锁：两条 if 必须逐字相同，否则"只在 push 跑测试 / 两种事件都跑构建"这类漂移会悄悄发生
+  assert.equal(String(buildStep.if), String(testStep.if),
+    `electron-ci.yml 重建步与测试步的 if 必须一致（实测 build=${buildStep.if} test=${testStep.if}）`);
+});
+
+test('顺序判据可达：重建排在测试之后必须判 BUILD_AFTER_TEST', () => {
+  const suite = { name: 'Unit tests', if: 'github.event_name != \'pull_request\'',
+    run: 'pnpm --filter @multi-publish/desktop test -- --maxWorkers=1' };
+  const build = { name: 'Build preload bundles', if: 'github.event_name != \'pull_request\'',
+    run: 'pnpm --filter @multi-publish/desktop run build:preload\npnpm --filter @multi-publish/desktop run build:paginator' };
+  const ok = judgeDesktopSuiteJob([build, suite]);
+  const bad = judgeDesktopSuiteJob([suite, build]);
+  const missing = judgeDesktopSuiteJob([suite]);
+  const nonConsumer = judgeDesktopSuiteJob([{ name: 'startup', run: 'pnpm --filter @multi-publish/desktop test:startup' }]);
+  assert.equal(ok.verdict, 'OK', '正确顺序必须判 OK（合规形态必须能绿）');
+  assert.equal(bad.verdict, 'BUILD_AFTER_TEST', '顺序反过来必须红——这条若抓不到就是装饰判据');
+  assert.equal(missing.verdict, 'MISSING_BUILD', '完全没重建必须红');
+  assert.equal(nonConsumer.verdict, 'NOT_A_CONSUMER', 'test:startup 不得被算进消费者（它不读那 5 个产物，build.yml 无重建步仍 push 实测 success）');
+  assert.equal(judgeDesktopSuiteJob([{ name: 'x', run: 'node --test scripts/foo.test.js' }]).verdict, 'NOT_A_CONSUMER',
+    '主进程侧 node --test 不属于本锁的范围');
+});
+
+// 外部评审（opencode/big-pickle，2026-10-17）C3(b) 命中：上一条锁只断言"两步的 if 相等"，
+// 于是"两步都漏写 if"（隐式全事件跑）也判绿 —— 而那恰好把这条 job 从「只在 main push 跑」变成
+// 「PR 上也跑一次 30 分钟全量」，即 #3782 之后我们想避免的重复执行。关系型判据挡不住"一起漏"，
+// 所以这里补一条**绝对值**判据：门槛必须由 YAML 里写出来的字面量表达。
+const ELECTRON_CI_PUSH_ONLY_IF = "github.event_name != 'pull_request'";
+
+test('electron-ci 的重建步与测试步必须把「只在非 PR 事件跑」写成字面量', () => {
+  const wf = yaml.load(fs.readFileSync(path.join(__dirname, '..', 'workflows', 'electron-ci.yml'), 'utf8'));
+  const j = judgeDesktopSuiteJob((wf.jobs['electron-tests'] || {}).steps || []);
+  const steps = (wf.jobs['electron-tests'] || {}).steps || [];
+  assert.equal(j.verdict, 'OK', `electron-ci 的配对状态被破坏：${JSON.stringify(j)}`);
+  const buildIf = steps[j.buildIdx] && steps[j.buildIdx].if;
+  const testIf = steps[j.testIdx] && steps[j.testIdx].if;
+  assert.equal(String(testIf), ELECTRON_CI_PUSH_ONLY_IF,
+    `桌面全量测试步的事件门槛必须是字面量 ${ELECTRON_CI_PUSH_ONLY_IF}，实测=${JSON.stringify(String(testIf))}` +
+    '（缺省=两种事件都跑，PR 上会重复跑整轮）');
+  assert.equal(String(buildIf), ELECTRON_CI_PUSH_ONLY_IF,
+    `重建步的门槛必须与测试步同字面量，实测=${JSON.stringify(String(buildIf))}`);
+});
+
+test('派生收口的账本锁必须接在 changes job 且在非 PR 早退之前（落点错了就等于不跑）', () => {
+  // change: gate-record-sync-derived-status。落点是这条判据的生死位置：
+  // static-gates 等重型 job 都挂 `if: needs.changes.outputs.docs-only != 'true'`，
+  // 把账本锁放进去，docs-only PR（也就是这条判据主要服务的那类 PR）会整 job 被短路 ⇒ 锁恒不跑。
+  const wf = yaml.load(fs.readFileSync(qualityGatePath, 'utf8'));
+  const changes = wf.jobs.changes;
+  assert.ok(changes, 'changes job 必须存在');
+  assert.equal(changes.if, undefined, 'changes job 自身不得有 job 级 if（有就等于可被跳过，判据随命令行抖动）');
+
+  const step = (changes.steps || []).find((s) => /Detect docs-only changes/.test(s.name || ''));
+  assert.ok(step, '「Detect docs-only changes」步骤必须存在（账本锁的宿主步骤）');
+  assert.equal(step.shell, 'bash', '必须是 bash：一个 run 块里塞多条命令时，pwsh 不会在中间某条非零时中止');
+  const body = step.run;
+  const iLedger = body.indexOf('node --test scripts/lib/merge-ledger.test.js');
+  assert.ok(iLedger >= 0, '账本回归锁必须接线在此——没接线的新测试永远不会执行、也没有任何东西会因此变红');
+
+  // 位置必须早于非 PR 早退那段，否则 push 事件档根本不跑
+  const iEarlyExit = body.search(/if \[\s*"\$\{\{\s*github\.event_name\s*\}\}"\s*!=\s*"pull_request"/);
+  assert.ok(iEarlyExit >= 0, '该步骤里应仍存在"非 PR 早退"分支（本断言钉的是它还在，不是它该在）');
+  assert.ok(iLedger < iEarlyExit, '账本锁必须排在非 PR 早退之前，否则 main push 那一档不跑它');
+
+  // 反向：这条锁绝不允许被"顺手"复制进任何带 job 级 if 的 job（两处各跑一遍会给出两套读数）
+  for (const [name, job] of Object.entries(wf.jobs)) {
+    if (name === 'changes') continue;
+    if (!job || typeof job !== 'object' || job.if === undefined) continue;
+    const text = JSON.stringify(job.steps || []);
+    assert.doesNotMatch(text, /merge-ledger\.test\.js/,
+      `${name} 有 job 级 if，账本锁不得出现在那里（docs-only 时会整 job 被短路）`);
+  }
+});

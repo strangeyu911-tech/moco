@@ -1,0 +1,87 @@
+---
+record: branch-merged-against-main
+task: 修 check-branch-merged.js 的判定域与差量口径（re-sync 型分支大面积假报 LOST）+ 顺带抓到并修掉逐行归因的编码盲区
+date: 2026-10-17
+---
+
+## 本次执行记录：给落地判据换判定域（branch-merged-against-main，2026-10-17）
+
+| 门禁 | 状态 | Fresh 证据 |
+|------|------|-----------|
+| 变更类型与隔离 | ✅ | 动 `scripts/` 工具脚本本体 ⇒ 混合 PR，按 AGENTS 分层铁律走隔离工作区：`git worktree list` 里有本任务那条、分支名 = 任务名裸名（`git -C <工作区> rev-parse --abbrev-ref HEAD` 回读 = `branch-merged-against-main`）；建区用 `scripts/start-mp-task.ps1 -TaskName branch-merged-against-main -NoDeps`，rc 不作判据，按产物判 |
+| 第一性原因（QM-5 ①） | ✅ | 引入点是本切片自己上午那笔提交（#3749）。两个缺陷叠加：**(D1)** 差量起点取 `merge-base(ref, merge)`，分支 re-sync 过 main 之后这个值退化成 **merge 自己**，于是「我新增的行」里混进了**别人后来合进主干的行**；**(D2)** 判定域钉在 merge 快照且按文件取「最好的那份」，一个文件被同分支多个 PR 分别改时**没有任何一份快照含全量** ⇒ 逐份 LOST ⇒ best 仍 LOST。第三个是本次才暴露的：逐行归因用 `git log -S<行>`，而判据内部按 latin1 保字节、execFileSync 把参数按 **UTF-8** 编码送出 ⇒ **中文行永远匹配不上**（同一次判定里 ASCII 的 `sync_status: PENDING` 命中、紧随的两条中文行全部救不走）。 |
+| 逃逸分析（QM-5 ②） | ✅ | 单元测试：v1 的 13 条夹具**全部用 ASCII 行**、且全部是「刚合并、main 未前进」的新鲜形态 ⇒ D1/D2/编码三条都不可表示。真实合并 A/B 当时跑了 8 例，覆盖面同样只有新鲜态——**这就是"0 假阳性"这句结论的真实边界**：它测的是它采过的那一类分支，不是"分支"这个类。视觉/打包/审查轴与本改动无关。逃逸点还有一条形状值得记：判据自己是清理流程的工具，它坏的时候最先发现的是清理任务本身，而上一次清理恰好用的是"新鲜合并"那 8 例。 |
+| 修复 + 回归保护（QM-5 ④） | ✅ | 判定域改为 `--against`（默认 `origin/main`，取不到按 `main` 回落**且末行必须打印实际落点**；显式传入而取不到 ⇒ 退出码 2）；差量起点 = `merge-base(ref, against)`；`--merge` 降级为归因排除集。违规行（新增缺失 / 删除复现）一律走**逐行具名归因**：同一次 `git log -p` 拿到的补丁在 latin1 字节空间里与该行等值比对（QM-6 后端轴命中后收紧为**两道前提**：该行须随本次合并进过主干 / 我的删除须在某个合并产物里确实生效过，且范围内有一笔提交对它**净删 / 净加**），命中才放行，命不到仍算 `LOST`；**整份文件不在主干（MISSING_FILE）单独成档且不做行级救走**。新增 7 条锁：T10（re-sync 后无差量是通过态）/ T10b（同夹具上分支独有行仍 LOST，防 blanket pass）/ T11（删除行被主干具名加回 ⇒ DRIFT）/ T12（收紧参考系不得放过真丢失）/ T13（`--against` 取不到 ⇒ 2，且必须打印落点）/ T14（我新增的行被别的 PR 正确改写 ⇒ 逐行归因点名）/ T15（从未上主干的行救不走）/ T16（MISSING_FILE 仍 LOST）/ **T17（中文行必须同样能归因——就是那条编码盲区本身的锁）**/ **T18（QM-6 命中的"别人先加后撤的同文行"不得替我的未落地行作保）**。全量 `node --test scripts/check-branch-merged.test.js` = **23 tests / 23 pass / 0 fail**。 |
+| 防止再次发生（QM-5 ⑤） | ✅ | ① 变异反证 **9 条**，逐条实测 CAUGHT（下表；红集尽量互不相同，M3 与 M5 相同已如实标注）；② 真实仓批量 A/B 把**覆盖面从"新鲜合并"扩到四类形态**（新鲜 / 单 PR 老分支 / 多 PR + re-sync / 整份缺席），并把仍红的 3 条逐个手工读现场而不是调宽判据；③ 测试夹具新增一条硬要求并已在本记录里落成文字：**判据涉及"行文本比对"时夹具必须含非 ASCII 行**，否则对中文仓等于没测；④ PRD §8 与 AGENTS 收尾清单第 5 条同步改写（AGENTS 那句现在明写"判定域是 `--against`，`--merge` 只做归因排除"）。 |
+| 行尾与 diff 对账 | ✅ | 见下方「对账读数」：本记录所在文件为新建（LF），被改的 `scripts/check-branch-merged.js` / `.test.js` / `AGENTS.md` / PRD 四件，`git diff --numstat` 与 `--ignore-cr-at-eol --numstat` 两口径逐文件相等（当场跑，见下）。 |
+| 接线棘轮 | ✅ | 测试文件未改名，Gate 2b4 已在 #3749 接进 `changes` job（`node --test scripts/check-branch-merged.test.js`），本切片不动接线；`check-unwired-tests.js` 实跑 rc=0。 |
+| QM-1 打包 / QM-4 视觉 | N/A | 未触 `apps/desktop/electron/`、`packages/rpa-engine/`，也未触任何前端视觉文件；改动面只有 `scripts/` 工具脚本 + 文档。 |
+| QM-6 CCG 双模型外部评审 | 见下 | 见「QM-6」一节，如实记录跑成/没跑成，不以自审冒充 |
+| 远程同步 | PASS | 本 PR 即 **#3836**，`state=MERGED`，merge SHA `2618909dcf378077d3028b56d3415c923b6bec41`，merge 时间 2026-10-17T13:34:31Z。取证三条：main 主题尾 `(#3836)$` 检索**恰好 1 行**；远端分支 ref 查询 **0 行**（随 squash 删除）；落地判据由本片自己修好的工具跑出——`node scripts/check-branch-merged.js --ref f4648eb3b --merge 2618909dc` ⇒ 5 个文件全 `IDENTICAL`、`lost=0 unattributed=0 judge_error=0`、退出码 0（这次跑的是**已落到 main 的 v2 实现**，即它以自己的落地为第一次真实输入）。PR 侧 CI：`21 pass / 0 fail / 0 pending / 2 skipping`，且按两处守门清单逐条核过——ruleset `main-ci-gate` 要求 7 条、classic protection 要求 4 条、并集 10 条**全部 pass**，跳过的 `release` / `gui-test` 都不在 required 内（required 里是聚合作业 `GUI Gate Result`，它过了）。合并经人工授权：QM-6 前端轴未跑成（见上），故按 #3749 同形交回人工，用户答复「合」。同一次提交内删除 frontmatter 的三个 `sync_*` 字段（新载体不进 JSON ledger）。两条如实保留的过程账：① 我推第二个提交时，旧 head 那轮 CI 只差 1 项就绿（已跑约 37 分钟），被这次推送作废——评审的 Critical 该修，但顺序上应等那一轮收口再推；② 本次 main push 的 `quality-gate.yml` 回读结果记在本条下方「遗留」里，不在此预填。 |
+
+### 变异反证（9 条，逐条实跑；红集见表，M3/M5 相同处已在下方注明）
+
+| 变异 | 改成什么（被规则明文禁止的那个形态） | 必须红 | 实测 |
+|---|---|---|---|
+| M1 | 判定域退回 merge 快照（v1 形状） | T6 / T11 | CAUGHT |
+| M2 | 摘掉逐行归因（违规一律算丢失） | T11 / T14 / T17 | CAUGHT |
+| M3 | 把「无差量」重新当成判据故障（v1 反失明一刀切） | T10 | CAUGHT |
+| M4 | 显式 `--against` 取不到时静默回落 merge[0]（把失明伪装成通过） | T13 | CAUGHT |
+| M5 | 差量起点退回 `merge-base(ref, merge[0])`（D1 的来源） | T10 | CAUGHT |
+| M6 | 逐行归因**无条件命中**（不做补丁等值判定就放行） | T15 | CAUGHT |
+| M7 | 摘掉 MISSING_FILE 特殊路径 | T16 | CAUGHT |
+| M8 | 归因分片分隔符放回 `%H` 之后（sha 与 patch 错位配对——本切片自己犯过的那次） | T2 / T11 / T14 / T17 | CAUGHT |
+| M9 | 摘掉"该行须随本次合并落地过"这道前提（QM-6 后端轴命中的那条洗白路径） | T18 | CAUGHT |
+
+驱动收尾断言 `restored_byte_identical=true`，且未变异的基线必须先全绿才允许谈红集（否则"变红"无法归因）。
+M3 与 M5 的红集相同（都只有 T10）：那是**同一条锁抓两种坏形态**，如实记而不是假装它们互不相同。
+
+### 真实仓批量 A/B（把覆盖面从"新鲜合并"扩到四类形态）
+
+| 分支形态 | v1 读数 | v2 读数 |
+|---|---|---|
+| 今天的回填 PR（tip 4e703f3a8） | 未测过这类之外的形态 | `files=1 drift=1 lost=0` rc=0 |
+| 今天的撤回 PR（tip a88bd5dba） | 同上 | `files=1 identical=1 lost=0` rc=0 |
+| 7 个 PR + re-sync（tip b0df701cf） | **`lost=65 files=66`，48 s** | `files=0 lost=0` rc=0，0.5 s |
+| 单 PR 老分支（tip bf520a13c） | — | 收紧前 `files=8 identical=2 drift=4 lost=2`；QM-6 修好后 **`drift=2 lost=4`** rc=1 |
+| 单 PR 老分支（tip 0ec118832） | — | `files=3 identical=2 lost=1`（MISSING_FILE）rc=1 |
+| 单 PR 老分支（tip e8a4749fc） | — | `files=13 identical=3 drift=9 lost=1` rc=1 |
+| 单 PR 老分支 ×2（5c9a5aa1d / 5f2c95a8a） | — | rc=0 |
+
+**收紧本身就有余量证据**：`bf520a13c` 在加"须随本次合并落地过"这道前提之前有 4 个文件判 `DRIFT-ATTRIBUTED`，加完之后其中 2 个退回 `LOST`——那 2 个正是被"别人加过又撤的同文行"救走的，评审的反例不是理论。
+
+**仍红的 3 条逐个读了现场，都是真停手而不是判据坏**：`bf520a13c` 的 `rpa-selector-utils.js` 连文件级归因都没有、点名的是 2026-09-30 那次未落地修复的注释行（项目记忆里那条"远程 head 与每个已合并 PR 的 headRefOid 都不相等 ⇒ 是别的会话尚未合并的工作"正是同一个 tip）；`0ec118832` 是 `_exempt` 记录整份不在主干；`e8a4749fc` 点名的是当初那条没落地的 learnings 文本。
+
+### QM-6
+
+**后端轴（codex，经 `codeagent-wrapper`，审 HEAD `9c808465a`）跑成，命中 1 条 CRITICAL，已在本 PR 内修复**：
+
+- 它的原话要点：`findLineCommit` 只做「补丁行内容等值」，既不看方向（`+`/`-` 一视同仁），也不看「这一行是不是随**本次合并**进过主干」；于是「别人在同一文件里先加后撤的同文行」会把「我的行从未落地」洗成 `DRIFT-ATTRIBUTED` ⇒ rc=0，而那份文本此刻唯一的携带者就是要被删的分支。它还明确点名「T15 只堵了该文件零归因提交的负控，没堵有他人提交、恰好同样文本的负控」——这句是对的，我原先把 T15 当成 rescue 的边界证明，高估了它。
+- 处置（不是调宽，是收紧）：救走改判为**两道前提缺一不可** —— ① 该行在**至少一份合并产物**里存在（`mergedLineState.landedCount`）／删除行方向则要求它在某份合并产物里确实缺席过；② 范围内有一笔提交对它**净删**（新增缺失方向）或**净加**（复现方向），净 = 同一次提交内 `+`/`-` 计数相减，于是"同一笔里挪了个位置"（net=0）不再算证据。新增 **T18** 就是它那条反例的可构造版本（先红后绿），并加 **M9** 变异把①整条摘掉以证明 T18 真在守它。
+- 它另外提出、我判为**不在本片修**的三条，理由写清不做假装修：① 重命名/搬家会判成 MISSING_FILE 假红——方向保守（挡合法清理，不丢工作），修它要引入相似度检测，超出"删除前闸门"的范围；② 改了又删回原样（净差量为零）的文件不进判定域——这是判据契约本身（问的是"有没有主干上没有的文本"），不是漏洞；③ 它说 latin1 比较"不算严格字节空间比较"（`key()` 会 trim、剥行尾）——属实，但那是**有意的同口径**：行尾与缩进差异不该决定"工作丢没丢"，且两侧同函数比较，不会单向偏置。
+
+**前端轴（claude）未跑成**：两次都是 `claude exited with status 1` + stdout 0 字节（本机已知形态：该后端对长任务静默空转/限流，`PONG` 级探针能通）。第一次失败另有我自己的原因——我把两路塞进同一条 shell 用 `&` 并发，整条命令 exit 2 使前端那路**根本没启动**；已改成两路各自独立后台任务。**不以自审替代 QM-6**：本 PR 的合并决定因此交回人工（与 #3749 同形处理）。
+
+第一次尝试还有一个我自己的错必须记：任务书写了「不要执行任何 shell 命令」，而 codex 在这个包装里**只有 shell 一种读法** ⇒ 它回答「无法基于实际代码给结论，猜测会误导你」并停下。这是约束写错不是通道坏；被审者在没有依据时不出结论是**对**的行为。同批第一条要修的调用错误：让评审把 findings 写到 `.tools/tmp`——那在被审 worktree **之外**，wrapper 沙箱一律 `blocked by policy`（记忆里早写过这条，本次又踩）。
+
+### 遗留（不假装已闭合）
+
+- **删除行方向的"落地过"前提没有专属负控**。`absentInAny` 这道前提（我删的那行必须在某份合并产物里确实缺席过）与新增行方向的 `landedCount` 是一对，但只造出了后者的反例（T18/M9）；前者的"错判"需要"我的删除从未生效 + 别人又净加回同文"两步，而第二步一旦成立，主干上就该有这行、违规也就不成立了 —— 我没能构造出可达的反例，因此**不假装它有锁**。留这条给下一个能构造出来的人。
+- **`--merge` 现在只是归因排除集，但 CLI 仍要求必填**。真实清理里更常用的其实是"只给 ref，让判据自己对主干"；把 `--merge` 变成可选要同时决定"没传时归因如何排除本次合并自身"（否则我的 PR 会被当成他人差异），本切片不动，留给下一轮。
+- **v1 的"0 假阳性"结论的边界已在逃逸分析里改写**：那句结论的测量域只有新鲜合并态。留一条通用纪律给下一个会话——判据的真实仓验证必须按**分支形态**分桶采样（新鲜 / 老单 PR / re-sync / 整份缺席），不能只挑刚合的那几个。
+
+### 本节由回填提交补上（2026-10-17 晚，随 `branch-merged-count-rescue` 一轮落地；当时正文写明"不在此预填"）
+
+- **#3836 的 main push 回读 = `cancelled`，不是 success**。run `39037127191`（`2618909dc`，event=push，attempt=1）跑满 40.0 分钟后于 `2026-10-17T14:18:28Z` 被取消，10 个作业里 9 个已 success。
+  **归因（当场量，非推测）**：取消方是 `QG Coverage` 自己的 `timeout-minutes: 40`；同窗口 main push 上该作业耗时读数 `39.0 / 39.3 / 39.6 / 39.7` 分钟（`1bed4ad2c`、`b68f820be`、`27bd5d72b`、`ab26324ce`），
+  即 main 侧长期贴着这道天花板跑，谁落在 40 之外谁的整轮证据就没了。不是并发组取消（`cancel-in-progress` 只对 PR 生效，且 push 按 `run_id` 唯一分组，`workflow-contract.test.js` 2b) 锁着），也不是仓库内任何 workflow 调了 cancel 端点（全 `.github/workflows/` grep 无一处）。
+  该 sha 的主侧证据按本仓既有实测（`#2642`/#2902 那批：被取消又有后续 run 补回 = 0 格）属**永久丢失**。
+- **但本片关心的那条判据在 main 上确有步骤级证据**：`job QG Changes = success`，其内层 **step 19 `Gate 2b4 - Branch-merged criterion (changes job)` = success**（同 run，13:34:57→13:35:46，共 49 s）。
+  口径照旧：只看 job 结论不算证据；而"main push 没绿"这件事也**不折算成本片内容有问题**——红/取消落在哪一步，就得指到那一步。
+- **回填 PR #3846 的 main push = `NO_RUN(by design)`**：`c39396729` 只差量 `openspec/records/branch-merged-against-main.md` 一个文件，
+  而 `quality-gate.yml` 的 push `paths-ignore` 第 18 行含 `openspec/**` ⇒ 该 sha 上根本没有 `quality-gate` 的 push run（实测 `gh run list --workflow=quality-gate.yml --commit c39396729` 返回 `[]`；同 sha 只有 `债务熔断门禁` 在排队）。
+  按收尾清单第 7 条如实记 `NO_RUN(by design)`，并转去核该判据最近一次在 main 上的读数（即上一条的 step 19），**不把"没有 run"读成"丢了证据"，也不拿"按设计不跑"当免检**。
+- **上一条那条「`absentInAny` 没有专属负控」的遗留：方向反了，且已被下一片解决。** 我当时构造不出"可达的反例"，因为我把要找的东西限定在"删除行被净加回"这一支；
+  真实的可达形态是它的对偶——**我删掉重复行的一份拷贝且逐字落地，主干那一份照样命中"出现过"**（`CHANGELOG.md` 3348 个重复行键、`learnings.md` 4104 个 ⇒ 这是常态不是边角）。
+  下一片（`branch-merged-count-rescue`）把判据换成「份数 + 可解释容量」并补 T19/T20/T23 三条锁，见其记录的 PRD §9。
+  留这一条纠数给下一个读到这里的人：**"我构造不出来"常常是搜索空间被我自己限窄了，不是该缺陷不存在。**

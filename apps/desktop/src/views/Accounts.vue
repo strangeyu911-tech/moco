@@ -1,6 +1,10 @@
 <template>
   <div class="accounts-page">
     <h1 class="sr-only">{{ t('accountsPage.pageTitle') }}</h1>
+    <!-- PRD-UI-FLOW-CLARITY S1a：账号域页内模块导航（替代被删除的 MpModuleNav）。
+         独立组件见 features/accounts/AccountModuleTabs.vue —— 本文件是
+         check-max-lines 的点名还账文件（targets 1578、零增长容差），故不内联。 -->
+    <AccountModuleTabs :active-key="accountTab" />
     <section v-if="accountTab !== 'groups' && accountTab !== 'favorites'" class="account-controls" :aria-label="t('accountsPage.filterAria')">
       <div class="search-box platform-search-box">
         <Search class="search-icon" />
@@ -118,18 +122,14 @@
       :aria-labelledby="`account-status-tab-${filter}`"
     >
       <RiskSuspendedBanner />
-      <section v-if="accountTab === 'share'" class="module-placeholder" data-testid="account-share-panel">
-        <div class="module-placeholder-icon" aria-hidden="true"><el-icon><Link /></el-icon></div>
-        <h2>{{ t('accountsPage.shareTitle') }}</h2>
-        <p>{{ t('accountsPage.shareHint') }}</p>
-        <span class="module-placeholder-state" data-testid="account-share-state" role="status">{{ t('accountsPage.shareNotConnected') }}</span>
-        <button class="page-button secondary" data-testid="account-share-create" type="button" disabled>{{ t('accountsPage.createShareLink') }}</button>
-      </section>
+      <!-- 「分享链接」占位面板已于 PRD-UI-FLOW-CLARITY S1a 删除：
+           该 tab 为零能力占位（disabled 按钮 + 未接入状态），
+           按 docs/desktop-ui-layout-spec.md:246-248「避免为零能力入口提供视觉热区」先例下线。 -->
       <!-- 分组真源状态必须可见：'unreadable' 与「用户没有分组」是两件事，
            'save-failed' 若不报就等于告诉用户"改好了"而其实重启即丢。
            必须放在面板之后：放在前面会抢走面板的 v-else-if 链条，让面板在非 ok 态整个消失。 -->
       <AccountGroupsPanel
-        v-else-if="accountTab === 'groups'"
+        v-if="accountTab === 'groups'"
         :groups="accountStore.groups || []"
         :accounts="accountStore.accounts"
         :platforms="allPlatforms"
@@ -158,7 +158,10 @@
         :groups="accountStore.groups || []"
         @open-group="openFavoriteGroup"
       />
-      <div v-else class="account-workspace">
+      <!-- S1a：显式写成 v-else-if="accountTab === 'accounts'"（原为 v-else）。
+           原 v-else 挂在 `<p v-if="groups && …">` 那条独立链上，语义上会在
+           groups tab 下也命中；改为显式判断后，三个 tab 与三个面板一一对应。 -->
+      <div v-else-if="accountTab === 'accounts'" class="account-workspace">
         <aside class="platform-filter-panel" :aria-label="t('accountsPage.platformFilterAria')">
           <div class="platform-filter-heading">{{ t('accountsPage.platform') }}</div>
           <button
@@ -358,13 +361,14 @@
 
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { Close, Delete, FolderOpened, Link, Plus, Search, UserFilled, WarningFilled } from '@element-plus/icons-vue'
+import { Close, Delete, FolderOpened, Plus, Search, UserFilled, WarningFilled } from '@element-plus/icons-vue'
 import { useNotify } from '@/composables/useNotify'
 import AccountAuthorizationGuide from '@/features/accounts/components/AccountAuthorizationGuide.vue'
 import AccountCloudSyncDialog from '@/features/accounts/components/AccountCloudSyncDialog.vue'
 import AccountFavoritesPanel from '@/features/accounts/components/AccountFavoritesPanel.vue'
 import AccountGroupsPanel from '@/features/accounts/components/AccountGroupsPanel.vue'
 import AccountLoginDialog from '@/features/accounts/components/AccountLoginDialog.vue'
+import AccountModuleTabs from '@/features/accounts/components/AccountModuleTabs.vue'
 import AccountManagementCard from '@/features/accounts/components/AccountManagementCard.vue'
 import AccountProxyDialog from '@/features/accounts/components/AccountProxyDialog.vue'
 import RiskSuspendedBanner from '@/features/accounts/components/RiskSuspendedBanner.vue'
@@ -538,7 +542,15 @@ const authViewVisible = computed({
   set: value => { loginVisible.value = Boolean(value) },
 })
 const authPlatformName = computed(() => loginPlatform.value ? platformLabel(loginPlatform.value) : t('accountsPage.loginTitle'))
-const accountTab = computed(() => String(route.query?.tab || 'accounts'))
+// PRD-UI-FLOW-CLARITY S1a：账号域页内 tab 契约。
+// 白名单兜底：此前 accountTab 直读 query，非法值会渲染空白面板；
+// 现非法值一律回落 'accounts'，避免用户手改 URL 后看到空页。
+// 导航控件见 features/accounts/AccountModuleTabs.vue（本文件是行数点名还账文件）。
+const ACCOUNT_MODULE_TAB_KEYS = ['accounts', 'groups', 'favorites']
+const accountTab = computed(() => {
+  const raw = String(route.query?.tab || 'accounts')
+  return ACCOUNT_MODULE_TAB_KEYS.includes(raw) ? raw : 'accounts'
+})
 const loginStateText = computed(() => {
   if (loginMode.value !== 'qrcode') return t('accountsPage.loginStateBrowser')
   return {
@@ -822,7 +834,10 @@ function toggleAccountInGroup (groupId, accountId) {
 
 function openFavoriteGroup (group) {
   setGroupFilter(group.id)
-  router.replace({ path: '/accounts', query: {} })
+  // PRD-UI-FLOW-CLARITY S1a：原实现 `router.replace({ query: {} })` 会清空**整个** query，
+  // 于是用户在「收藏分组」tab 内点开任一组就被踢回「账号管理」（accountTab 回落默认值），
+  // 且无任何提示。改为显式保留 tab，与页内 tab 契约一致。
+  router.replace({ path: '/accounts', query: { tab: 'favorites' } })
 }
 
 async function handleRequireLogin () {
@@ -946,7 +961,15 @@ async function checkLogin (account) {
     } else if (verdict === undefined) {
       // 三态契约：既非有效也非失效 = 本轮未取到定论。不得冒充「已失效」弹出去登录引导，
       // 也不得反向清除既有的会话失效标记 —— 与批量侧同一口径，证据缺席时什么都不改。
-      notifyInfo('accountsPage.loginUnconfirmed', { params: { platform: platformName } })
+      // 2026-10-17：把主进程给的 hint（为什么 + 下一步）拼进提示，用户才知道该重试还是该重新登录。
+      const hintKey = result?.data?.hint?.key
+      const detail = (hintKey && te(hintKey)) ? t(hintKey) : ''
+      notifyInfo('accountsPage.loginUnconfirmed', {
+        params: { platform: platformName },
+        message: detail
+          ? platformName + '：' + detail
+          : t('accountsPage.loginUnconfirmed', { platform: platformName }),
+      })
     } else {
       checkedExpiredIds.value.add(id)
       // 使用错误码映射到 i18n 文案，避免后端硬编码消息直接展示
@@ -1031,6 +1054,11 @@ async function batchCheckAllLogins () {
     const invalidIds = []
     let unconfirmedCount = 0
     const persistFailedIds = []
+    // 2026-10-17：未确认/失败账号的「下一步动作」聚合。参考产品B 把平台错误码翻译成
+    // 可执行提示（2190008→重新授权），我们这里把 reason 翻译成"重试 or 重新登录"，
+    // 让汇总行不只是报数，而是告诉用户接下来该做什么。
+    const reloginIds = []
+    const retryIds = []
     const checkedAt = result.data?.checkedAt || new Date().toISOString()
     for (const item of results) {
       if (!item?.accountId) continue
@@ -1047,6 +1075,9 @@ async function batchCheckAllLogins () {
         unconfirmedCount++
         checkedExpiredIds.value.delete(item.accountId)
       }
+      // hint.action：relogin=要重新登录 / retry=稍后重试；两者处置不同，不能混在一句里
+      if (item.hint && item.hint.action === 'relogin') reloginIds.push(item.accountId)
+      else if (item.hint && item.hint.action === 'retry') retryIds.push(item.accountId)
       const account = accounts.find(a => a.id === item.accountId)
       if (account) {
         // 这里只做本次会话的乐观展示。持久化由主进程在 accounts:batch-check-login
@@ -1066,6 +1097,14 @@ async function batchCheckAllLogins () {
       notifySuccess('accountsPage.batchCheckAllAllValid', { params: { count: validCount } })
     } else {
       notifyWarning('accountsPage.batchCheckAllDone', { params: { valid: validCount, invalid: invalidIds.length, unconfirmed: unconfirmedCount } })
+    }
+    // 未确认/失败的「下一步」单独一条：把"该重新登录"与"该稍后重试"分开说，
+    // 否则用户只看到数字、不知道哪些账号要自己动手。
+    if (reloginIds.length > 0 || retryIds.length > 0) {
+      const parts = []
+      if (reloginIds.length > 0) parts.push(t('accountsPage.checkHintsSummaryRelogin', { count: reloginIds.length }))
+      if (retryIds.length > 0) parts.push(t('accountsPage.checkHintsSummaryRetry', { count: retryIds.length }))
+      notifyInfo('accountsPage.checkHintsSummary', { message: parts.join('；') })
     }
     if (persistFailedIds.length > 0) {
       // 固化失败必须可见，否则用户会再次遇到「检测过了但重进又变回去」。
@@ -1329,12 +1368,8 @@ onUnmounted(() => {
 .login-state-actions .complete-login { min-height: 28px; padding: 4px 9px; border: 1px solid #5048e5; border-radius: 5px; background: #5048e5; color: #fff; }
 .login-state-actions button:disabled { opacity: 0.58; cursor: not-allowed; }
 .accounts-content { min-height: 520px; padding: 0; }
-.module-placeholder { min-height: 320px; display: grid; place-items: center; align-content: center; gap: 8px; padding: 32px; background: var(--color-bg-inset); color: #707080; text-align: center; }
-.module-placeholder h2 { margin: 0; color: #25252b; font-size: var(--font-size-md); }
-.module-placeholder p { max-width: 480px; margin: 0; font-size: var(--font-size-sm); line-height: 1.6; }
-.module-placeholder-icon { font-size: var(--font-size-xl); opacity: .72; }
-.module-placeholder-state { border-radius: 999px; padding: 3px 9px; background: #ececf1; color: #777985; font-size: var(--font-size-xs); }
-.module-placeholder .page-button { margin-top: 4px; }
+/* PRD-UI-FLOW-CLARITY S1a 的模块导航样式已随组件迁至
+   features/accounts/AccountModuleTabs.vue（本文件是行数点名还账文件）。 */
 .account-workspace { min-height: 520px; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
 .platform-filter-panel {
   display: flex;

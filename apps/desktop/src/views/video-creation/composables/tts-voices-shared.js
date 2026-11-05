@@ -8,10 +8,9 @@ import {
   state,
   requireDeps,
   getS2VVoiceProvider,
-  getS2VDefaultVoiceModel,
+  resolveVoiceModelForProvider,
   s2vVoiceProviderOptions,
   s2vVoiceCatalogRefreshable,
-  s2vVoiceModelOptions,
   s2vVoiceModelHidden,
   s2vVoiceContextModel,
   s2vVoiceOptions,
@@ -22,10 +21,12 @@ import { formatUserError } from '@/utils/user-facing-error'
 function getS2VVoiceContext() {
   const d = requireDeps()
   const providerId = typeof d.getS2vConfig().voiceProvider === 'string' ? d.getS2vConfig().voiceProvider.trim() : ''
-  // MiMo TTS：语音模型下拉隐藏，catalog 请求固定用 mimo-v2.5-tts（预置音色目录）
+  // 语音模型不再由用户选择（voice-model-program-resolved，2026-10-18）：
+  // MiMo 走 tts/voiceclone 双模型分支（预置音色目录固定用 mimo-v2.5-tts）；
+  // 其它 provider 一律按运营默许模型解析，**不读**用户可能陈旧的 s2vConfig.voiceModel。
   const model = s2vVoiceModelHidden.value
     ? 'mimo-v2.5-tts'
-    : (typeof d.getS2vConfig().voiceModel === 'string' ? d.getS2vConfig().voiceModel.trim() : '')
+    : resolveVoiceModelForProvider(getS2VVoiceProvider(providerId))
   return providerId && model ? { providerId, model } : null
 }
 
@@ -109,6 +110,7 @@ function friendlyVoiceCatalogError(message) {
     VOICE_CLONE_TOTAL_DURATION_EXCEEDED: 'The total audio duration exceeds the limit. Remove files and retry.',
     VOICE_CLONE_PROVIDER_UNAVAILABLE: 'Voice cloning is temporarily unavailable. Please try again later.',
     VOICE_CLONE_UNAVAILABLE: 'Voice cloning is temporarily unavailable. Please try again later.',
+    VOICE_CLONE_PLAN_UNSUPPORTED: 'Your MiniMax account cannot clone voices: note that MiniMax voice cloning requires a separate 9.9 CNY purchase per voice and is not covered by subscription plans. Purchase it on the MiniMax platform and retry, or use a built-in voice or another provider.',
     VOICE_CLONE_UNSUPPORTED: 'This voice model does not support voice cloning yet. Using the default voice.',
     VOICE_CLONE_DIALOG_UNAVAILABLE: 'Could not open the audio file picker. Please try again.',
     VOICE_CLONE_DUPLICATE_ID: 'A cloned voice with this name already exists. Use another name.',
@@ -250,7 +252,6 @@ async function selectS2VVoice(voiceId) {
 
 export {
   getS2VVoiceProvider,
-  getS2VDefaultVoiceModel,
   getS2VVoiceContext,
   getS2VVoiceCloneContext,
   isCurrentS2VVoiceRequest,

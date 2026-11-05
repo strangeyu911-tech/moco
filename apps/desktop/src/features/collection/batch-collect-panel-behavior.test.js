@@ -29,6 +29,14 @@ vi.mock('@/stores/settings-dialog', async () => {
   }
 })
 
+// 通知通道桩（2026-10-18，change: fav-force-recollect）：要断言「整批失败不得弹采集成功」，
+// 必须让 useNotify 返回可观测 spy。vi.hoisted 保证 mock 工厂早于 import 生效。
+const notifySpies = vi.hoisted(() => ({
+  notify: vi.fn(), notifySuccess: vi.fn(), notifyError: vi.fn(),
+  notifyWarning: vi.fn(), notifyInfo: vi.fn(), notifyConfirm: vi.fn(),
+}))
+vi.mock('@/composables/useNotify', () => ({ useNotify: () => notifySpies }))
+
 const BatchCollectPanel = (await import('./BatchCollectPanel.vue')).default
 const { settingsDialogRevision, requestSettingsDialog } = await import('@/stores/settings-dialog')
 
@@ -80,10 +88,17 @@ const i18n = createI18n({
         zhihuFav: {
           scopeFavlist: '指定收藏夹', scopeAll: '全部收藏', countPlaceholder: '数量', fullMode: '全量',
           includeCollected: '包含已采集', loadContents: '加载内容', loadingContents: '加载中',
-          selectAll: '全选', selectedCount: '已选 {count} 条', collectAndRewrite: '采集并改写',
+          selectAll: '全选', selectedCount: '已选 {count} 条', collectAndRewrite: '采集&改写',
           collecting: '采集中', markCollected: '已采集',
           progressSummary: '成功 {success} 失败 {failed} 跳过 {skipped} 改写失败 {rewriteFailed}',
           collectingNote: '采集 {url}', doneNote: '完成', registerOnlyNote: '仅登记',
+          duplicateNote: '已采集过，本次跳过（勾选「包含已采集」可强制重采）',
+          failedNote: '采集失败：{reason}',
+          failedNoReason: '采集失败（无详情，请查看日志）',
+          allFailedNote: '全部采集失败（{failed} 条），详情见进度明细与日志',
+          allSkippedNote: '这 {skipped} 条都已采集过，本次全部跳过（勾选「包含已采集」可强制重采）',
+          circuitBrokenNote: '已触发平台限流保护（熔断），本轮中止，请稍后重试',
+          nothingCollectedNote: '本轮没有采集到内容',
           collectOkRewriteFailNote: '采集成功但改写失败', fallbackSuffix: '（{count} 张图片降级）',
           kindAnswer: '回答', kindArticle: '文章', kindColumn: '专栏', kindPin: '想法', kindVideo: '视频', kindUnknown: '未知',
         },
@@ -326,6 +341,232 @@ describe('BatchCollectPanel 知乎收藏夹批量行为锁', () => {
     expect(window.electronAPI.zhihuFavlistContents).toHaveBeenCalled()
   })
 
+  // ── 改写失败可诊断（2026-10-17，change: collected-results-fix）──
+  // 用户实测：进度行只显示「改写失败用原文」，看不到是后端没起还是接口报错。
+  // 后端现已把原因摘要放进 done 事件的 result.rewriteError；进度行必须把它显示出来。
+  it('done 事件带 rewriteError → 进度行追加原因摘要（不再是只有「改写失败用原文」）', async () => {
+    let progressHandler = null
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn((cb) => { progressHandler = cb; return vi.fn() }),
+      zhihuFavBatchRun: vi.fn().mockResolvedValue({ code: 0, data: {
+        completed: 1, failed: 0, duplicateSkipped: 0, rewriteFailed: 1,
+        cancelled: false, circuitBroken: false,
+        results: [{ index: 0, ok: true, duplicate: false, data: {
+          id: 'fb_1', title: '标题甲', content: '正文甲', coverImage: '',
+          sourceUrl: 'https://zhuanlan.zhihu.com/p/1', kind: 'article', favTime: 1,
+          images: [], imageFallbacks: [], rewriteFailed: true,
+          rewriteError: 'connect ECONNREFUSED 127.0.0.1:8010',
+        } }],
+      } }),
+      zhihuFavlistContents: vi.fn().mockResolvedValue({ code: 0, data: { items: [], totals: 0 } }),
+    }
+    const w = mountPanel()
+    w.vm.zhihuFavlists = [{ urlToken: '111', title: '夹' }]
+    w.vm.zhihuSelectedFavlist = '111'
+    w.vm.zhihuFavItems = [{ url: 'https://zhuanlan.zhihu.com/p/1', title: '甲', kind: 'article', favTime: 1, collected: false }]
+    w.vm.zhihuFavChecked = new Set(['https://zhuanlan.zhihu.com/p/1'])
+    await w.vm.runZhihuFavCollectRewrite()
+    // 组件挂载时已订阅进度；直接喂 done 事件（与后端 sendProgress 同形）
+    expect(progressHandler).toBeTypeOf('function')
+    progressHandler({ phase: 'start', index: 0, total: 1, url: 'https://zhuanlan.zhihu.com/p/1' })
+    progressHandler({ phase: 'done', index: 0, total: 1, url: 'https://zhuanlan.zhihu.com/p/1', result: { ok: true, rewriteFailed: true, rewriteError: 'connect ECONNREFUSED 127.0.0.1:8010' } })
+    await flushPromises()
+    const lines = w.vm.zhihuFavProgressLines
+    const doneLine = lines.find((l) => l.includes('ECONNREFUSED'))
+    expect(doneLine, '进度行必须包含失败原因摘要').toBeTruthy()
+    expect(doneLine).toContain('改写失败用原文')
+    // 对比锁：没有原因时保持原文案、不得追加 undefined/"null" 等脏尾
+    const clean = lines.find((l) => l.includes('改写失败用原文') && !l.includes('ECONNREFUSED'))
+    expect(clean === undefined || !/(undefined|null)：/.test(clean)).toBe(true)
+  })
+
+  // ── 去重条目的呈现（2026-10-17，用户实测：进度「完成 2/2」但结果区 0 新增，不明所以）──
+  // 后端 C2 合同：已采集过的 URL 默认跳过（duplicate: true），这是正确行为；
+  // 缺陷在呈现——done 事件里 duplicate 与正常完成都显示「完成」，用户无法区分
+  //「采集成功」与「早采过被跳过」，也不知道「包含已采集」可强制重采。
+  it('done 事件 duplicate: true → 进度行显示跳过说明而非「完成」', async () => {
+    let progressHandler = null
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn((cb) => { progressHandler = cb; return vi.fn() }),
+    }
+    const w = mountPanel()
+    expect(progressHandler).toBeTypeOf('function')
+    progressHandler({ phase: 'start', index: 0, total: 1, url: 'https://www.zhihu.com/answer/1' })
+    progressHandler({ phase: 'done', index: 0, total: 1, url: 'https://www.zhihu.com/answer/1', result: { ok: true, duplicate: true } })
+    await flushPromises()
+    const lines = w.vm.zhihuFavProgressLines
+    // done 行不含 URL（note 无 url），特征是含跳过说明
+    const dupLine = lines.find((l) => l.includes('已采集过'))
+    expect(dupLine, 'duplicate 条目的 done 行必须有跳过说明').toBeTruthy()
+    expect(dupLine).toContain('包含已采集')
+    // 不得与正常完成的「完成」混同
+    expect(dupLine).not.toMatch(/完成$/)
+  })
+
+  it('正常完成（无 duplicate/registerOnly/rewriteFailed）仍显示「完成」', async () => {
+    let progressHandler = null
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn((cb) => { progressHandler = cb; return vi.fn() }),
+    }
+    const w = mountPanel()
+    progressHandler({ phase: 'start', index: 0, total: 1, url: 'https://www.zhihu.com/answer/2' })
+    progressHandler({ phase: 'done', index: 0, total: 1, url: 'https://www.zhihu.com/answer/2', result: { ok: true } })
+    await flushPromises()
+    // done 行是第二条（note 不含 URL；start 行含「采集中：URL」，done 行只有 note）
+    const line = w.vm.zhihuFavProgressLines.find((l) => !l.includes('采集中'))
+    expect(line, '正常完成必须有「完成」进度行').toBeTruthy()
+    expect(line).toContain('完成')
+    expect(line).not.toContain('已采集过')
+  })
+
+  // ── 采集失败必须可归因（2026-10-18，change: fav-force-recollect）──
+  // 用户实测：勾「包含已采集（强制重采）」后进度明细仍显示「完成」，结果区 0 新增。
+  // 根因之一：done 事件 ok:false 时渲染层没有对应分支，失败被渲染成「完成」。
+  it('done 事件 ok:false → 进度行显示「采集失败」+ 原因，绝不显示「完成」', async () => {
+    let progressHandler = null
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn((cb) => { progressHandler = cb; return vi.fn() }),
+    }
+    const w = mountPanel()
+    progressHandler({ phase: 'start', index: 0, total: 1, url: 'https://www.zhihu.com/answer/3' })
+    progressHandler({
+      phase: 'done', index: 0, total: 1, url: 'https://www.zhihu.com/answer/3',
+      result: { ok: false, error: 'unsubstantive', reason: '内容不可提取' },
+    })
+    await flushPromises()
+    const line = w.vm.zhihuFavProgressLines.find((l) => !l.includes('采集中'))
+    expect(line, '失败必须有进度行').toBeTruthy()
+    expect(line).toContain('采集失败')
+    expect(line).toContain('内容不可提取')
+    expect(line).not.toMatch(/完成$/) // 关键：不得把失败画成「完成」
+  })
+
+  it('done 事件 ok:false 且无 reason → 显示兜底话术（不出现 undefined）', async () => {
+    let progressHandler = null
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn((cb) => { progressHandler = cb; return vi.fn() }),
+    }
+    const w = mountPanel()
+    progressHandler({ phase: 'start', index: 0, total: 1, url: 'https://www.zhihu.com/answer/4' })
+    progressHandler({ phase: 'done', index: 0, total: 1, url: 'https://www.zhihu.com/answer/4', result: { ok: false } })
+    await flushPromises()
+    const line = w.vm.zhihuFavProgressLines.find((l) => !l.includes('采集中'))
+    expect(line).toContain('采集失败')
+    expect(line).toContain('请查看日志')
+    expect(line).not.toContain('undefined')
+  })
+
+  // ── 收尾通知必须与实际结果一致（2026-10-18，change: fav-force-recollect）──
+  // 原实现收尾**无条件** notifySuccess('collection.collectSuccess')：即使 2 条全部失败，
+  // 也弹「内容采集成功」。这是用户「显示完成但没结果」感知的第二个来源。
+  function clearNotifySpies () {
+    for (const s of Object.values(notifySpies)) s.mockClear()
+  }
+
+  it('整批全部失败 → 不得弹「采集成功」，改弹警告/错误', async () => {
+    clearNotifySpies()
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn(() => vi.fn()),
+      zhihuFavBatchRun: vi.fn().mockResolvedValue({ code: 0, data: {
+        completed: 0, failed: 2, duplicateSkipped: 0, rewriteFailed: 0,
+        cancelled: false, circuitBroken: false, items: [],
+        results: [
+          { index: 0, ok: false, error: 'unsubstantive', reason: '内容不可提取' },
+          { index: 1, ok: false, error: 'unsubstantive', reason: '内容不可提取' },
+        ],
+      } }),
+      zhihuFavlistContents: vi.fn().mockResolvedValue({ code: 0, data: { items: [], totals: 0 } }),
+    }
+    const w = mountPanel()
+    state(w, 'zhihuFavlists', [{ urlToken: 't', title: '夹' }])
+    state(w, 'zhihuFavItems', [
+      { url: 'https://www.zhihu.com/answer/1', title: 'A', kind: 'answer', collected: true },
+      { url: 'https://www.zhihu.com/answer/2', title: 'B', kind: 'answer', collected: true },
+    ])
+    state(w, 'zhihuSelectedFavlist', 't')
+    state(w, 'zhihuFavIncludeCollected', true)
+    state(w, 'zhihuFavChecked', new Set(['https://www.zhihu.com/answer/1', 'https://www.zhihu.com/answer/2']))
+    await w.vm.runZhihuFavCollectRewrite()
+    await flushPromises()
+    expect(notifySpies.notifySuccess, '全部失败绝不能报成功').not.toHaveBeenCalled()
+    const warned = notifySpies.notifyWarning.mock.calls.length + notifySpies.notifyError.mock.calls.length
+    expect(warned, '全部失败必须给出警告/错误提示').toBeGreaterThan(0)
+  })
+
+  it('整批全部被去重跳过 → 不弹「采集成功」，且说明全部已采集', async () => {
+    clearNotifySpies()
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn(() => vi.fn()),
+      zhihuFavBatchRun: vi.fn().mockResolvedValue({ code: 0, data: {
+        completed: 0, failed: 0, duplicateSkipped: 2, rewriteFailed: 0,
+        cancelled: false, circuitBroken: false, items: [],
+        results: [
+          { index: 0, ok: true, duplicate: true },
+          { index: 1, ok: true, duplicate: true },
+        ],
+      } }),
+      zhihuFavlistContents: vi.fn().mockResolvedValue({ code: 0, data: { items: [], totals: 0 } }),
+    }
+    const w = mountPanel()
+    state(w, 'zhihuFavlists', [{ urlToken: 't', title: '夹' }])
+    state(w, 'zhihuFavItems', [
+      { url: 'https://www.zhihu.com/answer/1', title: 'A', kind: 'answer', collected: true },
+      { url: 'https://www.zhihu.com/answer/2', title: 'B', kind: 'answer', collected: true },
+    ])
+    state(w, 'zhihuSelectedFavlist', 't')
+    state(w, 'zhihuFavChecked', new Set(['https://www.zhihu.com/answer/1', 'https://www.zhihu.com/answer/2']))
+    await w.vm.runZhihuFavCollectRewrite()
+    await flushPromises()
+    expect(notifySpies.notifySuccess, '全部跳过不是成功').not.toHaveBeenCalled()
+    const spoken = [
+      ...notifySpies.notifyInfo.mock.calls,
+      ...notifySpies.notifyWarning.mock.calls,
+    ].map((c) => String(c[0]))
+    expect(spoken.length, '全部跳过必须给出提示').toBeGreaterThan(0)
+    expect(spoken.join(' ')).toContain('allSkippedNote')
+  })
+
+  // ── 熔断 / 空批次不得落入「全部已采集」分支（2026-10-18，QM-6 自评发现）──
+  // 上一版四级分流的 else 兜底给 allSkippedNote(skipped=0)，熔断与空批次会显示
+  // 「这 0 条都已采集过」——语义完全错误。熔断必须有自己的文案。
+  it('circuitBroken 批次 → 提示熔断，绝不说「这 0 条都已采集过」', async () => {
+    clearNotifySpies()
+    window.electronAPI = {
+      onZhihuFavBatchProgress: vi.fn(() => vi.fn()),
+      zhihuFavBatchRun: vi.fn().mockResolvedValue({ code: 0, data: {
+        completed: 0, failed: 0, duplicateSkipped: 0, rewriteFailed: 0,
+        cancelled: false, circuitBroken: true, items: [], results: [],
+      } }),
+      zhihuFavlistContents: vi.fn().mockResolvedValue({ code: 0, data: { items: [], totals: 0 } }),
+    }
+    const w = mountPanel()
+    state(w, 'zhihuFavlists', [{ urlToken: 't', title: '夹' }])
+    state(w, 'zhihuFavItems', [{ url: 'https://www.zhihu.com/answer/1', title: 'A', kind: 'answer', collected: false }])
+    state(w, 'zhihuSelectedFavlist', 't')
+    state(w, 'zhihuFavChecked', new Set(['https://www.zhihu.com/answer/1']))
+    await w.vm.runZhihuFavCollectRewrite()
+    await flushPromises()
+    expect(notifySpies.notifySuccess).not.toHaveBeenCalled()
+    const allCalls = [
+      ...notifySpies.notifyInfo.mock.calls,
+      ...notifySpies.notifyWarning.mock.calls,
+      ...notifySpies.notifyError.mock.calls,
+    ].map((c) => String(c[0]))
+    expect(allCalls.join(' '), '熔断必须有专属提示').toContain('circuitBrokenNote')
+    expect(allCalls.join(' '), '不得落进「全部已采集」分支').not.toContain('allSkippedNote')
+  })
+
+  it('主按钮文案 = locale 的 collectAndRewrite（采集&改写）', async () => {
+    // 按钮在 v-if="zhihuFavItems.length" 容器内 ⇒ 须先有清单才渲染
+    const w = mountPanel()
+    state(w, 'zhihuFavlists', [{ urlToken: 't', title: '夹', isPublic: true }])
+    state(w, 'zhihuFavItems', [{ url: 'https://www.zhihu.com/answer/9', title: 'T', kind: 'answer', collected: false }])
+    await flushPromises()
+    const btn = w.find('[data-testid="zhihu-fav-collect-rewrite"]')
+    expect(btn.exists()).toBe(true)
+    expect(btn.text()).toBe('采集&改写')
+  })
+
   it('runZhihuFavCollectRewrite 未勾选 → 提示', async () => {
     window.electronAPI = { onZhihuFavBatchProgress: vi.fn(() => vi.fn()) }
     const w = mountPanel()
@@ -406,5 +647,91 @@ describe('旧整夹直采入口已下线（zhihu-fav-entries-consolidate）', ()
 
   it('rewriteFallbackItems prop 已移除（父级不再需要为旧改写喂来源）', () => {
     expect(Object.keys(BatchCollectPanel.props || {})).not.toContain('rewriteFallbackItems')
+  })
+})
+
+// ── 阶段引导（zhihu-fav-step-hint，2026-10-17）────────────────────────────
+// 动因：删掉旧整夹直采两个**常驻**按钮后，第 5 步（点「加载收藏内容」）之前，
+// 界面上没有任何「下一步该做什么」的引导 —— 用户看不到「采集并改写」也不知道要先加载。
+// 这批锁要求：三个阶段的引导**必须按阶段出现/消失**，且不得以任何形式复活旧入口。
+describe('阶段引导：加载收藏内容之前必须有路标（zhihu-fav-step-hint）', () => {
+  const HINT = '[data-testid="zhihu-fav-step-hint"]'
+  const REWRITE_BTN = '[data-testid="zhihu-fav-collect-rewrite"]'
+
+  /**
+   * 挂载一个「凭据已配置且可读」的面板。
+   *
+   * 注意**必须挂载前**就把桩放好：`onMounted` 会异步 `loadZhihuConfig()`，
+   * 它返回后会**覆盖**组件里的 zhihuConfig —— 若事后用 state() 改，会被这次异步写回冲掉
+   * （实测：单跑通过、全量顺序下失败，就是这个覆盖造成的）。
+   */
+  function mountWithSecret () {
+    window.electronAPI = {
+      zhihuGetConfig: vi.fn().mockResolvedValue({
+        code: 0,
+        data: secretConfig({ configured: true, readable: true, maskedSecret: 'ab****yz', source: 'encrypted' }),
+      }),
+    }
+    return mountPanel()
+  }
+
+  function favlist () {
+    return [{ urlToken: 'tok-1', title: '我的收藏夹', isPublic: true }]
+  }
+
+  it('阶段 A（已配凭据、还没拉收藏夹）→ 指向「获取收藏夹」', async () => {
+    const w = mountWithSecret()
+    await flushPromises()
+    const hint = w.find(HINT)
+    expect(hint.exists()).toBe(true)
+    expect(hint.text()).toContain('获取收藏夹')
+    // 阶段 A 不该出现「采集并改写」（它在清单区内，未加载即不存在）
+    expect(w.find(REWRITE_BTN).exists()).toBe(false)
+  })
+
+  it('阶段 B（已有收藏夹、还没加载内容）→ 指向「加载收藏内容」', async () => {
+    const w = mountWithSecret()
+    state(w, 'zhihuFavlists', favlist())
+    await flushPromises()
+    const hint = w.find(HINT)
+    expect(hint.exists()).toBe(true)
+    expect(hint.text()).toContain('加载收藏内容')
+    expect(w.find(REWRITE_BTN).exists()).toBe(false)
+  })
+
+  it('阶段 C（已加载出清单）→ 路标消失、按钮出现（不打扰）', async () => {
+    const w = mountWithSecret()
+    state(w, 'zhihuFavlists', favlist())
+    state(w, 'zhihuFavItems', [{ url: 'https://www.zhihu.com/question/1/answer/2', title: 'A', kind: 'answer', collected: false }])
+    await flushPromises()
+    expect(w.find(HINT).exists()).toBe(false)
+    expect(w.find(REWRITE_BTN).exists()).toBe(true)
+  })
+
+  it('凭据未配置时不与 configMissing 重复（只留凭据引导一条）', async () => {
+    // 显式桩「未配置」而不是靠 `window.electronAPI = {}` 的默认：
+    // 全量顺序下，前面用例泄漏的旧实例会用**当前的** window.electronAPI 再拉一次配置
+    // （本文件 L96 已记过这个污染形态），靠默认值会得到与单跑不同的结果。
+    window.electronAPI = {
+      zhihuGetConfig: vi.fn().mockResolvedValue({ code: 0, data: secretConfig({ configured: false, readable: false, maskedSecret: '', source: 'none' }) }),
+    }
+    const w = mountPanel()
+    await flushPromises()
+    expect(w.vm.zhihuSecretAvailable).toBe(false)
+    expect(w.find(HINT).exists()).toBe(false)
+    expect(w.find('[data-testid="zhihu-config-hint"]').exists()).toBe(true)
+  })
+
+  it('引导只解释下一步，不夹带旧入口的任何可点控件（不复活旧入口）', async () => {
+    const w = mountWithSecret()
+    state(w, 'zhihuFavlists', favlist())
+    await flushPromises()
+    const hint = w.find(HINT)
+    expect(hint.exists()).toBe(true)
+    // 引导是纯文案：内部不得有 button / a / input
+    expect(hint.element.querySelectorAll('button, a, input').length).toBe(0)
+    // 旧入口的 testid 仍然一个都不许出现
+    expect(w.find('[data-testid="zhihu-favlist-collect"]').exists()).toBe(false)
+    expect(w.find('[data-testid="zhihu-favlist-rewrite"]').exists()).toBe(false)
   })
 })

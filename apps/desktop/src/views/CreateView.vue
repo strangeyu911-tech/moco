@@ -1,12 +1,8 @@
 <template>
   <div class="create-page" :class="{ 'create-page--pipeline-list': view === 'pipelines' && !selectedPipeline, 'create-page--pipeline-detail': view === 'pipelines' && selectedPipeline }">
     <div class="page-header">
-      <div class="page-header-nav">
-        <button class="nav-arrow-btn" @click="goBack" :disabled="!canGoBack" title="上一页">←</button>
-        <button class="nav-arrow-btn" @click="goForward" :disabled="!canGoForward" title="下一页">→</button>
-      </div>
       <h1>视频创作</h1>
-      <p class="text-muted">基于 OpenMontage 流水线引擎，AI 驱动从脚本到成片的全流程</p>
+      <p class="text-muted">{{ $t('create.story2video.engineSubtitle') }}</p>
     </div>
 
     <!-- Remotion 状态提示 -->
@@ -44,8 +40,6 @@
 
       <!-- 流水线启动页：配置与执行 -->
       <div v-else class="pipeline-detail">
-        <button class="back-btn" @click="goToHistory()">← 返回</button>
-
         <div class="detail-header">
           <h2>{{ pipelineName(selectedPipeline.name) }}</h2>
           <p class="detail-desc">{{ pipelineDescription(selectedPipeline.name) }}</p>
@@ -71,7 +65,7 @@
               :class="story2videoTextCountLevel"
               :aria-live="story2videoTextCountLevel ? 'polite' : undefined"
               :title="story2videoTextCountLevel === 'is-warning' ? translateWithLocaleFallback('create.story2video.ui.charLimitWarning', '接近字数上限', 'Close to the character limit') : undefined"
-            >{{ story2videoTextCharacterCount }}/{{ MAX_STORY2VIDEO_TEXT_CHARACTERS }} 字符<span v-if="story2videoTextCountLevel === 'is-danger'">{{ translateWithLocaleFallback('create.story2video.ui.charLimitReached', '（已达字数上限）', ' (character limit reached)') }}</span></p>
+            >{{ story2videoTextCharacterCount }}/{{ story2videoTextMaxChars }} 字符<span v-if="story2videoTextCountLevel === 'is-danger'">{{ translateWithLocaleFallback('create.story2video.ui.charLimitReached', '（已达字数上限）', ' (character limit reached)') }}</span></p>
             <div v-if="isOrchestratedPipeline(selectedPipeline.name)" class="s2v-estimate-slot">
               <p v-if="s2vEstimateSummary" class="story2video-estimate" data-testid="s2v-estimate-row">
                 预估 {{ s2vEstimateSummary.sceneCount }} 个分镜 · 旁白约 {{ s2vEstimateSummary.durationMin }}~{{ s2vEstimateSummary.durationMax }} 秒 · 成本约 ¥{{ s2vEstimateSummary.totalCost.toFixed(2) }}
@@ -200,6 +194,58 @@
 
         <!-- Story2Video 配置：快速模式 + 五个折叠区 -->
         <S2vConfigPanels v-if="isOrchestratedPipeline(selectedPipeline?.name)" />
+
+        <!-- 数字人配置（avatar-spokesperson 专用）：形象 + 音色选择 -->
+        <div v-if="isAvatarPipeline" class="config-section" data-testid="avatar-config-section">
+          <h3>{{ avatarText('avatarSectionTitle') }}</h3>
+          <div class="config-grid">
+            <!-- provider 未配置：整区替换为引导，不渲染空下拉 -->
+            <div v-if="avatarProviderMissing" class="config-item" data-testid="avatar-provider-missing">
+              <p class="config-hint">{{ avatarText('avatarProviderMissing') }}</p>
+              <a href="#/model-providers" class="config-hint-link">{{ avatarText('avatarGotoSettings') }}</a>
+            </div>
+            <template v-else>
+              <div class="config-item" data-testid="avatar-select-item">
+                <label>{{ avatarText('avatarLabel') }}</label>
+                <select
+                  v-model="avatarId"
+                  class="form-select"
+                  data-testid="avatar-id-select"
+                  :disabled="avatarLoading || avatarOptions.length === 0"
+                >
+                  <option value="">{{ avatarText('avatarPlaceholder') }}</option>
+                  <option v-for="item in avatarOptions" :key="item.id" :value="item.id">{{ item.name }}</option>
+                </select>
+                <p v-if="avatarLoading" class="config-hint" data-testid="avatar-loading">{{ avatarText('avatarLoading') }}</p>
+                <span v-else-if="avatarError" class="inline-error" data-testid="avatar-error">{{ avatarLoadFailedText }}</span>
+                <span v-else-if="avatarCachedError" class="inline-error" data-testid="avatar-cached-error">{{ avatarCachedFailedText }}</span>
+                <span v-else-if="avatarOptions.length === 0" class="config-hint" data-testid="avatar-empty">{{ avatarText('avatarEmpty') }}</span>
+              </div>
+              <div class="config-item" data-testid="avatar-voice-item">
+                <label>{{ avatarText('avatarVoiceLabel') }}</label>
+                <select
+                  v-model="avatarVoiceId"
+                  class="form-select"
+                  data-testid="avatar-voice-select"
+                  :disabled="avatarLoading || avatarVoiceOptions.length === 0"
+                >
+                  <option value="">{{ avatarText('avatarVoicePlaceholder') }}</option>
+                  <option v-for="item in avatarVoiceOptions" :key="item.id" :value="item.id">{{ item.name }}</option>
+                </select>
+                <span v-if="!avatarLoading && avatarVoiceOptions.length === 0 && !avatarError" class="config-hint" data-testid="avatar-voice-empty">{{ avatarText('avatarVoiceEmpty') }}</span>
+              </div>
+              <div class="config-item">
+                <button
+                  type="button"
+                  class="s2v-btn-secondary s2v-btn-sm"
+                  data-testid="avatar-refresh"
+                  :disabled="avatarLoading"
+                  @click="refreshAvatarCatalog"
+                >{{ avatarText('avatarRefresh') }}</button>
+              </div>
+            </template>
+          </div>
+        </div>
 
         <!-- 输出配置 -->
         <div v-if="!isOrchestratedPipeline(selectedPipeline?.name)" class="config-section">
@@ -813,7 +859,7 @@
               v-model="s2vBatchTexts[index]"
               class="form-input textarea s2v-batch-text-area"
               rows="3"
-              :placeholder="translateWithLocaleFallback('create.story2video.batch.textPlaceholder', '输入第 ' + (index + 1) + ' 条文案（每条最多 ' + MAX_STORY2VIDEO_TEXT_CHARACTERS + ' 字）', 'Enter text ' + (index + 1) + ' (max ' + MAX_STORY2VIDEO_TEXT_CHARACTERS + ' chars each)', { index: index + 1, max: MAX_STORY2VIDEO_TEXT_CHARACTERS })"
+              :placeholder="translateWithLocaleFallback('create.story2video.batch.textPlaceholder', '输入第 ' + (index + 1) + ' 条文案（每条最多 ' + story2videoTextMaxChars + ' 字）', 'Enter text ' + (index + 1) + ' (max ' + story2videoTextMaxChars + ' chars each)', { index: index + 1, max: story2videoTextMaxChars })"
               :data-testid="'s2v-batch-text-' + index"
             ></textarea>
             <button
@@ -921,6 +967,7 @@ import UiModal from '@/components/UiModal.vue'
 import UiSelect from '@/components/UiSelect.vue'
 import CreateViewHistory from './CreateViewHistory.vue'
 import { buildPublishFromProject, publishDataToQuery } from '@/features/publish/publish-from-project'
+import { extractRunContextVideoPath } from '@/features/pipeline/run-context-video-path'
 import PodcastPublishAction from '@/components/PodcastPublishAction.vue'
 import { story2videoSaveAs, story2videoGetProject, draftList } from '@/api/publisher'
 import { PipelineSelector, StageProgress, SceneAssetSelection, S2vConfigPanels } from './video-creation'
@@ -948,12 +995,18 @@ import {
 } from '@/api/publisher'
 import { bgmLibraryRefs, bgmLibraryMethods, setupBgmLibraryDeps } from './video-creation/composables/useBgmLibrary'
 import { ttsVoicesRefs, ttsVoicesComputeds, ttsVoicesMethods, setupTtsVoicesDeps } from './video-creation/composables/useTtsVoices'
+// 能力级默认模型解析（voice-model-program-resolved，2026-10-18）：语音/视频域共用同一口径，
+// 与主进程 resolveProviderDefaultModel 逐项等价。
+import { resolveCapabilityDefaultModel } from './video-creation/composables/tts-voices-state'
 import { batchCreateRefs, batchCreateMethods, setupBatchCreateDeps } from './video-creation/composables/useBatchCreate'
-import { modelProviderList } from '@/api/model-providers'
+// 数字人（avatar-spokesperson）目录：形象/音色选择
+import { avatarCatalogRefs, avatarCatalogComputeds, avatarCatalogMethods } from './video-creation/composables/useAvatarCatalog'
+import { modelProviderList, modelProviderGetDefault } from '@/api/model-providers'
+import { resolveS2VDefaultProviderId } from './video-creation/s2v-default-provider'
 import { getApi } from '@/api/electron-bridge'
 import { settingsDialogRevision } from '@/stores/settings-dialog'
 import { showPipelineBackgroundToast } from '@/stores/pipeline-background-toast'
-import { opsCenterSyncRuntime, opsCenterSyncPipelineOptions } from '@/api/ops-center-sync'
+import { opsCenterSyncRuntime, opsCenterSyncPipelineOptions, onOpsCenterRuntimeUpdated } from '@/api/ops-center-sync'
 import { formatUserError } from '@/utils/user-facing-error'
 import {
   getPipelineCategory,
@@ -967,7 +1020,6 @@ import {
 import { getAppLocale } from '@/i18n'
 import { RESUME_BLOCKING_ERROR_PATTERN, HISTORY_STATUSES, filterHistoryByStatus, latestHistoryTimestamp, markStaleRunningAsInterrupted, fillFailedPausedStage, policySceneQuery, sortHistoryByEffectiveTime } from './history-utils'
 import {
-  MAX_STORY2VIDEO_TEXT_CHARACTERS,
   STORY2VIDEO_NOTIFICATION_KEYS,
   countStory2VideoTextCharacters,
   formatStory2VideoNotification,
@@ -977,6 +1029,8 @@ import {
   getStory2VideoNotificationUiText,
   resolveStory2VideoNotification,
 } from '@/story2video/story2video-notifications'
+// 字数控制（story-text-limit-control）：上限/预警阈值由运营中心运行时下发解析，缺省回落内置默认。
+import { resolveStory2VideoTextLimit, story2VideoTextWarnThreshold } from '@/story2video/story-text-limit'
 import {
   countSceneChars,
   estimateCharsPerSecond,
@@ -1038,7 +1092,9 @@ const S2V_SUMMARY_FIELDS = {
   basic: ['output.resolution', 'voiceSpeed', 'voiceVolume'],
   appearance: ['imageStyle', 'imageEffect'],
   videoEnhance: ['videoMode', 'videoFixedRatio', 'videoMinRatio', 'videoMaxRatio', 'shortVideoHandling'],
-  voice: ['voiceProvider', 'voiceModel', 'voiceId'],
+  // 背景音乐与音量归属「声音」分组（s2v-bgm-legacy-repair）：改动它们同样意味着该组已非默认。
+  // voiceModel 不再由用户选择（voice-model-program-resolved），不参与「是否默认」判定。
+  voice: ['voiceProvider', 'voiceId', 'bgmPath', 'bgmVolume'],
   advanced: ['splitLanguage', 'splitMode'],
   publish: ['platforms'],
 }
@@ -1077,6 +1133,9 @@ export default {
       pipelineRunId: null,
       // 流水线输入
       inputMode: 'text', pipelineText: '', pipelineImages: [], pipelineAudio: [], pipelineVideo: null,
+      // 数字人（avatar-spokesperson）：形象/音色选择。独立字段而非复用 s2vConfig.voiceId
+      // —— 后者是 story2video 专属，靠 story2videoTextConfig 下发，本流水线根本不读。
+      avatarId: '', avatarVoiceId: '',
       // 带文案进入（/create?draft=xxx 预填成功）：非文案型流水线在选择列表中灰显不可选
       textPrefilledFromDraft: false,
       // 配置
@@ -1183,18 +1242,26 @@ export default {
       s2vConfigProfileError: '',
       // 批量创作（2026-08-15 story2video-batch-create）：弹窗状态 / 输入源 / 队列展示
       s2vImageProviders: [], s2vVideoProviders: [],
+      // 「本次会话自动应用过的生成器默认值」（2026-10-18）。用于区分「用户显式选择」与
+      // 「上次由模型设置默认自动填入的值」：前者必须尊重，后者在设置里的默认变化后应当跟随。
+      // 不持久化 —— 快照回填的值按「显式选择」处理（见 PRD §9.10.3 交互优先级）。
+      s2vImageAutoProviderId: '', s2vVideoAutoProviderId: '', s2vVoiceAutoProviderId: '',
       s2vTemplateLibrary: [], s2vTemplateCategory: 'all', s2vCustomTemplateName: '',
+      // 折叠区默认态（s2v-voice-section-layout，2026-10-18）：除「基础」外全部默认收起。
+      // 原默认态同样是「仅 basic 展开」，此处把意图写成显式声明，并把恢复逻辑收紧为
+      // 「只打开快照里显式列出的分组」——旧实现是「先全关再逐项开」，等价但可读性差。
       s2vOpenSections: { basic: true, appearance: false, videoEnhance: false, voice: false, advanced: false, publish: false },
       // 运营中心选项控制（2026-08-31）：可见性与默认值
       s2vPipelineOptions: null,
       s2vPipelineOptionsLoading: false,
+      // 字数控制（story-text-limit-control，2026-10-18）：运营中心运行时下发的 storyTextLimit 块；
+      // null = 未配置/禁用/读取失败 → 计算属性回落内置默认（10000 字 / 90%）。
+      storyTextLimit: null,
       // 历史
       // 播客出期浮层（刀 3 第 4 片，PRD §6.4）：入口在历史卡片上，浮层挂在历史视图根部。
       // openedOnce 决定浮层是否已构造（按需挂载，理由见 PodcastEpisodeEntry 同名注释）。
       podcastEpisode: { visible: false, openedOnce: false, project: null, segments: [], videoPath: '', title: '', loadError: '' },
       history: [], historyLoading: false, historyLocalMode: false, historyFilter: 'all', historyRequestId: 0, historyPollTimer: null,
-      // 页面导航历史
-      viewHistory: [], viewHistoryIndex: -1,
       // 清理
       cleanups: [],
     }
@@ -1243,13 +1310,23 @@ export default {
     s2vVoiceCloneRenamingId: { get() { return ttsVoicesRefs.s2vVoiceCloneRenamingId.value }, set(v) { ttsVoicesRefs.s2vVoiceCloneRenamingId.value = v } },
     s2vVoiceCloneRenameDraft: { get() { return ttsVoicesRefs.s2vVoiceCloneRenameDraft.value }, set(v) { ttsVoicesRefs.s2vVoiceCloneRenameDraft.value = v } },
     s2vVoiceProviderExplicitEdge: { get() { return ttsVoicesRefs.s2vVoiceProviderExplicitEdge.value }, set(v) { ttsVoicesRefs.s2vVoiceProviderExplicitEdge.value = v } },
+    // 数字人目录（avatar-spokesperson）
+    avatarLoading: { get() { return avatarCatalogRefs.loading.value }, set(v) { avatarCatalogRefs.loading.value = v } },
+    avatarError: { get() { return avatarCatalogRefs.error.value }, set(v) { avatarCatalogRefs.error.value = v } },
+    avatarCachedError: { get() { return avatarCatalogRefs.cachedError.value }, set(v) { avatarCatalogRefs.cachedError.value = v } },
     // 计算属性：委托到 composable（只读，与迁出前的只读语义一致）。
     s2vVoiceProviderOptions: { get() { return ttsVoicesComputeds.s2vVoiceProviderOptions.value } },
     s2vVoiceCatalogRefreshable: { get() { return ttsVoicesComputeds.s2vVoiceCatalogRefreshable.value } },
-    s2vVoiceModelOptions: { get() { return ttsVoicesComputeds.s2vVoiceModelOptions.value } },
     s2vVoiceModelHidden: { get() { return ttsVoicesComputeds.s2vVoiceModelHidden.value } },
     s2vVoiceContextModel: { get() { return ttsVoicesComputeds.s2vVoiceContextModel.value } },
     s2vVoiceOptions: { get() { return ttsVoicesComputeds.s2vVoiceOptions.value } },
+    avatarOptions: { get() { return avatarCatalogComputeds.avatarOptions.value } },
+    avatarVoiceOptions: { get() { return avatarCatalogComputeds.avatarVoiceOptions.value } },
+    isAvatarPipeline() { return this.selectedPipeline?.name === 'avatar-spokesperson' },
+    /** 数字人 provider 未配置：整区替换为「前往配置」引导 */
+    avatarProviderMissing() {
+      return this.isAvatarPipeline && !this.avatarLoading && this.avatarOptions.length === 0 && !!this.avatarError
+    },
     styles() { return STYLES },
     s2vTemplates() {
       const templates = this.s2vTemplateCategory === 'all'
@@ -1447,8 +1524,18 @@ export default {
       // （运行/暂停/检查点）时同样禁用「启动流水线」，防止连点起出重复后台任务。
       if (this.startingPipeline) return false
       if (this.isOrchestratedPipeline(this.selectedPipeline.name) && this.orchestrationRunId) return false
+      // 历史背景音乐已确认丢失/不可用时阻断启动（s2v-bgm-legacy-repair）：
+      // 否则 compose 会按 bgmSkipped 静默跳过背景音乐，用户花完额度才发现成片没有音乐。
+      // unknown（核验通道不可用）不阻断，保持失败开放。
+      if (this.s2vLegacyBgmBlockedState) return false
       if (this.isOrchestratedPipeline(this.selectedPipeline.name)) {
         return this.inputMode === 'text' && this.pipelineText.trim().length > 0
+      }
+      // 数字人流水线：形象与音色必须都选好才能启动（与 preflight 校验同源，
+      // 在 UI 层先拦一次，避免用户白跑一次 LLM 调用才被告知缺参数）
+      if (this.isAvatarPipeline) {
+        if (!String(this.avatarId || '').trim()) return false
+        if (!String(this.avatarVoiceId || '').trim()) return false
       }
       if (this.inputMode === 'text') return this.pipelineText.trim().length > 0
       if (this.inputMode === 'images') return this.pipelineImages.length > 0
@@ -1461,13 +1548,22 @@ export default {
     story2videoTextCharacterCount() {
       return countStory2VideoTextCharacters(this.pipelineText)
     },
-    // 字数计数的视觉档位：<90% 中性、>=90% 警示、达上限危险（与 create-view.css 的色阶一一对应）。
+    // 字数控制运行时生效值（story-text-limit-control）：运营下发合法值 > 内置默认 10000 / 90%。
+    // 解析函数保证绝不抛错：块缺省/非法/越界时逐项回落默认。
+    story2videoTextMaxChars() {
+      return resolveStory2VideoTextLimit(this.storyTextLimit).maxChars
+    },
+    story2videoTextWarnPercent() {
+      return resolveStory2VideoTextLimit(this.storyTextLimit).warnPercent
+    },
+    // 字数计数的视觉档位：<预警阈值 中性、>=阈值 警示、达上限危险（与 create-view.css 的色阶一一对应）。
+    // 阈值由运营下发 warnPercent 驱动（默认 90，与历史固定 90% 的行为逐值一致）。
     story2videoTextCountLevel() {
-      const max = Number(this.MAX_STORY2VIDEO_TEXT_CHARACTERS) || 0
+      const max = Number(this.story2videoTextMaxChars) || 0
       const count = Number(this.story2videoTextCharacterCount) || 0
       if (max <= 0) return ''
       if (count >= max) return 'is-danger'
-      if (count >= Math.floor(max * 0.9)) return 'is-warning'
+      if (count >= story2VideoTextWarnThreshold(max, this.story2videoTextWarnPercent)) return 'is-warning'
       return ''
     },
     // 数值型配置是否落在允许区间：越界值会被后端拒绝，提前在启动提示里暴露。
@@ -1493,6 +1589,13 @@ export default {
       if (this.startingPipeline) return this.translateWithLocaleFallback('create.story2video.ui.blockedReason.starting', '启动请求处理中，请稍候', 'Start request is in flight, please wait')
       if (this.isOrchestratedPipeline(this.selectedPipeline.name) && this.orchestrationRunId) return this.translateWithLocaleFallback('create.story2video.ui.blockedReason.running', '已有流水线任务在运行中', 'A pipeline run is already active')
       if (this.s2vConfigRangeInvalid) return this.translateWithLocaleFallback('create.story2video.ui.blockedReason.invalidRange', '部分数值参数超出允许范围，请检查语速、音量与分镜长度', 'Some numeric options are out of range; check speed, volume and scene length')
+      if (this.s2vLegacyBgmBlockedState === 'missing') return this.$t('create.story2video.ui.blockedReason.bgmLost')
+      if (this.s2vLegacyBgmBlockedState === 'unusable') return this.$t('create.story2video.ui.blockedReason.bgmUnusable')
+      // 数字人缺参提示优先于通用「请输入文案」：用户看到的是「还差什么」而不是笼统原因
+      if (this.isAvatarPipeline) {
+        if (!String(this.avatarId || '').trim()) return this.$t('create.story2video.ui.avatarNeedAvatar')
+        if (!String(this.avatarVoiceId || '').trim()) return this.$t('create.story2video.ui.avatarNeedVoice')
+      }
       if (this.inputMode !== 'text') return this.translateWithLocaleFallback('create.story2video.ui.blockedReason.noAsset', '请先添加素材文件', 'Add the required material first')
       return this.translateWithLocaleFallback('create.story2video.ui.blockedReason.noText', '请先输入视频文案', 'Enter the script text first')
     },
@@ -1533,12 +1636,26 @@ export default {
     historyLocalModeText() {
       return formatStory2VideoNotification({ messageKey: STORY2VIDEO_NOTIFICATION_KEYS.HISTORY_LOCAL_MODE }).message
     },
-    // 历史/模板导入的 BGM 路径不在素材库时保留为独立选项，避免静默丢失已有配置
+    // 历史/模板导入的 BGM 路径不在素材库时保留为独立选项，避免静默丢失已有配置。
+    // 注意：这只回答“在不在库里”，不回答“文件还在不在”——后者由 s2vLegacyBgmStatus 承载。
     s2vLegacyBgmPath() {
       const current = String(this.s2vConfig.bgmPath || '').trim()
       if (!current) return ''
       if (this.s2vBgmLibrary.some(item => String(item.path) === current)) return ''
       return current
+    },
+    // 历史 BGM 状态桥接：get/set 双向委托 composable 单例（与 s2vBgmLibrary* 七元组同模式）。
+    s2vLegacyBgmStatus: {
+      get() { return bgmLibraryRefs.s2vLegacyBgmStatus.value },
+      set(v) { bgmLibraryRefs.s2vLegacyBgmStatus.value = v },
+    },
+    // 启动门禁只认「已确认」的丢失/不可用；checking/unknown/idle 均不阻断（失败开放）。
+    s2vLegacyBgmBlockedState() {
+      if (!this.s2vLegacyBgmPath) return ''
+      const state = this.s2vLegacyBgmStatus?.state
+      if (state === 'missing') return 'missing'
+      if (state === 'unusable') return 'unusable'
+      return ''
     },
     story2videoBgmLibraryDeleteConfirmMessage() {
       const target = this.s2vBgmLibrary.find(item => item.id === this.s2vBgmLibraryDeleteTargetId)
@@ -1819,8 +1936,6 @@ export default {
       if (this.quickMode === 'gallery') return this.quickImages.length > 0
       return false
     },
-    canGoBack() { return this.viewHistoryIndex > 0; },
-    canGoForward() { return this.viewHistoryIndex < this.viewHistory.length - 1; },
 
     // M-12：S2V 选项的浅层快照，供 watch 比较用。
     //
@@ -1871,6 +1986,11 @@ export default {
         this.$nextTick(() => this.scrollToSceneAssetPanel())
       }
     },
+    // 历史 BGM 路径变化（恢复快照/模板/配置、切换选择、清空）时触发一次只读核验。
+    // 核验只回答“文件还在不在/还能不能用”，不改写 bgmPath；旧响应由 composable 按代际丢弃。
+    s2vLegacyBgmPath(value) {
+      void this.verifyS2VLegacyBgm(value)
+    },
   },
   methods: {
     // ── 批量创作域方法代理（同名转发到 useBatchCreate）──────────────────
@@ -1905,8 +2025,38 @@ export default {
     loadS2VVoiceData(...args) { return ttsVoicesMethods.loadS2VVoiceData(...args) },
     refreshS2VVoiceCatalog(...args) { return ttsVoicesMethods.refreshS2VVoiceCatalog(...args) },
     handleS2VVoiceProviderChange(...args) { return ttsVoicesMethods.handleS2VVoiceProviderChange(...args) },
-    handleS2VVoiceModelChange(...args) { return ttsVoicesMethods.handleS2VVoiceModelChange(...args) },
     handleS2VVoiceSelection(...args) { return ttsVoicesMethods.handleS2VVoiceSelection(...args) },
+    // 数字人目录
+    loadAvatarCatalog(...args) { return avatarCatalogMethods.loadAvatarCatalog({ isAlive: () => this._avatarAlive !== false, ...(args && args[0]) }) },
+    refreshAvatarCatalog(...args) { return avatarCatalogMethods.refreshAvatarCatalog(...args) },
+    /**
+     * 数字人文案：一律走 locale（zh/en 成对）。
+     * 不接中文 fallback —— CI Gate 7 的 CJK 基线扫描会拦截渲染端新增的
+     * 中文字符串字面量，locale 是文案的唯一真源。
+     */
+    avatarText(key) {
+      return this.$t('create.story2video.ui.' + key)
+    },
+    /**
+     * 错误文案：composable 存的是「locale key 或原始错误码」，这里翻译成人话。
+     * 不认识的字符串（如 provider 透出的英文错误）原样显示，不臆造中文翻译。
+     */
+    avatarErrorText(raw) {
+      const text = String(raw || '').trim()
+      if (!text) return ''
+      if (text.startsWith('avatarErr')) return this.$t('create.story2video.ui.' + text)
+      return text
+    },
+    avatarLoadFailedText() {
+      return this.avatarErrorText(this.avatarError)
+    },
+    avatarCachedFailedText() {
+      return this.avatarErrorText(this.avatarCachedError)
+    },
+    /** 数字人形象选择变化时同步清理音色选择（不同形象可用音色可能不同） */
+    handleAvatarChange() {
+      // 形象换了但音色仍选着旧值时不必强清；HeyGen 音色与形象无绑定关系，保留即可
+    },
     selectS2VVoice(...args) { return ttsVoicesMethods.selectS2VVoice(...args) },
     chooseS2VVoiceCloneSamples(...args) { return ttsVoicesMethods.chooseS2VVoiceCloneSamples(...args) },
     nextS2VVoiceCloneName(...args) { return ttsVoicesMethods.nextS2VVoiceCloneName(...args) },
@@ -1918,16 +2068,6 @@ export default {
     renameS2VVoiceClone(...args) { return ttsVoicesMethods.renameS2VVoiceClone(...args) },
     formatS2VVoiceCloneBytes(...args) { return ttsVoicesMethods.formatS2VVoiceCloneBytes(...args) },
     formatS2VVoiceCloneDuration(...args) { return ttsVoicesMethods.formatS2VVoiceCloneDuration(...args) },
-    // 页面导航箭头
-    goBack() { if (this.viewHistoryIndex > 0) { this.viewHistoryIndex--; this.applyViewState(this.viewHistory[this.viewHistoryIndex]); } },
-    goForward() { if (this.viewHistoryIndex < this.viewHistory.length - 1) { this.viewHistoryIndex++; this.applyViewState(this.viewHistory[this.viewHistoryIndex]); } },
-    applyViewState(state) {
-      if (!state) return;
-      this.detachPipelineView(state.view)
-      if (state.view) this.view = state.view;
-      if (state.selectedPipeline !== undefined) this.selectedPipeline = state.selectedPipeline;
-      if (state.view === 'history') this.loadHistory();
-    },
     // 离开流水线创作视图只脱离 renderer 跟踪，不取消主进程 run；重新进入时回到新建列表。
     detachPipelineView(nextView) {
       if (this.view !== 'pipelines' || nextView === 'pipelines') return
@@ -1940,15 +2080,7 @@ export default {
       this.detachPipelineView(nextView)
       this.view = nextView
       if (nextView === 'history') this.loadHistory()
-      this.pushViewState({ view: nextView })
     },
-    pushViewState(state) {
-      this.viewHistory = this.viewHistory.slice(0, this.viewHistoryIndex + 1);
-      this.viewHistory.push(state);
-      this.viewHistoryIndex = this.viewHistory.length - 1;
-    },
-    // 返回历史记录页
-    goToHistory() { this.detachPipelineView('history'); this.selectedPipeline = null; this.view = 'history'; this.loadHistory(); this.pushViewState({ view: 'history' }); },
     // unify-video-pipeline-progress-modal：把 URL 上的 ?filter= 落到历史筛选态。
     // 单一入口供 mounted 与 $route.query.filter watch 共用；非法值静默忽略（保持当前筛选）。
     applyHistoryFilterFromRoute(value) {
@@ -2008,11 +2140,29 @@ export default {
     },
     s2vSubgroupLabel(subgroup) {
       const key = `create.story2video.subgroups.${subgroup}`
-      const fallback = { splitTiming: this.$t('create.story2video.ui.subgroupSplitTiming'), templateOutput: this.$t('create.story2video.ui.subgroupTemplateOutput') }[subgroup] || subgroup
-      const english = { splitTiming: 'Split & Timing', templateOutput: 'Template & Output' }[subgroup] || subgroup
-      return this.translateWithLocaleFallback(key, fallback, english)
+      // 子分区标题（声音区三个 + 高级区两个）：主键一律 create.story2video.subgroups.*，
+      // fallback 只作兜底，**不得自引用同一 key**（自引用等于没有 fallback）。
+      // 2026-10-18（s2v-voice-section-layout）：原先 splitTiming/templateOutput 的 fallback 指向
+      // ui.subgroupSplitTiming / ui.subgroupTemplateOutput，而二者与 subgroups.* 同值重复、主键
+      // 恒命中 ⇒ 那两键从未生效，已从 locale 删除并在此改为英文字面量（locale 文件受
+      // check-max-lines 的 500 行上限约束，删两行正好腾出本次新增的空间）。
+      const fallback = {
+        splitTiming: 'Split & Timing',
+        templateOutput: 'Template & Output',
+        voiceNarration: 'Narration',
+        voiceBgm: 'Background music',
+        voiceClone: 'Voice cloning',
+      }[subgroup] || subgroup
+      // fallback 与 english 同值：中文由 locale 主键给出，两者只在缺键时兜底，
+      // 因此不再维护两张同值表（原先的重复表就是上一版 fallback 自引用的来源）。
+      return this.translateWithLocaleFallback(key, fallback, fallback)
     },
     s2vSectionSummary(section) {
+      // 既有声音摘要模板字面量保持逐字节不变（CJK 基线按「文件+文案内容」对账，
+      // 且 create-story2video-detail 像素基线含折叠态摘要）。
+      // voice-model-program-resolved（2026-10-18）：摘要仍展示当前生效的模型 ID —— 它不是用户
+      // 可选项而是程序解析结果的只读回显，对用户有信息价值；「是否默认」判定已不再计入 voiceModel。
+      const voiceSummary = `${this.s2vConfig.voiceProvider || this.$t('create.story2video.voice.autoEdgeProvider')}${this.s2vConfig.voiceModel ? ` · ${this.s2vConfig.voiceModel}` : ''}${this.s2vConfig.voiceId ? ' · 已选音色' : ''}`
       const summaries = {
         basic: `${this.activeOutputConfig.resolution || '720x1280'} · 语速 ${Number(this.s2vConfig.voiceSpeed).toFixed(1)}x · 音量 ${Number(this.s2vConfig.voiceVolume).toFixed(2)}`,
         appearance: `${this.s2vConfig.imageStyle || this.$t('create.story2video.ui.imageStyleDefault')} · ${this.s2vConfig.imageEffect || this.$t('create.story2video.ui.imageEffectNone')}`,
@@ -2021,11 +2171,25 @@ export default {
           : (this.s2vConfig.videoMode === 'fixed'
             ? `固定 ${this.s2vConfig.videoFixedRatio}%` + (this.s2vConfig.shortVideoHandling === 'stop-at-end' ? ' · 播完停止' : '')
             : `AI 判断 ${this.s2vConfig.videoMinRatio}%-${this.s2vConfig.videoMaxRatio}%` + (this.s2vConfig.shortVideoHandling === 'stop-at-end' ? ' · 播完停止' : '')),
-        voice: `${this.s2vConfig.voiceProvider || this.$t('create.story2video.voice.autoEdgeProvider')}${this.s2vConfig.voiceModel ? ` · ${this.s2vConfig.voiceModel}` : ''}${this.s2vConfig.voiceId ? ' · 已选音色' : ''}`,
+        // 声音分组摘要含背景音乐（s2v-bgm-legacy-repair）：BGM 已从「画面」归位到「声音」。
+        // 仅在已选背景音乐时追加片段——默认态摘要与折叠行保持逐像素不变（像素基线不重取证）。
+        voice: this.s2vBgmLibrarySummaryText() ? [voiceSummary, this.s2vBgmLibrarySummaryText()].join(' · ') : voiceSummary,
         advanced: `${this.s2vConfig.splitLanguage === 'auto' ? this.$t('create.story2video.ui.splitLanguageAuto') : this.s2vConfig.splitLanguage} · ${this.s2vConfig.splitMode || this.$t('create.story2video.ui.splitModeBalanced')}`,
         publish: this.s2vConfig.platforms?.length ? this.$t('create.story2video.ui.summaryPlatforms', { count: this.s2vConfig.platforms.length }) : this.$t('create.story2video.ui.summaryNoPlatform'),
       }
       return summaries[section] || ''
+    },
+    // 「声音」分组摘要里的背景音乐片段：库内曲名 > 历史可用 > 已丢失/不可用；未选 BGM 返回空串
+    // （空串不参与拼接，保证默认折叠态摘要与像素基线逐字节一致）。
+    s2vBgmLibrarySummaryText() {
+      const path = String(this.s2vConfig.bgmPath || '').trim()
+      if (!path) return ''
+      const item = (this.s2vBgmLibrary || []).find(entry => String(entry.path) === path)
+      if (item) return this.$t('create.story2video.ui.summaryBgmLibrary', { name: item.name })
+      const state = this.s2vLegacyBgmStatus?.state
+      if (state === 'missing') return this.$t('create.story2video.ui.summaryBgmLegacyMissing')
+      if (state === 'unusable') return this.$t('create.story2video.ui.summaryBgmLegacyUnusable')
+      return this.$t('create.story2video.ui.summaryBgmLegacyAvailable')
     },
     // 该组摘要对应的字段全部等于初始默认值 → 视为未改动（供「（默认）」后缀使用）。
     // 基线取 $options.data()，与“保存配置”的默认值口径一致，不另起一份真相。
@@ -2074,7 +2238,6 @@ export default {
         return
       }
       if (p?.name === 'film-engineering') {
-        this.pushViewState({ view: 'pipelines', selectedPipeline: p });
         this.$router.push('/film-engineering')
         return
       }
@@ -2100,7 +2263,10 @@ export default {
       this.dismissedProviderWarnings = false
       this.closeStory2VideoErrorDialog()
       if (this.isOrchestratedPipeline(p?.name) && this.inputMode !== 'text') this.inputMode = 'text'
-      // 选中编排流水线时执行 6000 码点上限（含带文案预填场景：预填时不截断，选中时统一截断+提示）
+      // 选中数字人流水线时加载形象/音色目录（带缓存，重复选中不会重复打接口）
+      if (p?.name === 'avatar-spokesperson') this.loadAvatarCatalog()
+      // 选中编排流水线时执行生效上限（默认 10000，可被运营中心 storyTextLimit 覆盖）码点截断
+      // （含带文案预填场景：预填时不截断，选中时统一截断+提示）
       if (this.isOrchestratedPipeline(p?.name)) this.enforceStory2VideoTextLimit()
       // Bug 反哺（2026-08-09）：mounted 时 selectedPipeline 为 null，restore 守卫直接 return，
       // 导致「上次使用的选项」保存成功但从未恢复。选中编排流水线时主动触发恢复；
@@ -2134,7 +2300,7 @@ export default {
         if (typeof draft.title === 'string' && draft.title.trim()) {
           this.s2vConfig.title = [...draft.title.trim()].slice(0, 20).join('')
         }
-        // 注意：此处不做 6000 码点截断——该上限仅作用于编排流水线（story2video-compose），
+        // 注意：此处不做码点截断——该上限仅作用于编排流水线（story2video-compose），
         // 其余文案型流水线（talking-head 等）无此限制。截断推迟到 selectPipeline 选中
         // 编排流水线时由 enforceStory2VideoTextLimit() 执行（见 selectPipeline）。
         this.inputMode = 'text'
@@ -2206,6 +2372,12 @@ export default {
       // 与 startPipeline 内部 startingPipeline 守卫构成双重防线：登录门在途也拦截连点，
       // 防止绕过登录门直接调用 startPipeline 的入口跳过 busy 检查。
       if (this.startingPipeline) return false
+      // 历史 BGM 核验可能存在竞态（用户点得快时仍在 checking）：启动前 await 一次，
+      // 确保「已丢失/不可用」不会因为核验未返回而静默进入合成。
+      // 无历史路径时不额外 await，保持既有启动时序（等待点数量不变）。
+      if (this.s2vLegacyBgmPath) {
+        await this.ensureS2VLegacyBgmVerified()
+      }
       if (!(await this.ensureLoginForStart())) return false
       await this.startPipeline()
       return true
@@ -2310,6 +2482,14 @@ export default {
           // 01-docs/PRD-STORY2VIDEO-PORTRAIT-IMAGE-ASPECT-2026-10-06.md §3.4。
           aspectRatio: getStory2VideoOutputAspectRatio(output.resolution),
           fps: output.fps, format: output.format,
+        }
+        // 数字人（avatar-spokesperson）：下发生成的三要素来源。
+        // 不能复用 s2vConfig.voiceId —— 那是 story2video 专属，靠
+        // story2videoTextConfig 下发，本流水线走 startExplainerPipeline 根本不读。
+        if (this.selectedPipeline.name === 'avatar-spokesperson') {
+          params.avatarId = String(this.avatarId || '').trim()
+          params.voiceId = String(this.avatarVoiceId || '').trim()
+          params.videoProvider = 'heygen'
         }
         const res = await pipelineStartOrchestrated(this.selectedPipeline.name, this.cloneForIpc(params))
         const outcome = res?.data
@@ -2688,6 +2868,12 @@ export default {
           delete config.voiceProvider; delete config.voiceModel; delete config.voiceId
         }
         this._applyS2VSnapshot(config, this.s2vConfig)
+        // 快照里的生成器选择视为「上次的起点」，登记为自动应用值（2026-10-18）：
+        // 用户改了「模型设置」里的默认后，重启/重进页面不该继续钉住旧默认；
+        // 同一次会话内用户手动改过下拉则与自动值不同，按显式选择保留。
+        this.s2vImageAutoProviderId = this.s2vConfig.imageProvider || ''
+        this.s2vVideoAutoProviderId = this.s2vConfig.videoProvider || ''
+        this.s2vVoiceAutoProviderId = this.s2vConfig.voiceProvider || ''
         // 2026-08-10 Bug 反哺：陈旧快照枚举值（如 imageStyle=anime-mslpadvn）不在当前选项
         // 列表时先归一化，避免下拉框空白选中项，也避免分镜自愈使用陈旧语言值估算。
         this.normalizeS2VRestoredEnums()
@@ -2709,14 +2895,28 @@ export default {
           this.s2vConfig.videoProvider = ''
           this.s2vConfig.videoModel = ''
         }
+        // 语音模型归一（voice-model-program-resolved，2026-10-18）：旧快照/配置档案里的
+        // voiceModel 是用户从前端下拉手选的值，可能是任意 models 项（旧候选为
+        // `[capability_models.tts, ...models]`），恢复时若不重新解析就会把非 TTS 模型
+        // （如 MiniMax-Hailuo-2.3）当语音模型直达生成。这里统一按运营默许模型重算。
+        if (config.voiceProvider && voiceProviders.has(config.voiceProvider)) {
+          this.s2vConfig.voiceModel = this.getS2VDefaultVoiceModel(this.s2vConfig.voiceProvider)
+        } else {
+          this.s2vConfig.voiceModel = ''
+        }
         this._applyS2VSnapshot(snapshot.s2vOutputConfig, this.s2vOutputConfig)
         // 运营开关：恢复的旧快照若含超出上限的分辨率（如历史 4K），归一化到最高允许档
         this.s2vOutputConfig.resolution = normalizeResolution(this.s2vOutputConfig.resolution, this.maxOutputResolution)
         // 输出枚举（fps/format）同样做白名单归一化
         this.normalizeS2VRestoredEnums()
-        // 恢复表单折叠状态（类型守卫：仅接受字符串数组）
+        // 恢复表单折叠状态（s2v-voice-section-layout，2026-10-18）：
+        // 默认态是「除基础外全收」，因此恢复 = 先显式复位到默认态，再只打开快照里
+        // 列出的分组。语义与旧实现（"逐项置 true"）等价——旧实现依赖 data() 默认值
+        // 恰好是全关；一旦默认值变化（如新增分组默认展开），旧写法会把上一次的展开态
+        // 漏成"全开"，故这里把"复位"写成语义的一部分而不是隐含前提。
         if (applyUi && Array.isArray(snapshot.ui?.expandedGroups)) {
           const known = new Set(Object.keys(this.s2vOpenSections))
+          for (const section of known) this.s2vOpenSections[section] = section === 'basic'
           for (const section of snapshot.ui.expandedGroups) {
             if (typeof section === 'string' && known.has(section)) this.s2vOpenSections[section] = true
           }
@@ -2840,6 +3040,18 @@ export default {
         this.s2vPipelineOptionsLoading = false
       }
     },
+    async loadStoryTextLimit() {
+      // 字数控制（story-text-limit-control，2026-10-18）：与 loadPipelineOptions 同阶段拉取，
+      // 从运行时响应 data.storyTextLimit（驼峰）读取；通道不可用/块为 null/结构非法时
+      // 一律静默回落内置默认（fail-open，不弹错、不阻塞创作）。
+      try {
+        const res = await opsCenterSyncRuntime()
+        const data = res && res.code === 0 ? res.data : null
+        this.storyTextLimit = data && typeof data === 'object' ? (data.storyTextLimit ?? null) : null
+      } catch (_) {
+        this.storyTextLimit = null
+      }
+    },
     // 应用运营中心下发的选项默认值（2026-08-31）
     applyS2VPipelineDefaults() {
       const defaults = this.s2vPipelineOptions?.defaults
@@ -2893,6 +3105,12 @@ export default {
           }
         }
       }
+      // 语音模型不被运营 pipeline_options 覆盖（voice-model-program-resolved，2026-10-18）：
+      // 模型由运营「能力默认模型」经目录同步决定；此处若沿用运营下发的 voice.voiceModel，
+      // 会绕过 resolveVoiceModelForProvider 造成两套真源。重新解析一次即为最终值。
+      if (this.s2vConfig.voiceProvider) {
+        this.s2vConfig.voiceModel = this.getS2VDefaultVoiceModel(this.s2vConfig.voiceProvider)
+      }
     },
     // 检查选项是否可见（2026-08-31）
     s2vOptionVisible(optionKey) {
@@ -2924,6 +3142,9 @@ export default {
         this.s2vOutputConfig = JSON.parse(JSON.stringify(defaults.s2vOutputConfig || {}))
         // 重置后回到「未选择」状态，多模态默认重新生效
         this.s2vVoiceProviderExplicitEdge = false
+        this.s2vImageAutoProviderId = ''
+        this.s2vVideoAutoProviderId = ''
+        this.s2vVoiceAutoProviderId = ''
         await this.loadS2VVoiceData()
         try { await storeSetSetting('story2video.lastOptions.v1', null) } catch { /* 清理失败可忽略 */ }
       } finally { this.s2vRestoring = false }
@@ -2945,8 +3166,11 @@ export default {
           this.showStory2VideoErrorDialog({ messageKey: STORY2VIDEO_NOTIFICATION_KEYS.TEXT_REQUIRED })
           return
         }
-        if (countStory2VideoTextCharacters(text) > MAX_STORY2VIDEO_TEXT_CHARACTERS) {
-          this.showStory2VideoErrorDialog({ messageKey: STORY2VIDEO_NOTIFICATION_KEYS.TEXT_TOO_LONG, messageParams: { max: MAX_STORY2VIDEO_TEXT_CHARACTERS } })
+        // 生效上限（运营下发 > 内置默认 10000，story-text-limit-control）：最后一道前端闸，
+        // 即使截断路径被绕过（预填/批量）也不把超限文案送进流水线。
+        const textLimit = this.story2videoTextMaxChars
+        if (countStory2VideoTextCharacters(text) > textLimit) {
+          this.showStory2VideoErrorDialog({ messageKey: STORY2VIDEO_NOTIFICATION_KEYS.TEXT_TOO_LONG, messageParams: { max: textLimit } })
           return
         }
         this.orchestrationError = ''
@@ -3120,17 +3344,10 @@ export default {
       return this.s2vVideoProviders.find(provider => provider?.id === providerId) || null
     },
     getS2VDefaultVideoModel(providerId = this.s2vConfig.videoProvider) {
-      const provider = this.getS2VVideoProvider(providerId)
-      const models = Array.isArray(provider?.models)
-        ? provider.models.filter(model => typeof model === 'string' && model)
-        : []
-      // 多模态：默认取 capability_models.video（能力默认模型），models 首项可能是 image/llm 模型。
-      if (provider?.category === 'multimodal' && provider.capability_models && typeof provider.capability_models.video === 'string') {
-        const videoModel = provider.capability_models.video
-        return models.includes(videoModel) ? videoModel : (videoModel || models[0] || '')
-      }
-      const configuredDefault = typeof provider?.defaultModel === 'string' ? provider.defaultModel : ''
-      return models.includes(configuredDefault) ? configuredDefault : (models[0] || '')
+      // 与语音域共用同一口径（voice-model-program-resolved，2026-10-18）：
+      // 旧实现读 `provider.defaultModel`（该字段 IPC 从不返回，恒 undefined）并会猜 models[0]，
+      // 与主进程 resolveProviderDefaultModel 分叉。现统一走 resolveCapabilityDefaultModel。
+      return resolveCapabilityDefaultModel(this.getS2VVideoProvider(providerId), 'video')
     },
     handleS2VVideoProviderChange() {
       const nextProviderId = this.getS2VVideoProvider()?.id || ''
@@ -3161,6 +3378,22 @@ export default {
       ])
       if (providerRequestId !== this.s2vVoiceProviderRequestId || this._s2vAlive === false) return
 
+      // 主进程侧「谁是该能力默认」的真源（2026-10-18 修复）。getDefault 内部已实现
+      // 双默认语义：多模态 capability_defaults / is_default > 普通 provider is_default。
+      // 失败（IPC 不可用 / 未初始化）时返回 data:null，由 resolveS2VDefaultProviderId
+      // 自行在列表内找默认，再兜底首项 —— 不因这一次查询失败就丢掉默认解析。
+      const [defaultImage, defaultVoice, defaultVideo] = await Promise.allSettled([
+        modelProviderGetDefault('image'),
+        modelProviderGetDefault('tts'),
+        modelProviderGetDefault('video'),
+      ])
+      if (providerRequestId !== this.s2vVoiceProviderRequestId || this._s2vAlive === false) return
+      const defaultProviderId = (result) => (
+        result.status === 'fulfilled' && result.value?.code === 0 && result.value?.data?.id
+          ? String(result.value.data.id)
+          : ''
+      )
+
       // 只展示「已启用且已配置」的服务商（is_configured=true：有可用 API Key 或免 Key 本地模型）。
       // 未配置/Key 解密失败的 provider 不进入能力下拉，避免旧配置恢复选中后流水线反复重试
       // 「尚未配置 API Key」导致卡在 generate_assets（2026-08-09 排查：debug profile 残留失效 key）。
@@ -3175,28 +3408,61 @@ export default {
       if (nextImageProviders) {
         this.s2vImageProviders = nextImageProviders
         // 图片生成器下拉归一化：已不存在/未配置的 provider 清空（含 imageModel），
-        // 避免下拉出现空白选中项；无显式选择时默认取第一个可用图片 provider（2026-08-12 Bug 修复）。
+        // 避免下拉出现空白选中项；无显式选择时默认取模型设置里该能力的默认 provider
+        // （2026-10-18 修复：此前只取列表首项，用户在设置里改默认不生效）。
         const imageProviderIds = new Set(this.s2vImageProviders.map(p => p.id))
+        // 当前值若等于「上次自动应用的值」，它就不是用户显式选择 ⇒ 应随设置里的默认重新解析。
+        // 这一条是「设置弹窗关闭后重拉列表」路径（settingsDialogRevision watcher）的关键：
+        // 只判 `!imageProvider` 会让旧默认永远钉住，用户改了设置也不生效。
+        const imageIsAutoApplied = this.s2vConfig.imageProvider !== ''
+          && this.s2vConfig.imageProvider === this.s2vImageAutoProviderId
         if (this.s2vConfig.imageProvider && !imageProviderIds.has(this.s2vConfig.imageProvider)) {
           this.s2vConfig.imageProvider = ''
           this.s2vConfig.imageModel = ''
+          this.s2vImageAutoProviderId = ''
         }
-        if (!this.s2vConfig.imageProvider && this.s2vImageProviders[0]) this.s2vConfig.imageProvider = this.s2vImageProviders[0].id
+        if (!this.s2vConfig.imageProvider || imageIsAutoApplied) {
+          if (this.s2vImageProviders[0]) {
+            const resolvedImageProvider = resolveS2VDefaultProviderId(
+              this.s2vImageProviders,
+              'image',
+              defaultProviderId(defaultImage)
+            )
+            if (resolvedImageProvider !== this.s2vConfig.imageProvider) {
+              this.s2vConfig.imageProvider = resolvedImageProvider
+              this.s2vConfig.imageModel = ''
+            }
+            this.s2vImageAutoProviderId = resolvedImageProvider
+          }
+        }
       }
 
       const nextVideoProviders = enabledProviders(videoResult)
       if (nextVideoProviders) {
         this.s2vVideoProviders = nextVideoProviders
         // 视频生成器与图片对齐（2026-08-12 审查 M2）：陈旧 provider 清空（含 videoModel），
-        // 未显式选择时默认取第一个可用视频 provider。
+        // 未显式选择时默认取模型设置里 video 能力的默认 provider（2026-10-18 起同源修复）。
         const videoProviderIds = new Set(this.s2vVideoProviders.map(p => p.id))
+        const videoIsAutoApplied = this.s2vConfig.videoProvider !== ''
+          && this.s2vConfig.videoProvider === this.s2vVideoAutoProviderId
         if (this.s2vConfig.videoProvider && !videoProviderIds.has(this.s2vConfig.videoProvider)) {
           this.s2vConfig.videoProvider = ''
           this.s2vConfig.videoModel = ''
+          this.s2vVideoAutoProviderId = ''
         }
-        if (!this.s2vConfig.videoProvider && this.s2vVideoProviders[0]) {
-          this.s2vConfig.videoProvider = this.s2vVideoProviders[0].id
-          this.s2vConfig.videoModel = this.getS2VDefaultVideoModel(this.s2vConfig.videoProvider)
+        if (!this.s2vConfig.videoProvider || videoIsAutoApplied) {
+          if (this.s2vVideoProviders[0]) {
+            const resolvedVideoProvider = resolveS2VDefaultProviderId(
+              this.s2vVideoProviders,
+              'video',
+              defaultProviderId(defaultVideo)
+            )
+            if (resolvedVideoProvider !== this.s2vConfig.videoProvider) {
+              this.s2vConfig.videoProvider = resolvedVideoProvider
+              this.s2vConfig.videoModel = this.getS2VDefaultVideoModel(resolvedVideoProvider)
+            }
+            this.s2vVideoAutoProviderId = resolvedVideoProvider
+          }
         }
       }
 
@@ -3204,23 +3470,28 @@ export default {
       if (nextVoiceProviders) {
         this.s2vVoiceProviders = nextVoiceProviders
         const configuredProvider = this.getS2VVoiceProvider()
-        // 默认选择多模态 TTS 模型（2026-08-12）：当模型设置保存了支持 TTS 能力的多模态模型
-        // Key（category=multimodal 且 capabilities 含 tts，如 MiniMax）时，语音生成器默认选中它，
-        // 其次才回退到普通 TTS 服务商首项；用户显式保存过的选择（configuredProvider / 显式 Edge）
-        // 始终优先。多模态候选额外要求 capability_models.tts 存在，避免缺默认 TTS 模型时
-        // getS2VDefaultVoiceModel 落到 image/video 模型（fail-closed 回退普通 TTS 首项）。
-        const multimodalProvider = nextVoiceProviders.find(
-          provider => provider?.category === 'multimodal' && typeof provider?.capability_models?.tts === 'string'
-        ) || null
-        const explicitEdge = this.s2vVoiceProviderExplicitEdge === true && !this.s2vConfig.voiceProvider
+        // 语音生成器默认值（2026-10-18 修复）：跟随「模型设置」里 TTS 能力的默认 ——
+        // 用户在设置中把某类别 TTS 模型设为默认、或把多模态模型（如 MiniMax）的 TTS
+        // 能力设为默认时，这里默认选中它，而不是「第一个多模态」或列表首项。
+        // 用户显式选择优先，但「上次由默认自动填入的值」不算显式选择：设置弹窗关闭后
+        // 会重跑本方法，若把旧默认当成用户选择，用户改设置就永远不生效（本次 Bug 主路径）。
+        const currentVoiceId = this.s2vConfig.voiceProvider || ''
+        const voiceIsAutoApplied = currentVoiceId !== '' && currentVoiceId === this.s2vVoiceAutoProviderId
+        const voiceExplicit = Boolean(configuredProvider) && !voiceIsAutoApplied
+        const explicitEdge = this.s2vVoiceProviderExplicitEdge === true && !currentVoiceId
+        const resolvedVoiceId = resolveS2VDefaultProviderId(
+          this.s2vVoiceProviders,
+          'tts',
+          defaultProviderId(defaultVoice)
+        )
         const nextProviderId = explicitEdge
           ? ''
-          : (configuredProvider?.id || multimodalProvider?.id || this.s2vVoiceProviders[0]?.id || '')
-        const nextModel = nextProviderId
-          ? (this.s2vVoiceModelOptions.includes(this.s2vConfig.voiceModel)
-            ? this.s2vConfig.voiceModel
-            : this.getS2VDefaultVoiceModel(nextProviderId))
-          : ''
+          : (voiceExplicit ? configuredProvider.id : resolvedVoiceId)
+        if (!voiceExplicit && !explicitEdge) this.s2vVoiceAutoProviderId = nextProviderId
+        // 语音模型由程序解析（voice-model-program-resolved，2026-10-18）：不再读用户保存的
+        // voiceModel，一律按运营默许模型解析；历史快照里的陈旧模型值在此被静默归一
+        // （不弹错、不中断）。「语音模型」下拉已整体移除，用户无法再手选模型。
+        const nextModel = nextProviderId ? this.getS2VDefaultVoiceModel(nextProviderId) : ''
         const contextChanged = nextProviderId !== this.s2vConfig.voiceProvider || nextModel !== this.s2vConfig.voiceModel
         this.s2vConfig.voiceProvider = nextProviderId
         this.s2vConfig.voiceModel = nextModel
@@ -3277,10 +3548,13 @@ export default {
     },
     enforceStory2VideoTextLimit() {
       if (!this.selectedPipeline || !this.isOrchestratedPipeline(this.selectedPipeline.name)) return
+      // 生效上限（默认 10000，可由运营中心 storyTextLimit 下发覆盖）：按 Unicode 码点截断，
+      // 不用 slice(0, max) 切 UTF-16（会切碎 emoji 代理对）。
+      const maxChars = this.story2videoTextMaxChars
       const characters = Array.from(this.pipelineText)
-      if (characters.length <= MAX_STORY2VIDEO_TEXT_CHARACTERS) return
-      this.pipelineText = characters.slice(0, MAX_STORY2VIDEO_TEXT_CHARACTERS).join('')
-      this.showStory2VideoErrorDialog({ messageKey: STORY2VIDEO_NOTIFICATION_KEYS.TEXT_TOO_LONG, messageParams: { max: MAX_STORY2VIDEO_TEXT_CHARACTERS } })
+      if (characters.length <= maxChars) return
+      this.pipelineText = characters.slice(0, maxChars).join('')
+      this.showStory2VideoErrorDialog({ messageKey: STORY2VIDEO_NOTIFICATION_KEYS.TEXT_TOO_LONG, messageParams: { max: maxChars } })
     },
     showStory2VideoErrorDialog(notification = {}) {
       const resolved = resolveStory2VideoNotification(notification)
@@ -3701,16 +3975,10 @@ export default {
         // 埋点失败不影响用户操作
       }
     },
+    // 成片提取统一走共享纯函数（2026-10-17 抽出）：热门选题一键生成视频支持多流水线后，
+    // 两条链路必须共用同一 publish/compose/export/render/report 判据，避免一侧取不到路径。
     extractOrchestrationVideoPath(context) {
-      const publish = context?.publish?.data || context?.publish
-      const compose = context?.compose?.data || context?.compose
-      const clipExport = context?.export?.data || context?.export
-      const cinematicRender = context?.render?.data || context?.render
-      const smokeReport = context?.report?.data || context?.report
-      return publish?.videoPath || publish?.path || compose?.videoPath || compose?.path ||
-        clipExport?.videoPath || clipExport?.path ||
-        cinematicRender?.videoPath || cinematicRender?.path ||
-        smokeReport?.videoPath || smokeReport?.path || null
+      return extractRunContextVideoPath(context)
     },
     applyOrchestrationOutcome(outcome, expectedRunId = null, expectedActionRequestId = null) {
       // 卸载后残留响应不得写状态或触发跳转（2026-08-21 unmount 竞态守卫）
@@ -4784,6 +5052,25 @@ export default {
     //    壳保留同名代理维持旧测试/模板触点不变；代理删除计划见方案 §2.3 映射表 ──
     async addFileToBgmLibrary(file) { return bgmLibraryMethods.addFileToBgmLibrary(file) },
     async loadS2VBgmLibrary(options = {}) { return bgmLibraryMethods.loadS2VBgmLibrary(options) },
+    // 历史 BGM 核验与修复（s2v-bgm-legacy-repair）：实现落在 composable，壳只做同名代理。
+    async verifyS2VLegacyBgm(path) { return bgmLibraryMethods.verifyLegacyBgmLibraryPath(path === undefined ? this.s2vLegacyBgmPath : path) },
+    async ensureS2VLegacyBgmVerified() {
+      // CCG 评审 i4 修复：不只在 checking 时等待。快照恢复与 watch 触发之间存在
+      // 微任务窗口（状态仍为 idle 但尚未核验），直接启动会绕过门禁 ——
+      // 这里对「存在历史路径」一律补一次核验并等待其落地（同路径在途请求被
+      // composable 去重复用，不会放大 IPC）。
+      if (!this.s2vLegacyBgmPath) return
+      await this.verifyS2VLegacyBgm(this.s2vLegacyBgmPath)
+    },
+    async adoptS2VLegacyBgm() {
+      const adopted = await bgmLibraryMethods.adoptLegacyBgmLibrary()
+      if (adopted) this.showS2VOptionsToast(this.$t('create.story2video.bgmLibrary.adoptSuccess'))
+      return adopted
+    },
+    clearS2VLegacyBgm() {
+      void bgmLibraryMethods.clearLegacyBgmLibrarySelection()
+      this.showS2VOptionsToast(this.$t('create.story2video.bgmLibrary.clearedToast'))
+    },
     async openBgmLibraryDialog() { return bgmLibraryMethods.openBgmLibraryDialog() },
     closeBgmLibraryDialog() { return bgmLibraryMethods.closeBgmLibraryDialog() },
     async handleBgmLibraryAddFile(e) { return bgmLibraryMethods.handleBgmLibraryAddFile(e, this.$refs.s2vBgmLibraryInput) },
@@ -4831,7 +5118,7 @@ export default {
         const r = await aiGenerate('llm', providerId, { prompt: '为短视频写一个30秒文案，风格：' + this.quickTheme })
         if (r?.code === 0 && r.data?.content) this.quickText = r.data.content // P0-1: content 非 text
       } catch (e) { this.quickError = 'AI 写稿失败: ' + formatUserError(e, { fallback: '未知错误' }).message }
-      this.aiLoading = false
+      finally { this.aiLoading = false }
     },
     // Remotion 安装
     async installDeps() {
@@ -4992,6 +5279,14 @@ export default {
     await Promise.all([this.loadPipelines(), this.loadS2VProviders()])
     await this.loadMaxOutputResolution()
       await this.loadPipelineOptions()
+      // 字数控制与选项控制同阶段：失败静默回落内置默认，不阻塞创作（story-text-limit-control）
+      await this.loadStoryTextLimit()
+      // ⚠️ 单次拉取不够：启动同步由主进程 `autoSyncOnStart()` 的 setTimeout 3000 触发，
+      // 而本页通常在此之前就已挂载 ⇒ 首次拉取读到的是「尚未 apply」的旧状态，上限会被钉在内置默认。
+      // 订阅 applyRuntime 成功后的广播再拉一次（与 MpSidebar 同一机制、同一通道），
+      // 否则「运营改了值、重启应用仍不生效」会按「用户何时进入本页」随机出现。
+      // 取消订阅走既有 cleanups 数组，beforeUnmount 统一释放。
+      this.cleanups.push(onOpsCenterRuntimeUpdated(() => { void this.loadStoryTextLimit() }))
     // 路由直接进入历史记录视图（/create?view=history）
     if (this.$route?.query?.view === 'history') {
       this.detachPipelineView('history')

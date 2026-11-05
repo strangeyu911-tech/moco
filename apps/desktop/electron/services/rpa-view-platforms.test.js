@@ -4,6 +4,7 @@
  */
 const fs = require('fs')
 const platformsMixin = require('./rpa-view-platforms')
+const { PLATFORM_PUBLISH_SELECTORS } = require('@multi-publish/rpa-engine/src/platform-selectors')
 
 // 2026-09-29：rpa-view-platforms.js 两次拆分（rpa-publish-id-extract.js / rpa-view-navigation-helpers.js），
 // 2026-10 三次拆分（upload-waiter.js：视频上传等待循环 v4）——
@@ -666,17 +667,9 @@ describe('rpa-view-platforms — 图文模式（2026-09-29：双入口 URL + 图
     expect(context._setFileInput).not.toHaveBeenCalled()
   })
 
-  // 2026-10-10 硬约束收紧：小红书视频不再走通用发布流程（终点是点「发布」），改为 fail-closed。
-  // 旧断言（无 preFill + target=video 交给 generic）正是「视频可真实发布」的契约，已被用户要求推翻。
-  it('小红书视频模式：fail-closed 拒绝，绝不进入 generic（不得真实发布）', async () => {
-    const { win } = createWindow('https://creator.xiaohongshu.com/publish/publish?from=menu&target=video')
-    const context = createImageContext()
-
-    const result = await platformsMixin._publish_xiaohongshu.call(context, win, { title: 'T', video_path: 'D:/v.mp4' })
-
-    expect(context._publish_generic).not.toHaveBeenCalled()
-    expect(result).toMatchObject({ success: false, platform: 'xiaohongshu', errorCode: 'XHS_VIDEO_DRAFT_UNSUPPORTED' })
-  })
+  // 2026-10-18 video-publish-4：小红书视频契约已迁到 xiaohongshu-video-draft.test.js
+  // （本文件已贴 testLimit=1500 熔断）。该文件锁：视频走草稿链 draftOnly=true 不点发布；
+  // 真实配置下缺 file_input 仍 fail-closed 拒绝；图文模式不回归。
 
   it('generic 图片上传：无视频有图时上传首图（image_upload 字段）', async () => {
     const { win } = createWindow('https://example.com/publish')
@@ -959,15 +952,6 @@ describe('rpa-view-platforms — 视频发布页字段填充时序（2026-09 E2E
     return source.slice(start, end > 0 ? end : undefined)
   }
 
-  it('_publish_generic：视频上传发生在标题填充之前', () => {
-    const body = getGenericBody()
-    const uploadIdx = body.indexOf('_setFileInput(win, article.video_path')
-    const titleIdx = body.indexOf("'filling title...'")
-    expect(uploadIdx).toBeGreaterThan(-1)
-    expect(titleIdx).toBeGreaterThan(-1)
-    expect(uploadIdx).toBeLessThan(titleIdx)
-  })
-
   it('_publish_generic：导航后调用弹窗清理（草稿恢复/引导遮罩）', () => {
     const body = getGenericBody()
     expect(body).toContain('_dismissPostNavDialogs')
@@ -978,33 +962,6 @@ describe('rpa-view-platforms — 视频发布页字段填充时序（2026-09 E2E
     // 快手草稿弹窗两按钮（放弃/继续编辑）与通用引导按钮（我知道了/知道了）都在处理范围内
     expect(source).toContain('放弃')
     expect(source).toContain('我知道了')
-  })
-
-  it('_publish_generic：上传后有编辑器表单就绪等待（而非直接填字段）', () => {
-    const body = getGenericBody()
-    const uploadIdx = body.indexOf('_setFileInput(win, article.video_path')
-    const titleIdx = body.indexOf("'filling title...'")
-    const formWait = body.slice(uploadIdx, titleIdx)
-    expect(formWait).toContain('_waitForCondition')
-  })
-
-  // smoke4（2026-09-23）实锤：旧上传完成判定 !p||s 在快手/B站立即为真（页面根本
-  // 不用 progress class），导致还在上传落地页就点发布→全部失败。统一改为
-  // 共享的强判定：进度元素不可见 且（可见 video 预览 或 已跳转编辑页 URL）。
-  it('视频上传完成强判定存在于 generic 与 douyin 两条链路', () => {
-    const source = readPlatformsSource()
-    expect(source).toMatch(/async\s+_waitForVideoUploadComplete\s*\(/)
-    const genericStart = source.indexOf('async _publish_generic')
-    const genericEnd = source.indexOf('\n  // ========== ', genericStart + 10)
-    const genericBody = source.slice(genericStart, genericEnd > 0 ? genericEnd : undefined)
-    expect(genericBody).toContain('this._waitForVideoUploadComplete(')
-    const douyinStart = source.indexOf('async _publish_douyin')
-    const douyinEnd = source.indexOf('\n  async _', douyinStart + 10)
-    const douyinBody = source.slice(douyinStart, douyinEnd > 0 ? douyinEnd : undefined)
-    expect(douyinBody).toContain('this._waitForVideoUploadComplete(')
-    // blob 本地预览在注入瞬间就存在，判定必须要求 https 服务端预览源（smoke5 实锤）
-    expect(source).toMatch(/currentSrc/)
-    expect(source).toMatch(/indexOf\("https:"\)===0/)
   })
 })
 
@@ -1047,6 +1004,12 @@ describe('rpa-view-platforms — 选择器候选回退与标题写编辑器（li
     // 这样测试才真的能验证「首个候选不存在时回退到下一个」这条取证结论
     ctx._resolveSelector = (...args) => platformsMixin._resolveSelector.call(ctx, ...args)
     ctx._composeEditorCaption = (...args) => platformsMixin._composeEditorCaption.call(ctx, ...args)
+    // publish-precondition-gate（2026-10-18）：上传整段已下沉到 upload-waiter 的
+    // `_runVideoUpload`。这条用例的 ctx 是手造对象（不是 Object.assign(mixin, …)），
+    // 所以必须像 _resolveSelector 一样把真实实现接上——否则 this._runVideoUpload
+    // 在 ctx 上不存在，「上传发生在标题之前」这类顺序断言会直接失去被测对象。
+    ctx._setFileInput = vi.fn().mockResolvedValue(true)
+    ctx._runVideoUpload = (...args) => platformsMixin._runVideoUpload.call(ctx, ...args)
     return ctx
   }
 
@@ -1491,5 +1454,82 @@ describe('rpa-view-platforms — API 响应等待的判据来自单一来源（C
     expect(localRewrite.length,
       '不得本地复写两轴合取（请调用 isApiTrack），命中: ' + localRewrite.join(' | ')).toBe(0)
     expect(src, '不得回退成 `const rp = (config.has_api && …)`').not.toMatch(/const rp = \(config\.has_api &&/)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// no-title 平台 caption 合并路径 × publish-precondition-gate 契约
+// （2026-10-28 修复，回归自 2026-10-27 微博图文三连败：pre-submit gate blocked
+//   content-not-filled, content=null —— caption 合并写入成功但 content 未记账）
+// 契约：标题（含正文的合并文案）写入成功 ⇒ 补记 content.ok 放行；写入失败 ⇒ 保持
+// null，门禁照常拦截。
+// ═══════════════════════════════════════════════════════════════════════════════
+describe('rpa-view-platforms — no-title caption 合并路径的门禁契约（weibo content-not-filled 回归）', () => {
+  const { isNoTitlePlatform } = require('@multi-publish/shared-utils/src/publish-capabilities')
+
+  function captionMergeContext (fillInputImpl) {
+    return {
+      _emitProgress: vi.fn(),
+      _navigateAndWait: vi.fn().mockResolvedValue(undefined),
+      _dismissPostNavDialogs: vi.fn().mockResolvedValue(undefined),
+      _waitForElement: vi.fn().mockResolvedValue(true),
+      _resolveSelector: vi.fn().mockResolvedValue(PLATFORM_PUBLISH_SELECTORS.weibo.content_textarea[0]),
+      _fillInput: vi.fn(fillInputImpl || (() => Promise.resolve())),
+      _click: vi.fn().mockResolvedValue(true),
+      _sleep: vi.fn().mockResolvedValue(undefined),
+      _waitForResponse: vi.fn().mockResolvedValue(null),
+      _startPublishNetworkCapture: vi.fn().mockResolvedValue({ stop: vi.fn() }),
+      _confirmPublishDialog: vi.fn().mockResolvedValue('NO_DIALOG'),
+      _verifyPublishSuccess: vi.fn().mockResolvedValue({ success: true, platform: 'weibo' }),
+      _composeEditorCaption: platformsMixin._composeEditorCaption,
+    }
+  }
+
+  function captionMergeWin () {
+    return { webContents: {
+      getURL: vi.fn().mockReturnValue('https://weibo.com/'),
+      getTitle: vi.fn().mockReturnValue('微博'),
+      executeJavaScript: vi.fn().mockResolvedValue(true),
+    } }
+  }
+
+  function captionMergeConfig () {
+    return {
+      platform: 'weibo',
+      publish_url: 'https://weibo.com/',
+      max_content: 10000,
+      has_api: false,
+      publishMode: 'dom-only',
+      success_patterns: [],
+      selectors: PLATFORM_PUBLISH_SELECTORS.weibo,
+    }
+  }
+
+  it('微博图文：caption 合并写入成功 ⇒ 门禁放行（content 随合并文案视为已写入），走到发布验证', async () => {
+    expect(isNoTitlePlatform('weibo')).toBe(true) // 前提：微博是 no-title 平台，标题走 caption 合并
+    const win = captionMergeWin()
+    const context = captionMergeContext()
+    const article = { title: '2026-10-27 读书笔记', content: '<p>正文内容</p>' }
+
+    const result = await platformsMixin._publish_generic.call(context, win, article, 'weibo', captionMergeConfig())
+
+    expect(context._fillInput).toHaveBeenCalledWith(
+      win, PLATFORM_PUBLISH_SELECTORS.weibo.content_textarea[0], expect.stringContaining('2026-10-27 读书笔记'))
+    expect(context._emitProgress).not.toHaveBeenCalledWith('weibo', 'filling content...', 35)
+    expect(context._verifyPublishSuccess).toHaveBeenCalledTimes(1)
+    expect(result).toEqual({ success: true, platform: 'weibo' })
+  })
+
+  it('caption 合并写入失败时保持拦截 —— 补记必须以写入成功为前提（防反向漏洞）', async () => {
+    const win = captionMergeWin()
+    const context = captionMergeContext(() => Promise.reject(new Error('readback=0')))
+    const article = { title: '2026-10-27 读书笔记', content: '<p>正文内容</p>' }
+
+    const result = await platformsMixin._publish_generic.call(context, win, article, 'weibo', captionMergeConfig())
+
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('正文未写入')
+    expect(result.preSubmitBlocked).toBe(true)
+    expect(context._verifyPublishSuccess).not.toHaveBeenCalled()
   })
 })

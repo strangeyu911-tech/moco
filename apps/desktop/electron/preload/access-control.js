@@ -3,8 +3,9 @@
 const AUTH_ERROR = -3
 
 // 仅开发模式允许暴露的敏感方法。
+// 2026-10-17 remove-buyout-license：paymentComplete / paymentSimulate 已随买断
+// 授权模型移除（本地下单链路在 S1 修复后已无法授予任何授权）。
 const ADMIN_ONLY_METHODS = [
-  'paymentComplete', 'paymentSimulate',
   'proxyTest', 'proxyTestAll', 'proxyReset',
 ]
 
@@ -16,9 +17,8 @@ const PUBLIC_METHODS = [
   'showNotification', 'onNotification',
   'onNavigate',
   'onboardingComplete', 'onboardingGetSteps', 'onboardingStatus',
-  'licenseInfo', 'licenseActivate', 'licenseDeactivate', 'licenseActivateTrial',
+  'licenseInfo', 'licenseDeactivate', 'licenseActivateTrial',
   'licenseHasFeature', 'licenseFeatures',
-  'paymentCreateOrder', 'paymentListOrders', 'paymentGetOrder', 'paymentCancel',
   'authOpenLogin', 'authClose', 'onAuthViewOpened', 'onAuthCompleted', 'onAuthViewClosed',
   'authLoginSilent',
   'authOpenQrCodeLogin', 'authQrCodeClose',
@@ -55,9 +55,10 @@ const PUBLIC_METHODS = [
   // Story2Video 本地历史读取与缩略图查询：项目数据按 owner 隔离，未登录也可查看本机历史。
   'story2videoListProjects', 'story2videoGetProject', 'story2videoGetThumbnail',
   // BGM 素材库（与主进程 PUBLIC_CHANNELS 的 story2video:bgm-library-* 对齐）：
-  // 设备级本地素材库管理（列表/添加/改名/删除），未登录可用。
+  // 设备级本地素材库管理（列表/添加/改名/删除/历史路径只读核验），未登录可用。
   'story2videoBgmLibraryList', 'story2videoBgmLibraryAdd',
   'story2videoBgmLibraryRename', 'story2videoBgmLibraryDelete',
+  'story2videoBgmLibraryStatus',
   // 流水线「保存配置」（与主进程 story2video:config-profile-* 对齐）：设备级本地配置管理，未登录可用。
   'story2videoConfigProfileList', 'story2videoConfigProfileCreate',
   'story2videoConfigProfileRename', 'story2videoConfigProfileDelete',

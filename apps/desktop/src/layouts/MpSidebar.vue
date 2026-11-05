@@ -38,26 +38,43 @@
            选中态：菜单展开 或 子路由命中时保持高亮（收起后仍能感知当前页在「更多」内） -->
       <button
         v-if="moreItems.length"
+        ref="moreTriggerRef"
         class="mp-primary-item mp-more-trigger"
         :class="{ active: moreOpen || hasActiveMoreItem }"
         type="button"
         aria-haspopup="true"
         :aria-expanded="moreOpen"
+        aria-controls="mp-more-menu"
         data-testid="mp-primary-more"
-        @click="moreOpen = !moreOpen"
+        @click="toggleMoreMenu"
+        @keydown.down.prevent="openMoreAt(initialMoreIndex)"
       >
         <MoreFilled aria-hidden="true" />
         <span>更多</span>
         <ArrowDown :class="{ rotated: moreOpen }" aria-hidden="true" />
       </button>
-      <div v-if="moreOpen && moreItems.length" class="mp-more-menu" role="menu">
+      <!-- 「更多」菜单键盘可达（audit-31）：role=menu 的 ARIA 契约要求 roving tabindex + 方向键，
+           不是 Tab 逐个走。此前只给了 role/aria-expanded，键盘用户实际只能 Tab 穿过、
+           没有 Esc 退出也没有焦点归还，菜单展开后焦点会掉回 body。 -->
+      <div
+        v-if="moreOpen && moreItems.length"
+        id="mp-more-menu"
+        ref="moreMenuRef"
+        class="mp-more-menu"
+        role="menu"
+        @keydown="onMoreMenuKeydown"
+        @focusout="onMoreMenuFocusout"
+      >
         <router-link
-          v-for="item in moreItems"
+          v-for="(item, index) in moreItems"
           :key="item.key"
+          :ref="(el) => setMoreItemRef(index, el)"
           :to="item.to"
           role="menuitem"
           class="mp-more-item"
           :class="{ active: isActive(item) }"
+          :tabindex="index === moreActiveIndex ? 0 : -1"
+          @focus="moreActiveIndex = index"
           @click.prevent="onNavClick(item.to)"
           :aria-current="isActive(item) ? 'page' : undefined"
           :data-testid="`mp-more-item-${item.key}`"
@@ -78,21 +95,24 @@
       <!-- 登录区 banner：收起时只显示这一条，点击向上展开菜单（账号操作 / 设置 / 升级 Pro） -->
       <ProfileMenu
         @open-settings="emit('open-settings')"
-        @upgrade="showUpgradeModal = true"
+        @upgrade="router.push('/member-center')"
       />
-      <UpgradeModal v-if="showUpgradeModal" @close="showUpgradeModal = false" />
+      <!-- 升级入口跳会员中心，不再渲染 UpgradeModal：
+           正式包里那个弹窗只有「付费通道筹备中」，是死胡同；会员中心才有真实档位、
+           真实价格与服务端兑换码核销（当前唯一真实可用的开通渠道）。
+           原先这里开着弹窗，还配了一个 watch 去挂起内嵌 WebContentsView 以防被原生
+           图层压住 —— 没有弹窗后这套互斥机制随之不需要（函数本身其它 7 处在用）。 -->
     </footer>
   </aside>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ArrowDown, MoreFilled, Plus } from '@element-plus/icons-vue'
 import { SIDEBAR_MENU_DEFINITION } from '@/config/sidebar-menu'
 import { resolveSidebarMenu } from '@/config/sidebar-menu-merge'
-import UpgradeModal from '@/components/UpgradeModal.vue'
 import ProfileMenu from '@/components/ProfileMenu.vue'
 import SidebarServiceStatus from '@/components/SidebarServiceStatus.vue'
 import SidebarUpdateButton from '@/components/SidebarUpdateButton.vue'
@@ -100,7 +120,6 @@ import { invokePageManager, getApi } from '@/api/electron-bridge'
 import { useTabStore } from '@/stores/tab'
 import { opsCenterSyncAppMenu, onOpsCenterRuntimeUpdated } from '@/api/ops-center-sync'
 import { useAppVersion } from '@/composables/useAppVersion'
-import { suspendEmbeddedViewsForOverlay, releaseEmbeddedViewsForOverlay } from '@/composables/useEmbeddedViewSuspension'
 import brandLogoUrl from '@/assets/brand/tom-fish-logo.png'
 
 const route = useRoute()
@@ -108,7 +127,6 @@ const router = useRouter()
 const tabStore = useTabStore()
 const { t } = useI18n()
 const moreOpen = ref(false)
-const showUpgradeModal = ref(false)
 // 左上角品牌区展示的应用版本号（非 Electron 环境取不到时保持为空，不渲染该节点）
 const { version, loadVersion } = useAppVersion()
 
@@ -198,18 +216,150 @@ async function onNavClick (to) {
 /** 「更多」组是否存在当前路由命中项（触发器常驻高亮依据，2026-09-21 选中态修复） */
 const hasActiveMoreItem = computed(() => moreItems.value.some((item) => isActive(item)))
 
+// ── 「更多」菜单键盘可达（audit-31 / 阶段 4.5）────────────────────────
+// role="menu" 的 ARIA 契约要求 roving tabindex + 方向键，不是"Tab 逐个穿过"。
+// 改之前只有 role/aria-expanded：键盘用户展开后焦点掉回 body，既没有 Esc 退出，
+// 也没有把焦点还给触发器；读屏软件会announce「菜单」却没有菜单该有的操作方式。
+const moreTriggerRef = ref(null)
+const moreMenuRef = ref(null)
+const moreActiveIndex = ref(0)
+// 元素表**必须是普通数组**：模板 ref 回调在每次 patch 时都会被调用，
+// 若它写的是响应式状态（ref([]) + 赋新数组），就会 render → ref 回调 → 改状态 → 再 render 无限递归
+// （实测本组件立刻 "Maximum recursive updates exceeded"）。
+// 这张表只在事件处理器里读（方向键/focusout），不需要参与渲染，所以不该是响应式的。
+const moreItemEls = []
+
+/**
+ * `<router-link>` 的模板 ref 拿到的是**组件实例**，可聚焦的是它渲染出的 `<a>`。
+ * 直接对实例调 focus() 是 undefined —— 与主进程"读不存在的宿主字段"同型，只是这里换了层。
+ */
+function focusableOf (refValue) {
+  const raw = refValue && refValue.$el ? refValue.$el : refValue
+  return raw && typeof raw.focus === 'function' ? raw : null
+}
+
+function setMoreItemRef (index, el) {
+  moreItemEls[index] = el || null
+}
+
+/** 只返回当前真实存在的项，防"运营把某项隐藏后索引漂移" */
+function visibleMoreIndexes () {
+  const out = []
+  for (let i = 0; i < moreItems.value.length; i++) {
+    if (moreItemEls[i]) out.push(i)
+  }
+  return out
+}
+
+function focusMoreItem (index) {
+  const visible = visibleMoreIndexes()
+  if (!visible.length) return
+  const safe = visible.includes(index) ? index : visible[0]
+  moreActiveIndex.value = safe
+  const node = focusableOf(moreItemEls[safe])
+  if (node) node.focus()
+}
+
+/** 方向键在可见项之间循环：越过末位回头一项，越过头回末一项（菜单惯例，非跳到首项） */
+function moveMoreActive (delta) {
+  const visible = visibleMoreIndexes()
+  if (!visible.length) return
+  const at = visible.indexOf(moreActiveIndex.value)
+  const next = at < 0
+    ? (delta > 0 ? visible[0] : visible[visible.length - 1])
+    : visible[(at + delta + visible.length) % visible.length]
+  focusMoreItem(next)
+}
+
+/** 展开时把 roving 起点放在命中项上，而不是第一项：否则用户从当前页打开菜单会被丢到别的项 */
+const initialMoreIndex = computed(() => {
+  const at = moreItems.value.findIndex((item) => isActive(item))
+  return at >= 0 ? at : 0
+})
+
+function toggleMoreMenu () {
+  if (moreOpen.value) {
+    closeMoreMenu(false)
+    return
+  }
+  moreOpen.value = true
+  moreActiveIndex.value = initialMoreIndex.value
+}
+
+function openMoreAt (index) {
+  moreOpen.value = true
+  moreActiveIndex.value = index
+  // 项是 v-if 刚挂载的，DOM 还没建；不等 nextTick 就会 focus 到空引用（表现为"按了没反应"）
+  nextTick(() => focusMoreItem(index))
+}
+
+function closeMoreMenu (returnFocus) {
+  if (!moreOpen.value) return
+  moreOpen.value = false
+  if (returnFocus) {
+    const node = focusableOf(moreTriggerRef.value)
+    if (node) node.focus()
+  }
+}
+
+function onMoreMenuKeydown (event) {
+  switch (event.key) {
+    case 'ArrowDown':
+      event.preventDefault()
+      moveMoreActive(1)
+      break
+    case 'ArrowUp':
+      event.preventDefault()
+      moveMoreActive(-1)
+      break
+    case 'Home': {
+      event.preventDefault()
+      const visible = visibleMoreIndexes()
+      if (visible.length) focusMoreItem(visible[0])
+      break
+    }
+    case 'End': {
+      event.preventDefault()
+      const visible = visibleMoreIndexes()
+      if (visible.length) focusMoreItem(visible[visible.length - 1])
+      break
+    }
+    case 'Escape':
+      // Esc 必须把焦点还给触发器：只收起不归还，等于把键盘用户丢在页面顶上
+      event.preventDefault()
+      closeMoreMenu(true)
+      break
+    case 'Tab':
+      // Tab 走出菜单时收起（不做 preventDefault：Tab 的自然走位是用户的预期）
+      closeMoreMenu(false)
+      break
+    case 'Enter':
+    case ' ':
+      // 让 <a> 的原生激活发生（onNavClick 负责真正的跳转），这里只负责收起
+      closeMoreMenu(false)
+      break
+    default:
+      break
+  }
+}
+
+function onMoreMenuFocusout (event) {
+  const menu = moreMenuRef.value
+  if (!menu) return
+  const to = event.relatedTarget
+  if (!to) return
+  if (menu.contains(to)) return
+  const trigger = focusableOf(moreTriggerRef.value)
+  if (trigger && trigger.contains(to)) return
+  // 焦点离开菜单与触发器 => 用户已经走了，菜单不该继续占着可读区域
+  closeMoreMenu(false)
+}
+
 // 路由变化时若落在「更多」组 → 自动展开菜单，让选中项可见。
 // 用 watch 而非仅 onMounted：真实应用初始路由是异步解析的，
 // 硬刷新深链时 onMounted 早于 route.path 就绪，需路由解析后再展开（2026-09-21）。
 watch(navPath, () => {
   if (hasActiveMoreItem.value) moreOpen.value = true
-})
-
-// 弹窗互斥（2026-09-23 Bug 修复）：升级弹窗是渲染层全屏遮罩浮层，浏览器标签
-// （外部网页 WebContentsView）活动时会被原生图层整个压住；打开期间挂起内嵌视图。
-watch(showUpgradeModal, (open) => {
-  if (open) suspendEmbeddedViewsForOverlay('upgrade-modal')
-  else releaseEmbeddedViewsForOverlay('upgrade-modal')
 })
 
 // ── 左侧导航栏宽度同步到主进程（避免 WebContentsView 遮挡侧边栏）──

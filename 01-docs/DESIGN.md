@@ -502,6 +502,86 @@ Primary CTAs and pills meet comfortable touch sizing through 12px-24px padding a
 
 该统一壳只覆盖编排流水线、历史续跑等“有可观察流水线阶段状态”的路径；快速渲染 loading、发布 timeline、独立分析状态保持各自轻量展示。已废弃的 `CreateHistory.vue` 不再提供内嵌进度卡片，历史入口统一为 `CreateViewHistory.vue` 的摘要与恢复。
 
+## 热门选题行内流水线选择器（2026-10-17）
+
+### 结构与层级
+
+- 每条选题行（热门 tab 与收藏 tab）的右侧按钮区是一个**按钮组**：主按钮【生成视频】+ 紧邻的小下箭头按钮（▾）。两者同用 `cohere-btn-primary`（主色实心、小尺寸），间距 2px；下箭头内边距 4px 6px、行高 1，视觉上是主按钮的“分段”而非并列的第二个主操作。
+- 下箭头点击后打开**行内下拉面板**：`position: absolute; right: 0; top: calc(100% + 6px)`，`z-index: 60`；绝对定位不参与行 flex 布局 ⇒ 列表行高不变、不产生跳动。
+- 面板尺寸：`min-width: 260px; max-width: 340px; max-height: 320px`（超出纵向滚动）；圆角 10px、1px 边框、`box-shadow 0 10px 28px` 低透明度；内部 `padding: 6px`，菜单项圆角 7px。
+- 面板结构：标题行（`hotTopics.genVideoPipelinePickTitle`）→ 状态区（加载中/加载失败+重试/空）或菜单项列表 → 底部操作提示（仅存在可执行项时）。菜单项名称左对齐、默认徽标/禁用原因右对齐（`flex-shrink: 0`），长名称省略号截断。
+- 不引入 `el-dropdown` / `el-popover`：与 Element Plus 按需注册的机械锁（组件清单 + 样式闭包）保持零变更，避免为一个行内菜单扩大全局组件面。样式全部 scoped 在该组件内，禁止放到全局 `styles/`。
+
+### 视觉令牌
+
+- 面板底色 `--color-bg-card`、边框 `--color-border`、标题/原因文字 `--color-text-muted`、正文 `--color-text-primary`；hover/焦点底色 `color-mix(in srgb, var(--color-primary) 8%, var(--color-bg-card))`。
+- 默认徽标：主色淡底 + `--color-primary-dark-tint` 文字（与列表其它主色徽标同源）；禁用项整体 `opacity: .66` + `cursor: not-allowed`。
+- 主色禁用态由 `cohere-btn-primary:disabled` 统一提供，不在组件内重定义语义色。
+
+### 交互与动效
+
+- 下箭头 → 面板：0.15s 箭头 180° 旋转；面板无入场动画（避免在长列表中出现多个浮动动画体）。
+- 关闭路径：再次点击下箭头、点击面板外（document `pointerdown` capture）、Esc；Esc 关闭后焦点回到下箭头。
+- 面板打开时焦点进入第一个可执行项；↑/↓ 在可执行项间循环、Home/End 到首/末项、禁用项不可聚焦；回车 = 点击（原生 button）。
+- 同一时刻只允许一个面板打开（跨行单例指针）；busy（编排在途）时主按钮与下箭头一起禁用，面板强制关闭。
+- **空间自适应（2026-10-17 视觉取证后补）**：面板下方可用高度 < 面板理想高度（320px）+ 6px 时翻转到按钮上方；翻转后仍不足则按可用空间压缩面板高度（下限 160px，内部滚动），避免被页面滚动容器（`.cohere-content`，实测仅 342px 高）裁掉前几项。
+- **滚动即关闭**：捕获阶段监听 `window` 的 scroll（能收到滚动容器的事件），面板一滚动就收起，避免面板与按钮脱位或被裁切。
+- 加载中显示「正在加载流水线…」；加载失败显示错误 +【重试】+ 回退项「故事讲述（默认）」；空清单显示提示，不渲染空菜单。
+
+### 内容与数据表现
+
+- 菜单项 = 本地化流水线名 + 类型徽标（可省略）+ 默认徽标 / 禁用原因。默认项固定 `story2video-compose`；可执行项在前、禁用项在后，顺序保持主进程返回顺序。
+- 禁用原因四类文案：需先导入视频/音频素材、需在专属页面使用、内部调试流水线、尚未实现执行引擎；未知条目统一“暂不支持从选题直接生成”。
+- 弹窗内显示当前流水线名称（`hotTopics.genVideoPipelineLabel`），与阶段清单一起构成“我点了哪条流水线、它跑到哪了”的完整上下文。
+
+### 范围边界
+
+- 该选择器只负责“选哪条流水线并立即开始”，不承载流水线参数编辑（参数仍在视频创作页配置）。
+- 不做“记住上次选择”作为主按钮默认值；主按钮固定默认流水线，避免隐式状态。
+- 像素门禁当前不覆盖 `hot-topics`（见 PRD §9.2 盲区登记），视觉正确性由组件/集成测试 + 人工截图取证保证。
+
+
+## 全局壳层：左侧菜单收起/展开（2026-10-18）
+
+### 结构与层级
+
+- 按钮固定于顶部标签栏 `TabBar` 最左侧、可横向滚动的 `.tab-bar-tabs` 之前；标签条滚动不带动按钮；按钮在既有 36px 行内垂直撑满，不新增行高，`TabBar(36px) + NavBar(40px) = BROWSER_CHROME_TOP(76px)` 的主进程契约不变。
+- 使用原生 `<button type="button">`；图标为内联 SVG 的双向 `chevron`（左箭头 + 右箭头，组合成「<>」），不使用 emoji、图标字体、位图或新图标依赖。
+- `role="tablist"` 只属于 `.tab-bar-tabs`；折叠按钮与「+」新建标签按钮位于 tablist 之外，不参与 tab 序列（原实现把 `role="tablist"` 放在 `TabBar` 根节点，既包含非 tab 元素，ARIA 不合规）。
+- `App.vue` 对 `<MpSidebar>` 施加 `v-show` 跟随折叠态（`display:none`），**不卸载组件**（保留其内部状态、`ResizeObserver` 与运营菜单订阅）；`MpSidebar.vue` 本体**未改动**，其既有 `if (w > 0)` 守卫保证收起时不会上报 `width=0`。收起时主内容区横向铺满。
+
+### 尺寸与视觉令牌
+
+- 按钮尺寸 30×28px，在 36px 行内垂直居中（`margin-top: 4px`），标签区左内边距 8px —— 不撑满行高、不新增行高；图标视觉尺寸 16×16，`stroke` 使用 `currentColor`，无固定像素颜色。
+- 常态前景 `--color-text-secondary`；hover 背景 `--color-bg-card`、前景 `--color-primary`、边框 `--color-border`；焦点环 `2px solid var(--color-primary)` + `1px` offset；收起态（`aria-pressed="true"`）前景用主色强化，但图标形状不变。
+- 暗色主题由 `[data-theme="dark"]` 的 token 覆写自动适配；组件内禁止十六进制颜色字面量。
+- **无布局动画/无宽度过渡**：原生 `WebContentsView` 不跟随 CSS 过渡插值，宽度动画期间视图边界必然与 DOM 不同步；折叠是「瞬时切换 + 一次重排」。仅 hover/focus 的颜色有 0.15s 过渡，`prefers-reduced-motion: reduce` 下关闭。
+
+### 状态与交互
+
+- 二态 `expanded ⇄ collapsed`；点击或键盘 Enter/Space 切换，切换幂等；本地状态先于 IPC 生效，不做防抖延迟。
+- `aria-label` 与 `title` 使用同一文案，按「点击后会发生什么」描述：展开态显示「收起左侧菜单」/“Collapse sidebar”，收起态显示「展开左侧菜单」/“Expand sidebar”；`aria-pressed="true"` 表示已收起。
+- 文案写入 `apps/desktop/src/locales/tab-bar/{zh,en}.js`，zh/en 成对；`.vue` 内不硬编码中文。
+- 不进入 tablist、不注册全局快捷键；作为 `TabBar` 内第一个可聚焦元素参与 Tab 顺序。
+
+### 持久化与跨进程
+
+- `localStorage['mulpub.ui.sidebarCollapsed']`：`'1'` 收起；其他值、缺失、`getItem`/`setItem` 抛异常一律按展开/静默处理，不阻塞渲染。
+- 收起状态经 preload `pageManager.setSidebarCollapsed(boolean)` → IPC `page-manager:set-sidebar-collapsed` → 主进程 `WebviewManager._sidebarCollapsed`，并同步 `AuthViewManager` / `QRCodeLogin`；`computeEmbeddedViewBounds(win, sidebarWidth, 76, sidebarCollapsed)` 第 4 参为 `true` 时内嵌视图 `x=0`、宽=客户区全宽。
+- **收起不得用 `setSidebarWidth(0)` 表达**：`MIN_SIDEBAR_WIDTH=1` / `MAX_SIDEBAR_WIDTH=600` 与三处 `setSidebarWidth` 守卫逐字保留；收起不修改 `_sidebarWidth`，展开直接恢复 200px（≤900px 时 68px）。
+- 启动时若持久化为收起，工作台壳层挂载后主动上报一次；非 Electron（`invokePageManager` 返回 `undefined`）静默跳过。
+
+### 可访问性
+
+- 原生按钮语义；`aria-pressed` 暴露状态；SVG 带 `aria-hidden="true"` 与 `focusable="false"`，不进入可访问名称。
+- 焦点环可见且不被标签栏裁切；前景/背景对比度 ≥ 3:1（非文本 UI 元素），hover/focus 态同样满足。
+- `role="tablist"` 仅覆盖 `.tab-bar-tabs`，读屏器不会把「+」与折叠按钮播报为 tab。
+
+### 范围边界
+
+- 不做动画、拖拽调宽、窄屏 68px 图标栏的第二种折叠形态、快捷键；OAuth 内嵌视图（`apps/desktop/electron/services/oauth-manager.js:86` 不传侧栏宽度）不跟随折叠，登记为已知限制。
+- 该按钮是全局可见 UI：`apps/desktop/tests/visual-testing/base-screenshots/` 中**含 TabBar 的基线**都会变化（并非全部 43 张都含壳层，例如 `first-run` 走 `.fullscreen-main`）；最终变化清单以 CI `Gate 7b` 点名为准，基线由 CI 同源渲染重建并逐张审核，不得声称「视觉中性」。
+
 ## Known Gaps
 
 - Exact proprietary font files are not bundled; use the documented fallbacks when implementing externally.

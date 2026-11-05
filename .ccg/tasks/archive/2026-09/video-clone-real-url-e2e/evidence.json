@@ -1,0 +1,404 @@
+{
+  "url": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
+  "source": {
+    "type": "url",
+    "url": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4"
+  },
+  "level": "L1",
+  "elapsedMs": 7572,
+  "events": [
+    {
+      "type": "stage:started",
+      "stage": "ingest"
+    },
+    {
+      "type": "stage:succeeded",
+      "stage": "ingest"
+    },
+    {
+      "type": "stage:started",
+      "stage": "analyze"
+    },
+    {
+      "type": "stage:succeeded",
+      "stage": "analyze"
+    },
+    {
+      "type": "stage:started",
+      "stage": "plan"
+    },
+    {
+      "type": "stage:succeeded",
+      "stage": "plan"
+    },
+    {
+      "type": "stage:started",
+      "stage": "generate"
+    },
+    {
+      "type": "stage:succeeded",
+      "stage": "generate"
+    },
+    {
+      "type": "stage:started",
+      "stage": "compose"
+    },
+    {
+      "type": "stage:succeeded",
+      "stage": "compose"
+    },
+    {
+      "type": "stage:started",
+      "stage": "publish"
+    },
+    {
+      "type": "stage:succeeded",
+      "stage": "publish"
+    }
+  ],
+  "checks": [
+    {
+      "name": "pipeline.ok",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "name": "report.meta.durationSec > 0",
+      "pass": true,
+      "detail": 10
+    },
+    {
+      "name": "report.visual.shots non-empty",
+      "pass": true,
+      "detail": 1
+    },
+    {
+      "name": "report.replication.level valid",
+      "pass": true,
+      "detail": {
+        "level": "L1",
+        "mode": "structure",
+        "auto": {
+          "determined": false,
+          "source": "explicit",
+          "level": "L1"
+        }
+      }
+    },
+    {
+      "name": "similarity verdict present",
+      "pass": true,
+      "detail": "needs_review"
+    },
+    {
+      "name": "publish skipped (no router)",
+      "pass": true,
+      "detail": {
+        "status": "skipped",
+        "reason": "no-publisher"
+      }
+    },
+    {
+      "name": "output artifact exists",
+      "pass": true,
+      "detail": {
+        "path": "D:\\Data\\projects\\Multi-Publish\\.ccg\\tasks\\video-clone-real-url-e2e\\run-output-mtn1iyop\\clone.mp4",
+        "durationSec": 10,
+        "width": 640,
+        "height": 360,
+        "fps": 24,
+        "sizeBytes": 13965,
+        "probeOk": true,
+        "shots": [
+          {
+            "t0": 0,
+            "t1": 10
+          }
+        ],
+        "sceneMethod": "ffmpeg-scene"
+      }
+    },
+    {
+      "name": "clone.mp4 has video stream",
+      "pass": true,
+      "detail": "h264"
+    },
+    {
+      "name": "clone.mp4 playable duration > 0",
+      "pass": true,
+      "detail": "10.000000"
+    },
+    {
+      "name": "clone.mp4 sizeBytes matches report",
+      "pass": true,
+      "detail": 13965
+    },
+    {
+      "name": "duration within tolerance (<2s)",
+      "pass": true,
+      "detail": {
+        "source": 10,
+        "clone": 10
+      }
+    }
+  ],
+  "runId": "vc-mtn1iyox-pwokz9",
+  "report": {
+    "meta": {
+      "source": "url",
+      "platform": null,
+      "durationSec": 10,
+      "resolution": "640x360",
+      "fps": 30
+    },
+    "narrative": {
+      "structure": "unknown",
+      "timeline": [
+        {
+          "t0": 0,
+          "t1": 10,
+          "label": "shot"
+        }
+      ],
+      "plot": ""
+    },
+    "script": {
+      "fullText": "",
+      "lines": [],
+      "language": "zh"
+    },
+    "scriptStyle": {
+      "person": "unknown",
+      "tone": "unknown",
+      "sentenceStats": {},
+      "hookLines": []
+    },
+    "visual": {
+      "palette": "unknown",
+      "colorGrade": {},
+      "shots": [
+        {
+          "t0": 0,
+          "t1": 10,
+          "type": "unknown",
+          "motion": "unknown"
+        }
+      ],
+      "transitions": [],
+      "subtitleStyle": {}
+    },
+    "audio": {
+      "bgm": {
+        "style": "",
+        "bpm": null,
+        "segments": []
+      },
+      "sfx": [],
+      "voice": {
+        "gender": "unknown",
+        "speed": 1
+      }
+    },
+    "elements": {
+      "characters": [],
+      "props": [],
+      "brand": [],
+      "watermark": false
+    },
+    "platformParams": {
+      "aspect": "16:9",
+      "maxDurationSec": null
+    },
+    "replication": {
+      "level": "L1",
+      "mode": "structure",
+      "auto": {
+        "determined": false,
+        "source": "explicit",
+        "level": "L1"
+      }
+    }
+  },
+  "reportSource": {
+    "meta": {
+      "source": "url",
+      "platform": null,
+      "durationSec": 10,
+      "resolution": "640x360",
+      "fps": 30
+    },
+    "narrative": {
+      "structure": "unknown",
+      "timeline": [
+        {
+          "t0": 0,
+          "t1": 10,
+          "label": "shot"
+        }
+      ],
+      "plot": ""
+    },
+    "script": {
+      "fullText": "",
+      "lines": [],
+      "language": "zh"
+    },
+    "scriptStyle": {
+      "person": "unknown",
+      "tone": "unknown",
+      "sentenceStats": {},
+      "hookLines": []
+    },
+    "visual": {
+      "palette": "unknown",
+      "colorGrade": {},
+      "shots": [
+        {
+          "t0": 0,
+          "t1": 10,
+          "type": "unknown",
+          "motion": "unknown"
+        }
+      ],
+      "transitions": [],
+      "subtitleStyle": {}
+    },
+    "audio": {
+      "bgm": {
+        "style": "",
+        "bpm": null,
+        "segments": []
+      },
+      "sfx": [],
+      "voice": {
+        "gender": "unknown",
+        "speed": 1
+      }
+    },
+    "elements": {
+      "characters": [],
+      "props": [],
+      "brand": [],
+      "watermark": false
+    },
+    "platformParams": {
+      "aspect": "16:9",
+      "maxDurationSec": null
+    },
+    "replication": {
+      "level": "L0",
+      "mode": "structure"
+    }
+  },
+  "similarity": {
+    "score": 1,
+    "confidence": 0.5,
+    "metrics": {
+      "structure": 1,
+      "script": 1,
+      "style": 1,
+      "durationDeviation": 0
+    },
+    "passes": {
+      "structure": true,
+      "script": false,
+      "style": false,
+      "duration": true
+    },
+    "warnings": {
+      "verbatimScript": false,
+      "unmeasuredScript": true,
+      "degradedAssets": true
+    },
+    "grade": null,
+    "level": "L1",
+    "verdict": "needs_review",
+    "target": "P1",
+    "provenance": {
+      "structure": "measured",
+      "duration": "measured",
+      "script": "plan-constructive",
+      "style": "plan-constructive"
+    }
+  },
+  "artifacts": {
+    "media": {
+      "path": "D:\\Temp\\vc-dl-p4Ewv2\\video.mp4",
+      "sizeBytes": 991017,
+      "source": "url",
+      "url": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
+      "platform": null,
+      "format": "mov",
+      "durationSec": 10,
+      "width": 640,
+      "height": 360,
+      "fps": 30,
+      "hasAudio": false,
+      "ext": "mp4"
+    },
+    "analysis": {
+      "download": {
+        "ok": true,
+        "url": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4"
+      },
+      "scene": {
+        "method": "ffmpeg-scene",
+        "shotCount": 1
+      },
+      "asr": {
+        "status": "skipped"
+      },
+      "probe": {
+        "ok": true,
+        "durationSec": 10
+      },
+      "rewrite": {
+        "status": "kept"
+      }
+    },
+    "assets": {
+      "scenes": [
+        {
+          "index": 0,
+          "kind": "image",
+          "path": "D:\\Data\\projects\\Multi-Publish\\.ccg\\tasks\\video-clone-real-url-e2e\\run-output-mtn1iyop\\assets\\default\\img_0000.png",
+          "durationSec": 10,
+          "degraded": true,
+          "source": "ffmpeg-placeholder"
+        }
+      ],
+      "plan": [
+        {
+          "index": 0,
+          "t0": 0,
+          "t1": 10,
+          "durationSec": 10,
+          "kind": "image",
+          "promptSeed": "palette:unknown | tone:unknown | person:unknown | plot:"
+        }
+      ],
+      "level": "L1",
+      "degraded": true
+    },
+    "output": {
+      "path": "D:\\Data\\projects\\Multi-Publish\\.ccg\\tasks\\video-clone-real-url-e2e\\run-output-mtn1iyop\\clone.mp4",
+      "durationSec": 10,
+      "width": 640,
+      "height": 360,
+      "fps": 24,
+      "sizeBytes": 13965,
+      "probeOk": true,
+      "shots": [
+        {
+          "t0": 0,
+          "t1": 10
+        }
+      ],
+      "sceneMethod": "ffmpeg-scene"
+    }
+  },
+  "publishResult": {
+    "status": "skipped",
+    "reason": "no-publisher"
+  }
+}

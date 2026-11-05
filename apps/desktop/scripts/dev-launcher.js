@@ -48,8 +48,15 @@ function buildElectronArgs({ electronUserDataDir, electronCacheDir, desktopDir, 
  * 开发模式默认 userData 目录（固定 D 盘，避免 C 盘空间占用）。
  * 登录态（identity-session.json）与模型 key（multi-publish.db）都按 userData 隔离，
  * 固定默认目录可杜绝「随机临时目录 → 数据像丢失」的启动问题。
+ *
+ * 2026-10-24：原值 `D:\tmp\Multi-Publish-debug-profile` 落在 **tmp 目录**下 ——
+ * 「固定默认目录」这条初衷是对的，但选错了位置：D:\tmp 会被系统/工具的临时文件清理
+ * （含 AI 助手执行的清底板）整目录删除，且删除走命令行不进回收站，无法还原。
+ * 实测本机该目录在 10-23 被清空，应用 22:42 重新 first-run ⇒ 登录态、发布历史、
+ * 账号、授权缓存（identity-entitlement.json）全部归零。
+ * 现迁到与仓库同级的稳定目录，路径里不再出现 tmp/temp 字样。
  */
-const DEFAULT_USER_DATA_DIR = 'D:\\tmp\\Multi-Publish-debug-profile'
+const DEFAULT_USER_DATA_DIR = 'D:\\MulPub\\Multi-Publish-UserData'
 
 /**
  * 解析开发模式 userData 目录。

@@ -457,7 +457,17 @@ def _account_to_dict(a: dict) -> dict:
 def _request_subject(request: Request) -> str | None:
     auth = getattr(request.state, "auth", None)
     subject = auth.get("subject") if isinstance(auth, dict) else None
-    return subject if isinstance(subject, str) and subject else None
+    if isinstance(subject, str) and subject:
+        return subject
+    # 2026-10-26 本地版：身份服务关闭后没有 token，request.state.auth 恒为空，
+    # 而历史账号、登录态与凭据全部归属在某个 sub 下 ⇒ _is_owned_by 会把它们
+    # 全判成「不属于当前用户」，账号列表返回空。
+    # 这里用主进程注入的本地 owner 认领；它只是归属标识，不参与任何鉴权判定。
+    #
+    # ⚠️ 注意：本文件是**主仓**那份（启动脚本 PYTHON_BACKEND_DIR 指向 MP_MAIN），
+    # 与 mp-worktrees/mp-local-integration 下的同名文件需保持一致，否则本地版不生效。
+    local_owner = os.environ.get("MP_LOCAL_OWNER_SUBJECT", "").strip()
+    return local_owner or None
 
 
 def _require_authenticated_subject(request: Request) -> str | None:

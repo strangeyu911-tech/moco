@@ -22,6 +22,10 @@ const {
 // R28 修复：防止 macOS app.on('activate') 重复调用 createWindow 时
 // 重复注册 ipcMain.handle 导致 "Attempted to register a second handler" 崩溃
 const _ipcRegistrationState = { completed: false, pending: null }
+// 有意只增，且**必须**只增（R11 审计面已人工复核，结论登记在 openspec/records/risk-closeout.md；本注释不是豁免机制）：key 只来自下方 IPC_REGISTRAR_NAMES
+// 常量表（≤10 个，空间严格有界），作用是 R28 的幂等保护 —— 该表一旦被 clear()，
+// macOS activate 的二次 createWindow 就会重新注册同一批 handler 并当场崩溃。
+// 即「不清」不是疏漏，是这条保护本身的前提；表大小由代码常量决定，不随运行时间增长。
 const _completedIpcRegistrars = new Set()
 let _pendingWindowCreation = null
 const IPC_REGISTRAR_NAMES = [
@@ -198,6 +202,11 @@ function finishWindowInitialization(context, mainWindow) {
   webviewManager.setMainWindow(mainWindow)
   qrCodeLogin.setMainWindow(mainWindow)
   oauthManager.setMainWindow(mainWindow)
+  // OAuth 授权视图需跟随侧边栏宽度/折叠态重排：把它交给 WebviewManager 单向同步
+  // （2026-10-18 回归修复，此前它自己用默认 200px 布局，与折叠按钮不同步）
+  if (typeof webviewManager.setOAuthManager === 'function') {
+    webviewManager.setOAuthManager(oauthManager)
+  }
   commentManager.setGetMainWin(() => BrowserWindow.getAllWindows()[0])
   systemTray.init(mainWindow)
   hotkeys.register()
@@ -207,6 +216,13 @@ function finishWindowInitialization(context, mainWindow) {
     })
   } catch (e) {
     log.notify('window', 'autoupdater-init-failed', { level: 'WARN', error: String(e && e.message) })
+  }
+  // forced-update-gate：主窗访问器注入（阻断时 hide 主窗 / pass 时恢复）。
+  // 用 getAllWindows()[0] 同 commentManager.setGetMainWin 先例：窗口重建后引用自动跟随。
+  try {
+    require('./services/enforce-gate').setMainWindowFacade(() => BrowserWindow.getAllWindows()[0] || null)
+  } catch (e) {
+    log.notify('window', 'enforce-gate-facade-failed', { level: 'WARN', error: String(e && e.message) })
   }
   firstRun.runSetup(mainWindow)
   return mainWindow
@@ -256,7 +272,12 @@ function createWindow(context) {
     showMainWindow()
   }
   // 打包状态是窗口加载模式的唯一权威，生产包不能被残留开发信号降级到本地服务器。
-  const isDev = app.isPackaged === false
+  // MP_FORCE_PROD_RENDERER=1 是唯一的显式例外：未打包时也走 dist/index.html（生产渲染）。
+  // 只对「未打包」生效（isPackaged===true 时 isDev 恒为 false），因此不会把生产包降级到 dev server。
+  // 2026-10-21 恢复：window.js 曾移除该开关，导致 launch-prod.cjs（生产渲染）在未打包状态下
+  // 仍去连 5174 的 dev server；dev server 没起时窗口就是一片白（ERR_CONNECTION_REFUSED）。
+  const forceProdRenderer = process.env.MP_FORCE_PROD_RENDERER === '1'
+  const isDev = app.isPackaged === false && !forceProdRenderer
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!isAllowedMainWindowUrl(url)) {
       event.preventDefault()

@@ -11,10 +11,14 @@
     <!-- 内嵌主页壳态（PRD-TAB-INDEPENDENT-HOME F1）：+ 新标签中的独立 SPA 实例
          运行于 WebContentsView（仅覆盖内容矩形），外层窗口的 TabBar/NavBar/Sidebar
          已在其视野之外——本实例若再渲染一份会造成双份 chrome 视觉错乱，故只渲染
-         模块导航 + 工作区内容。 -->
+         工作区内容。 -->
+    <!-- PRD-UI-FLOW-CLARITY S1b：本分支原渲染「模块导航 + 工作区」。
+         模块导航已删除——它对该实例只提供「指向当前路由的自指 tab」或账号域 4 tab，
+         而账号域 tab 现由 Accounts.vue 页内 tablist 承担（Accounts.vue 渲染在本分支
+         的 router-view 内，页内 tab 同样生效）。壳态导航能力：
+         页内 tab（accounts 域）+ 主进程 home-shell-navigate 定向投递（App.vue 下方订阅）。 -->
     <template v-else-if="isHomeShell">
       <div class="mp-home-shell-root" data-testid="mp-home-shell">
-        <MpModuleNav />
         <main class="mp-workspace cohere-main" data-testid="mp-workspace">
           <RouteLoadError v-if="routeLoadError" v-bind="routeLoadError" @retry="retryRouteLoad" @refresh="refreshRouteLoad" />
           <router-view />
@@ -24,7 +28,10 @@
 
     <template v-else>
       <div class="mp-shell" data-testid="mp-shell">
-        <MpSidebar @open-settings="showSettingsDialog = true" />
+        <!-- 全局左侧菜单折叠（PRD-SIDEBAR-COLLAPSE-TOGGLE-2026-10-18）：
+             用 v-show 而不是 v-if —— 卸载会重建侧栏的 ResizeObserver / 运营菜单拉取 /
+             登录区状态，并在展开首帧闪出一次 0 宽；v-show 只隐藏不销毁。 -->
+        <MpSidebar v-show="!sidebarCollapsed" @open-settings="showSettingsDialog = true" />
         <div class="mp-shell-main">
           <!-- 浏览器式标签栏 -->
           <TabBar
@@ -56,8 +63,11 @@
             @navigate="onNavigate"
             @save-account="onSaveAccount"
           />
-          <!-- 模块导航（仅首页标签显示） -->
-          <MpModuleNav v-if="isHomeTab" />
+          <!-- 模块导航已删除（PRD-UI-FLOW-CLARITY S1b）：
+               原为 70px 外壳层，只渲染「指向当前页面的自指 tab」或账号域 4 tab。
+               账号域 tab 已由 Accounts.vue 页内 tablist 承担（S1a），
+               home 域是自指空壳、publish 域本就返回 []，故组件整体下线。
+               删除后页面顶部少一层，视觉基线需重建（QM-4）。 -->
           <!-- 主内容区 -->
           <main class="mp-workspace cohere-main" data-testid="mp-workspace">
             <RouteLoadError v-if="routeLoadError" v-bind="routeLoadError" @retry="retryRouteLoad" @refresh="refreshRouteLoad" />
@@ -90,7 +100,7 @@
 
 <script setup>
 import { getApi, invokePageManager } from '@/api/electron-bridge'
-import MpModuleNav from '@/layouts/MpModuleNav.vue'
+// PRD-UI-FLOW-CLARITY S1b：MpModuleNav 已删除（账号域 tab 改由 Accounts.vue 页内承担）
 import MpSidebar from '@/layouts/MpSidebar.vue'
 import TabBar from '@/components/TabBar.vue'
 import NavBar from '@/components/NavBar.vue'
@@ -114,6 +124,11 @@ import { useLicenseStore } from '@/stores/license'
 import { useIdentityStore } from '@/stores/identity'
 import { useTabStore } from '@/stores/tab'
 import { notifySettingsDialogClosed, settingsDialogRequest } from '@/stores/settings-dialog'
+import {
+  reportSidebarCollapsed,
+  sidebarCollapsed,
+  applyRemoteCollapsed,
+} from '@/stores/sidebar-collapse'
 import { isHomeShellSearch } from '@/utils/home-shell'
 import { suspendEmbeddedViewsForOverlay, releaseEmbeddedViewsForOverlay } from '@/composables/useEmbeddedViewSuspension'
 import { useTabDocumentTitle } from '@/composables/useTabDocumentTitle'
@@ -232,6 +247,10 @@ let unsubscribeHomeShellNav = null
 // getAllWindows()[0]（主窗口），home-shell（独立 WebContentsView）收不到，
 // 同一 renderer 内 App 只挂载一次（main.js createApp 单例），无双订阅。
 let unsubscribeDispatchFailed = null
+// 多窗口折叠状态同步（2026-10-18）：主进程是应用级唯一真源，任一窗口点击后它会
+// 重排全部内嵌视图并向每个窗口广播。本窗口若不跟上，DOM 侧栏还显示着却被原生
+// 视图盖住 ⇒ 侧栏看得见却点不动（点击错乱）。
+let unsubscribeSidebarCollapsed = null
 
 // 弹窗互斥（2026-09-23 Bug 修复）：浏览器/登录标签（外部网页 WebContentsView）活动时，
 // 原生图层永远压在渲染层 DOM 之上——设置弹窗打开后「屏幕闪一下但没出现」。
@@ -385,6 +404,9 @@ onMounted(() => {
   // 它是被标签系统管理的对象，而非管理者，不订阅 tab 事件、不驱动壳态互斥。
   if (!isHomeShell) {
     tabStore.init()
+    // 启动恢复折叠态：主进程默认展开；若用户上次退出时是收起态，这里补一次上报，
+    // 否则之后新建的浏览器/登录标签 WebContentsView 仍从 x=200 开始，左侧留死区。
+    reportSidebarCollapsed()
   }
   spaNav.attach()
 
@@ -402,6 +424,15 @@ onMounted(() => {
       if (typeof path === 'string' && path.charAt(0) === '/') {
         try { router.push(path) } catch (error) { console.warn('[home-shell] navigate failed', error) }
       }
+    })
+  }
+
+  // 多窗口折叠同步：主进程广播 → applyRemoteCollapsed（只改本地 ref，不持久化、不上报，
+  // 回环防护见 stores/sidebar-collapse.js）。preload 未暴露该方法（老版本）时静默跳过。
+  const pm = api && api.pageManager
+  if (pm && typeof pm.onSidebarCollapsedChanged === 'function') {
+    unsubscribeSidebarCollapsed = pm.onSidebarCollapsedChanged((collapsed) => {
+      applyRemoteCollapsed(collapsed)
     })
   }
 
@@ -432,6 +463,8 @@ onBeforeUnmount(() => {
   unsubscribeHomeShellNav = null
   if (typeof unsubscribeDispatchFailed === 'function') unsubscribeDispatchFailed()
   unsubscribeDispatchFailed = null
+  if (typeof unsubscribeSidebarCollapsed === 'function') unsubscribeSidebarCollapsed()
+  unsubscribeSidebarCollapsed = null
   if (!isHomeShell) tabStore.dispose()
   identityStore.dispose()
 })

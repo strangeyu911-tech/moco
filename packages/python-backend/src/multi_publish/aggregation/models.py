@@ -149,19 +149,38 @@ class CollectVideoRequest(BaseModel):
         return v
 
 
+class LlmOverride(BaseModel):
+    """请求级 LLM 运行时覆盖（桌面「模型设置」默认模型注入，2026-10-18）。
+
+    三字段均可选，缺省按字段回退进程环境变量（LLM_* > PO_OPENAI_*）。
+    ⚠️ api_key 是凭据：只允许用于构造适配器，**不得**写入任何日志/异常文案。
+    """
+    api_key: Optional[str] = Field(default=None, description="LLM API Key（仅用于调用适配器，禁止落日志）")
+    base_url: Optional[str] = Field(default=None, description="OpenAI 兼容 base_url")
+    model: Optional[str] = Field(default=None, description="文字推理模型 ID")
+
+
 class RewriteRequest(BaseModel):
     """改写请求"""
     content: str = Field(..., min_length=1, description="待改写内容（非空即可，无最小字数限制）")
     style: str = Field(default="轻松易懂", description="改写风格")
     length: str = Field(default="keep", description="长度控制: keep/compress/expand")
-    # 字数区间控制（2026-09-12）：默认 800-2000；显式传入时优先于 length 三档
-    min_word_count: int = Field(default=800, ge=0, le=5999, description="改写结果最小字数")
-    max_word_count: int = Field(default=2000, ge=1, le=6000, description="改写结果最大字数")
+    # 字数区间控制（2026-09-12）：默认 800-2000；显式传入时优先于 length 三档。
+    # rewrite-segment-and-finish-reason（2026-10-20）：上界与 JS 引擎 MAX_OUTPUT_CHARS
+    # 对齐（6000 → 50000，随 rewrite-limits-50000 放开）；真源在
+    # packages/rewrite-engine/src/rewrite-engine-core.js。
+    min_word_count: int = Field(default=800, ge=0, le=49999, description="改写结果最小字数")
+    max_word_count: int = Field(default=2000, ge=1, le=50000, description="改写结果最大字数")
     seo_optimize: bool = Field(default=False, description="SEO 优化")
     # v1.4：目标发布平台，透传给质量评估器做平台适配/CTA 等维度评分。
     # 取值与 ContentQualityEvaluator._PLATFORM_KEYWORDS 键一致：
     # 微信 / 抖音 / 小红书 / 知乎 / 微博 / B站 / 通用。
     platform: str = Field(default="通用", description="目标平台（微信/抖音/小红书/知乎/微博/B站/通用）")
+    # 桌面「模型设置」注入的默认文字推理模型（可选）：优先级 request.llm > env。
+    llm: Optional[LlmOverride] = Field(
+        default=None,
+        description="请求级 LLM 覆盖（桌面模型设置注入）；缺省字段回退环境变量",
+    )
 
     @field_validator("style")
     @classmethod

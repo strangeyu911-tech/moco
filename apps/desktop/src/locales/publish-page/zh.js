@@ -10,9 +10,17 @@ export default {
     noDrafts: '暂无草稿',
     draftsHint: '保存草稿后，可以从这里继续编辑。',
     continueEdit: '继续编辑',
+    // S1c：草稿箱卡片的唯一发布出口（原「继续编辑」与「发布」指向同一 URL，收敛为一个）
+    openDraftToPublish: '去发布',
     untitled: '无标题',
     updatedUnknown: '更新时间未知',
     platformCount: (ctx) => ctx.named('count') + ' 个平台',
+    // v2.0 机制 C1.3：平台数触顶提示。只播报、不改变选择；数值来自服务端 limits。
+    platformLimitReached: '当前档位最多选择 {limit} 个平台，升级后可继续添加',
+    platformLimitHint: '已选 {selected} / {limit} 个平台',
+    batchSizeExceeded: '当前档位单次最多批量 {limit} 条，升级后可提高上限',
+    cloudAccountLimitExceeded: '当前档位不提供云端账号同步，升级后可绑定 {limit} 个',
+    deviceLimitExceeded: '当前档位最多同时在 {limit} 台设备上登录',
     delete: '删除',
     publishTitle: '一键发布',
     batchSubtitle: '批量编辑多篇文章，各平台独立发布',
@@ -104,6 +112,28 @@ export default {
       alreadySelected: '该分组的 {count} 个账号已在选中集里',
       emptyGroup: '这个分组还没有成员',
       nothingToAdd: '「{name}」里的账号当前都不可用（已删除或已停用）',
+      selectedCount: '已选 {selected}/{total}',
+      },
+      // 全选 / 清空（publish-target-select-all，2026-10-17）：
+      // 全选的定义是「全选可发布的」——平台目录里大量平台当前没有任何可用账号
+      // （未登录 / 全部停用），全选它们会让提交校验以「请为<平台>选择至少一个账号」阻断，
+      // 那是用户点了全选反而发不出去。契约见 01-docs/PRD-PUBLISH-TARGET-SELECT-ALL-2026-10-17.md。
+      targetBulk: {
+      selectAll: '全选',
+      clearAll: '清空',
+      groupAria: '批量选择发布目标',
+      selectAllAria: '选中所有可发布的平台（{count} 个）',
+      selectAllDisabledTitle: '暂无可发布的平台，请先添加账号',
+      clearDisabledTitle: '当前没有选中的发布目标',
+      listRest: ' 等 {rest} 个',
+      /* 平台名之间的连接符。必须走 locale：纯函数里硬编码「、」时英文界面会渲染成
+         `Weibo、Zhihu and 2 more`（`--cjk` 只扫汉字，扫不到顿号 U+3001，所以当时没红）。 */
+      listSeparator: '、',
+      added: '已选中 {added} 个平台{skippedText}',
+      skipped: '，{count} 个平台没有可用账号，未纳入：{platforms}',
+      riskIncluded: '；其中 {count} 个已风控挂起，发布时会先被拦截',
+      alreadyAll: '已全部选中（{count} 个平台）',
+      cleared: '已清空发布目标',
       },
     accountSuffix: '账号',
     addArticle: '＋ 添加文章',
@@ -170,7 +200,8 @@ export default {
       blockedBucketAccount: '（本账号间隔）',
       blockedBucketPlatform: '（同平台其他账号间隔）',
       blockedBucketDaily: '（本账号每日上限）',
-      blockedClockAnomaly: '（时钟异常，等待已钳位）',
+      // 文案纪律（fix-clock-anomaly-copy）：用户侧不出现「异常/钳位」，且明确「无需处理」
+      blockedClockAnomaly: '（本机时间跳变，已自动缩短等待，无需处理）',
       blockedDailyQuota: (ctx) => '今日已达上限（' + ctx.named('used') + '/' + ctx.named('max') + '），将于明日 00:00 后自动继续',
       releasedNotSubmitted: '未提交到平台，已恢复可发布',
     },
@@ -201,6 +232,12 @@ export default {
     videoDescLabel: '视频描述',
     videoDescPlaceholder: '输入视频描述，简要介绍视频内容...',
     videoTitlePlaceholder: '输入视频标题',
+    // fix-hot-topics-genvideo-title（2026-10-17）：视频模式标题来源提示（三态）。
+    // 热门选题「生成视频 → 去发布」带入标题时，query 带 title_source/title_reason 说明来源；
+    // 无 title_source 时不渲染，图文模式忽略。
+    videoTitleFromAi: '标题由 AI 按爆款元素生成',
+    videoTitleFromTopicNoModel: '未配置文字推理模型，标题已使用原始选题',
+    videoTitleFromTopicFailed: 'AI 标题生成失败，标题已使用原始选题',
     extractCover: '从视频提取封面',
     aiGenerateCover: 'AI 生成封面',
     aiCoverPromptLabel: '封面描述',
@@ -300,7 +337,10 @@ export default {
     saveDraft: '💾 保存草稿',
     drafts: '📋 草稿箱',
     quickPublish: '🚀 一键发布',
-    createVideo: '🎬 创作视频',
+    // S2（PRD-UI-FLOW-CLARITY §14 裁决 #2）：该按钮点击后会**先静默保存一份草稿**
+    // 再跳转创作页。草稿本身有保留价值，故保留副作用，但必须在文案上明示，
+    // 否则用户会在草稿箱里发现一条"自己没存过"的草稿（§1.2 混淆点 #3）。
+    createVideo: '🎬 保存草稿并创作视频',
     createVideoEmpty: '内容为空，无法创作视频',
     cancelTasks: '取消任务',
     cancelledCount: (ctx) => '已取消 ' + ctx.named('count') + ' 个任务',
@@ -355,6 +395,13 @@ export default {
       publishFailed: '发布失败',
       publishFailedTitle: '发布失败',
       publishErrorTitle: '发布异常',
+      // 发布前闸门的「解法入口」链接文案（2026-10-19，publish-gate-help-ui）。
+      // 链接地址不在这里维护 —— 在 packages/shared-utils/src/publish-gate-help(.browser).js
+      // 的单一真源里（与引擎侧 helpUrl 同表，parity 测试钉住），这里只管文案。
+      gateHelp: {
+        accountNotVerified: '去头条号完善账号信息',
+        noPublishPermission: '去头条号完善账号信息',
+      },
       publishFailedProgress: (ctx) => '✗ 发布失败: ' + ctx.named('message'),
       publishErrorProgress: (ctx) => '✗ 错误: ' + ctx.named('message'),
       scheduleInvalidProgress: (ctx) => '✗ ' + ctx.named('message'),

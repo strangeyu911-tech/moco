@@ -74,12 +74,37 @@ describe('CollectedResultsList 卡片操作分级', () => {
     const cards = w.findAll('.cohere-card')
     expect(cards.length).toBe(2)
     const cls = (id) => w.find(`[data-testid="result-${id}-a"]`).classes().join(' ')
-    expect(cls('draft')).toContain('is-primary')
-    expect(cls('publish')).toContain('is-primary')
-    expect(cls('view')).not.toContain('is-primary')
-    expect(cls('video')).not.toContain('is-primary')
+    // 2026-10-17 collection-page-ui-ue-refine：`is-primary` 是全仓零样式定义的**死类**
+    // （分级在视觉上完全不成立），统一改为 col-btn--primary；「该类真有定义」由
+    // collection-page-css-contract.test.js 的「消费⇒有定义」判据看守。
+    expect(cls('draft')).toContain('col-btn--primary')
+    expect(cls('publish')).toContain('col-btn--primary')
+    expect(cls('view')).not.toContain('col-btn--primary')
+    expect(cls('video')).not.toContain('col-btn--primary')
+    // 死类不得复辟
+    for (const id of ['draft', 'publish', 'view', 'video']) {
+      expect(cls(id), `${id} 不得再用死类 is-primary`).not.toContain('is-primary')
+      expect(cls(id), `${id} 不得再用死类 primary`).not.toMatch(/(^|\s)primary(\s|$)/)
+    }
     expect(w.find('[data-testid="batch-item-check-a"]').exists()).toBe(true)
     expect(w.find('[data-testid="batch-item-check-b"]').exists()).toBe(true)
+  })
+
+  it('primary 档按钮在规范层有真实样式定义（不是死类占位）', () => {
+    // 上一条只证明「class 名对」；这一条证明「class 名有样式」——
+    // 正是 is-primary 缺陷的盲区（原测试只断类名、不断定义，所以分级失效三年没人发现）。
+    const { readFileSync } = require('node:fs')
+    const { join } = require('node:path')
+    const pageCss = readFileSync(join(process.cwd(), 'src/features/collection/collection-page.css'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const primaryBody = /\.col-btn--primary\s*\{([^}]*)\}/.exec(pageCss)
+    const secondaryBody = /\.col-btn--secondary\s*\{([^}]*)\}/.exec(pageCss)
+    expect(primaryBody, 'col-btn--primary 应在规范层有定义').toBeTruthy()
+    expect(secondaryBody, 'col-btn--secondary 应在规范层有定义').toBeTruthy()
+    // primary 与 secondary 的声明必须真的不同（否则分级仍是假的）
+    expect(primaryBody[1].trim()).not.toBe(secondaryBody[1].trim())
+    expect(primaryBody[1]).toMatch(/background/)
+    expect(secondaryBody[1]).toMatch(/border/)
   })
 })
 
@@ -103,5 +128,30 @@ describe('CollectedResultsList 批量操作条', () => {
     const w = mountList()
     await w.find('[data-testid="batch-select-all"]').setValue(true)
     expect(w.emitted('toggleSelectAll')[0][0]).toBe(true)
+  })
+
+  // ── 结果区可点性与改写失败可诊断（2026-10-17，change: collected-results-fix）──
+  it('点卡片内容/图标 = 选中该条（emit select）——修「有链接光标但没反应」', async () => {
+    const w = mountList()
+    await w.find('[data-testid="card-info-a"]').trigger('click')
+    expect(w.emitted('select')[0][0]).toMatchObject({ id: 'a' })
+    await w.find('[data-testid="card-icon-b"]').trigger('click')
+    expect(w.emitted('select')[1][0]).toMatchObject({ id: 'b' })
+  })
+
+  it('改写失败徽标带原因（rewriteError 内联 + title 悬停），改写成功徽标不带', () => {
+    const w = mountList({
+      items: [
+        item('f', { rewriteFailed: true, rewriteError: 'connect ECONNREFUSED 127.0.0.1:8010' }),
+        item('s', { rewrittenContent: '改写后的文字' }),
+      ],
+    })
+    const fail = w.find('[data-testid="badge-rewrite-failed-f"]')
+    expect(fail.exists()).toBe(true)
+    expect(fail.text()).toContain('改写失败')
+    expect(fail.text()).toContain('ECONNREFUSED')
+    expect(fail.attributes('title')).toContain('ECONNREFUSED')
+    // 成功条目不得带失败徽标（防旧数据误标）
+    expect(w.find('[data-testid="badge-rewrite-failed-s"]').exists()).toBe(false)
   })
 })

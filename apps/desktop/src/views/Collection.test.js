@@ -167,6 +167,8 @@ describe("CollectionView", () => {
 
   // 2026-10-12：素材来源入口改走 PLATFORM_SOURCE_URLS（语义「去哪找素材」），
   // 不再用 PLATFORM_DASHBOARD_URLS（创作者后台/发布目的地，且被登录态校验复用）。
+  // 2026-10-17：知乎（强制登录）/ 头条（JSON 接口）两个入口换为免登录渲染页，
+  // 断言改为对 baidu 取证，避免只测一条仍然通过而漏掉另一条的退化。
   it("openCollection opens a tab via pageManager with the SOURCE url", async () => {
     const { PLATFORM_SOURCE_URLS, PLATFORM_DASHBOARD_URLS } = await import("@multi-publish/shared-utils/src/platform-definitions");
     window.electronAPI = {
@@ -176,14 +178,27 @@ describe("CollectionView", () => {
     };
     const w = mountCollection();
     await nextTick();
-    await w.vm.openCollection("weibo");
+    await w.vm.openCollection("baidu");
     expect(window.electronAPI.pageManager.createNewTabPage).toHaveBeenCalledWith(
-      expect.objectContaining({ url: PLATFORM_SOURCE_URLS.weibo, platform: "weibo" })
+      expect.objectContaining({ url: PLATFORM_SOURCE_URLS.baidu, platform: "baidu" })
     );
     const { ElMessage } = await import("element-plus");
     expect(ElMessage.success).toHaveBeenCalled();
     // 语义独立锁：素材来源不得再指向创作者后台（头条那条曾是明确的分类错误）
     expect(PLATFORM_SOURCE_URLS.toutiao).not.toBe(PLATFORM_DASHBOARD_URLS.toutiao);
+  });
+
+  // 结构锁（2026-10-17）：模板里三张卡的来源 id 必须与 PLATFORM_SOURCE_URLS 的键逐一对齐。
+  // 只改字典不改模板 = 死按钮；只改模板不改字典 = 点开即告警。两边一起看才锁得住。
+  it("素材来源卡片与来源表逐一对齐（无知乎、无 JSON 入口）", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const src = readFileSync(join(process.cwd(), "src/views/Collection.vue"), "utf8");
+    for (const id of ["weibo", "baidu", "toutiao"]) {
+      expect(src).toContain(`openCollection('${id}')`);
+    }
+    expect(src).not.toContain("openCollection('zhihu')");
+    expect(src).not.toContain("sourceZhihu");
   });
 
   it("openCollection warns and skips when platform has no source URL", async () => {
@@ -200,56 +215,28 @@ describe("CollectionView", () => {
     expect(ElMessage.warning).toHaveBeenCalled();
   });
 
-  it("editDraft navigates to publish", async () => {
+  // S1c：均一的 editDraft / goPublish 两个入口已删除 ——
+  // 它们实现完全相同（都 push `/publish?draft=<id>`），是规则 1 下的重复标签；
+  // 收敛后由 /publish?tab=drafts 整页的单一「去发布」按钮承担。
+  it("drafts 的编辑/发布入口不再存在于采集页（收敛到整页草稿箱）", async () => {
     const w = mountCollection();
     await nextTick();
-    await w.vm.editDraft({ id: "d1" });
-    expect(pushSpy).toHaveBeenCalledWith("/publish?draft=d1");
+    expect(w.vm.editDraft).toBeUndefined();
+    expect(w.vm.goPublish).toBeUndefined();
   });
 
-  it("goPublish navigates to publish", async () => {
-    const w = mountCollection();
-    await nextTick();
-    await w.vm.goPublish({ id: "d2" });
-    expect(pushSpy).toHaveBeenCalledWith("/publish?draft=d2");
-  });
-
-  // 删除由草稿箱面板内的 CollectionDraftsPanel 承担（collect tab 不再有独立删除入口），
-  // 行为契约见 composables/useCollectionDrafts.test.js 的删除三例。
-  it("drafts deletion lives in the drafts panel, not in collect tab", async () => {
-    const { ElMessageBox } = await import("element-plus");
-    ElMessageBox.confirm.mockResolvedValue(undefined);
-    const draftDelete = vi.fn().mockResolvedValue({ code: 0, data: true });
+  // S1c：草稿删除能力随 CollectionDraftsPanel 一并迁到整页草稿箱，
+  // 采集页不再有任何草稿删除入口。删除行为契约见
+  // composables/useCollectionDrafts.test.js 的删除三例 + Publish.test.js 整页草稿箱。
+  it("采集页不再有草稿删除入口", async () => {
     window.electronAPI = {
-      draftDelete,
+      draftDelete: vi.fn(),
       draftList: vi.fn().mockResolvedValue({ code: 0, data: [{ id: "d1", title: "待删" }] }),
     };
     const w = mountCollection();
     await nextTick();
-    await w.find('[data-testid="collection-tab-drafts"]').trigger("click");
     await flushPromises();
-    await w.find('[data-testid="draft-delete"]').trigger("click");
-    await flushPromises();
-    expect(draftDelete).toHaveBeenCalledWith("d1");
-    const { ElMessage } = await import("element-plus");
-    expect(ElMessage.success).toHaveBeenCalled();
-  });
-
-  it("drafts panel delete does nothing on cancel", async () => {
-    const { ElMessageBox } = await import("element-plus");
-    ElMessageBox.confirm.mockRejectedValue(new Error("canceled"));
-    const draftDelete = vi.fn();
-    window.electronAPI = {
-      draftDelete,
-      draftList: vi.fn().mockResolvedValue({ code: 0, data: [{ id: "d1", title: "保留" }] }),
-    };
-    const w = mountCollection();
-    await nextTick();
-    await w.find('[data-testid="collection-tab-drafts"]').trigger("click");
-    await flushPromises();
-    await w.find('[data-testid="draft-delete"]').trigger("click");
-    await flushPromises();
-    expect(draftDelete).not.toHaveBeenCalled();
+    expect(w.find('[data-testid="draft-delete"]').exists()).toBe(false);
   });
 
   it("collectUrl warns if no urlCollectFetch API", async () => {
@@ -301,6 +288,38 @@ describe("CollectionView", () => {
     expect(ElMessage.error).toHaveBeenCalledWith("collection failed");
   });
 
+  // ── 结果区「点了没反应」修复（2026-10-17，change: collected-results-fix）──
+  it("selectCollectedItem 选中该条并把详情框滚进视口（scrollIntoView + 高亮类）", async () => {
+    window.electronAPI = {};
+    const w = mountCollection();
+    await nextTick();
+    // 桩详情框锚（组件按 id 找；jsdom 无真实布局，断言 scrollIntoView 被调 + flash 类被加）
+    const scrollSpy = vi.fn();
+    const box = document.createElement("div");
+    box.id = "collected-result-box";
+    Object.defineProperty(box, "offsetWidth", { value: 10 });
+    box.scrollIntoView = scrollSpy;
+    document.body.appendChild(box);
+    const item = { id: "x", title: "T", content: "c" };
+    w.vm.selectCollectedItem(item);
+    await nextTick();
+    await nextTick();
+    expect(w.vm.collectedResult).toStrictEqual(item);
+    expect(scrollSpy).toHaveBeenCalled();
+    expect(box.classList.contains("col-result-box--flash")).toBe(true);
+    box.remove();
+  });
+
+  it("CollectedResultsList 的 @select 绑定的是 selectCollectedItem（不只是赋值）", async () => {
+    // 结构锁：防止将来有人把 @select 改回 "collectedResult = $event" 而失去滚动反馈
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const src = readFileSync(join(process.cwd(), "src/views/Collection.vue"), "utf8");
+    expect(src).toContain('@select="selectCollectedItem"');
+    expect(src).not.toContain('@select="collectedResult = $event"');
+    expect(src).toContain('data-testid="collected-result-box"');
+  });
+
   it("collectUrl 反爬安全验证页 → 回退 urlCollectFetch 而非误报成功", async () => {
     // 2026-09-29 起百家号链接先走视频通道（无视频回退 stealth），不再经聚合层；
     // 本回归用通用文章站点验证「安全验证页不得当成功」的语义仍然成立
@@ -335,7 +354,10 @@ describe("CollectionView", () => {
     function mockStealthApi() {
       return {
         aggregationCollect: vi.fn(), // 必须未被调用（裸连会触发风控）
-        aggregationRewrite: vi.fn().mockResolvedValue({ result_content: "改写后的内容。" }),
+        // 2026-10-18：stealth 分支自动改写改走桌面改写引擎（读「模型设置」的默认文字推理模型），
+        // 不再调 Python aggregationRewrite（它只读环境变量，必然误报 LLM_KEY_MISSING）。
+        aiRewrite: vi.fn().mockResolvedValue({ code: 0, data: { success: true, result: "改写后的内容。" } }),
+        aggregationRewrite: vi.fn(),
         urlCollectNeedsStealth: vi.fn().mockResolvedValue({
           code: 0,
           data: { needsStealth: true },
@@ -360,7 +382,7 @@ describe("CollectionView", () => {
       expect(w.vm.collectedResult.title).toBe("知乎回答标题");
     });
 
-    it("collectAndRewrite：知乎链接采集走 stealth，改写正常触发", async () => {
+    it("collectAndRewrite：知乎链接采集走 stealth，改写走桌面引擎（读模型设置）", async () => {
       window.electronAPI = mockStealthApi();
       const w = mountCollection();
       await nextTick();
@@ -370,9 +392,148 @@ describe("CollectionView", () => {
       expect(window.electronAPI.urlCollectFetch).toHaveBeenCalledWith(ZHIHU_ANSWER_URL);
       expect(w.vm.collectedResult.title).toBe("知乎回答标题");
       expect(w.vm.rewriteResult).toBe("改写后的内容。");
-      expect(window.electronAPI.aggregationRewrite).toHaveBeenCalledWith(
+      // 回归锁（2026-10-18）：stealth 分支必须走读取「模型设置」的 aiRewrite，
+      // 不得回退到只读环境变量的 Python aggregationRewrite。
+      expect(window.electronAPI.aiRewrite).toHaveBeenCalledWith(
         expect.objectContaining({ content: expect.stringContaining("知乎回答正文内容") })
       );
+      expect(window.electronAPI.aggregationRewrite).not.toHaveBeenCalled();
+    });
+
+    it("stealth 返回「百度安全验证」页 → 不入库、不触发改写、给出 security_challenge 文案", async () => {
+      const api = mockStealthApi();
+      api.urlCollectFetch = vi.fn().mockResolvedValue({
+        code: 0,
+        data: {
+          title: "百度安全验证",
+          content: "百度安全验证\n请完成下方验证后继续操作\n拖动左侧滑块使图片为正\n扫码验证| 意见反馈 |刷新",
+        },
+      });
+      window.electronAPI = api;
+      const w = mountCollection();
+      await nextTick();
+      w.vm.linkUrl = ZHIHU_ANSWER_URL;
+      await w.vm.collectAndRewrite();
+      // 验证页不是正文：绝不入库、绝不进入改写
+      expect(w.vm.collectedResult).toBe(null);
+      expect(w.vm.collectedItems.length).toBe(0);
+      expect(w.vm.collectError.reason).toBe("security_challenge");
+      expect(w.vm.collectErrorDetail).toContain("安全验证");
+      expect(api.aiRewrite).not.toHaveBeenCalled();
+      expect(api.aggregationRewrite).not.toHaveBeenCalled();
+    });
+
+    it("验证页文字命中 persistDraft 守卫 → 不创建草稿、不跳发布页", async () => {
+      const draftSave = vi.fn();
+      window.electronAPI = { draftSave, draftList: vi.fn().mockResolvedValue({ code: 0, data: [] }) };
+      const w = mountCollection();
+      await nextTick();
+      const verificationItem = {
+        id: "v1",
+        title: "百度安全验证",
+        content: "请完成下方验证后继续操作\n拖动左侧滑块使图片为正",
+        source: "url",
+      };
+      await w.vm.goPublishFromItem(verificationItem);
+      expect(draftSave).not.toHaveBeenCalled();
+      expect(pushSpy).not.toHaveBeenCalled();
+    });
+
+    // ─── 2026-10-18 空正文改写守卫（fix-collect-rewrite-empty-content）───
+    // 事故链：内容缓存命中返回空壳 {title:'',content:''}（url-collector.js cache_hit），
+    // 「一键改写」拿空串当改写入参 → 旧后端 min_length=1 报 422「Python backend request
+    // failed」，文案毫无指向性；新代码走桌面引擎虽不会 422，但同样会把空内容发出去。
+    // 判据：改写漏斗 rewriteViaEngine 一律判空（trim），空内容返回稳定错误码
+    // AGGREGATION_CONTENT_EMPTY，且绝不调用 aiRewrite。
+    describe("空正文改写守卫（rewriteViaEngine 漏斗判空）", () => {
+      it("空串 → 不调 aiRewrite，返回 AGGREGATION_CONTENT_EMPTY 错误信封", async () => {
+        window.electronAPI = mockStealthApi();
+        const w = mountCollection();
+        await nextTick();
+        const r = await w.vm.rewriteViaEngine("");
+        expect(window.electronAPI.aiRewrite).not.toHaveBeenCalled();
+        expect(r).not.toBe(null);
+        expect(r.__error).toBeTruthy();
+        expect(r.__error.errorCode).toBe("AGGREGATION_CONTENT_EMPTY");
+        expect(r.__error.code).toBe(-400);
+      });
+
+      it("纯空白（空格/换行/制表）同样拦截 —— 不得把不可见字符当正文", async () => {
+        window.electronAPI = mockStealthApi();
+        const w = mountCollection();
+        await nextTick();
+        const r = await w.vm.rewriteViaEngine("  \n\t  ");
+        expect(window.electronAPI.aiRewrite).not.toHaveBeenCalled();
+        expect(r.__error.errorCode).toBe("AGGREGATION_CONTENT_EMPTY");
+      });
+
+      it("collectAndRewrite：缓存空壳（content 为空）→ 提示空内容文案，不改写", async () => {
+        const api = mockStealthApi();
+        // 复现事故形态：cache_hit 空壳 —— title/content 均为空串
+        api.urlCollectFetch = vi.fn().mockResolvedValue({
+          code: 0,
+          data: { success: true, reason: "cache_hit", title: "", content: "" },
+        });
+        window.electronAPI = api;
+        const w = mountCollection();
+        await nextTick();
+        w.vm.linkUrl = ZHIHU_ANSWER_URL;
+        await w.vm.collectAndRewrite();
+        expect(api.aiRewrite).not.toHaveBeenCalled();
+        expect(api.aggregationRewrite).not.toHaveBeenCalled();
+        expect(w.vm.rewriteResult).toBe("");
+        expect(w.vm.rewriteError).toBeTruthy();
+        expect(w.vm.rewriteError.message).toContain("采集");
+        expect(w.vm.rewriteErrorDetail || w.vm.rewriteError.message).toContain("改写");
+      });
+
+      it("正常内容不受影响（回归：守卫不得误杀）", async () => {
+        window.electronAPI = mockStealthApi();
+        const w = mountCollection();
+        await nextTick();
+        const r = await w.vm.rewriteViaEngine("这是一段长度足够的正常正文内容。");
+        expect(window.electronAPI.aiRewrite).toHaveBeenCalled();
+        expect(r.result_content).toBe("改写后的内容。");
+      });
+    });
+
+    // QM-6 外部评审 P3（2026-10-18）：abortIfVerificationPage 写入的 `reason` 必须被
+    // collectErrorDetail/collectErrorRetryable 消费；否则分类器只拿到 message 字符串，
+    // en 文案不含中文关键词时会退化为 collectErrors.unknown。
+    it("collectErrorDetail 优先采信结构化 reason（message 不含中文关键词也不退化 unknown）", async () => {
+      const w = mountCollection();
+      await nextTick();
+      w.vm.collectError = {
+        code: -1,
+        reason: "security_challenge",
+        message: "The target page triggered a security check",
+      };
+      expect(w.vm.collectErrorDetail).toContain("安全验证");
+      expect(w.vm.collectErrorDetail).not.toContain("原因未识别");
+      expect(w.vm.collectErrorRetryable).toBe(true);
+    });
+
+    it("urlCollectFetch 失败信封的 data.reason 会进入 collectError（结构化分类不丢）", async () => {
+      window.electronAPI = {
+        urlCollectNeedsStealth: vi.fn().mockResolvedValue({ code: 0, data: { needsStealth: true } }),
+        urlCollectFetch: vi.fn().mockResolvedValue({
+          code: -1,
+          message: "采集失败: 目标站点返回安全验证页",
+          data: {
+            success: false,
+            reason: "security_challenge",
+            error: "目标站点返回安全验证页（百度安全验证），请稍后再试或先在浏览器中完成验证",
+          },
+        }),
+      };
+      const w = mountCollection();
+      await nextTick();
+      // 用非视频平台 URL，避免先进入视频采集通道（百家号 /s 属视频平台路由）
+      w.vm.linkUrl = "https://www.sohu.com/a/123";
+      await w.vm.collectUrl();
+      expect(w.vm.collectError.reason).toBe("security_challenge");
+      expect(w.vm.collectedItems.length).toBe(0);
+      expect(w.vm.collectErrorDetail).toContain("安全验证");
     });
 
     it("stealth 采集失败 → 显示错误，不回退裸连", async () => {
@@ -940,48 +1101,26 @@ describe("CollectionView", () => {
     expect(draftSave).not.toHaveBeenCalled();
   });
 
-  // 草稿列表已移入「草稿箱」页签（CollectionDraftsPanel），采集页 collect tab 不再内嵌一份。
-  it("collect tab no longer renders an inline drafts section", async () => {
+  // S1c：草稿箱整页迁出采集页。页内不再渲染草稿列表（第 4 处 UI 已删除），
+  // 点击「草稿箱」页签改为 router.push('/publish?tab=drafts')。
+  it("collect tab no longer renders any inline drafts section", async () => {
     const w = mountCollection();
     await new Promise(r => setTimeout(r, 0));
     await nextTick();
     expect(w.find('[data-testid="collection-drafts-empty"]').exists()).toBe(false);
     expect(w.find('[data-testid="collection-drafts-panel"]').exists()).toBe(false);
+    expect(w.find('[data-testid="collection-drafts-list"]').exists()).toBe(false);
   });
 
-  it("switching to the drafts tab renders the drafts panel", async () => {
-    window.electronAPI = {
-      draftList: vi.fn().mockResolvedValue({ code: 0, data: [
-        { id: "d1", title: "Saved Draft", content: "hello", createdAt: "2026-07-05T10:00:00.000Z" },
-      ] }),
-    };
+  it("clicking the drafts tab navigates to the single whole-page drafts view", async () => {
+    pushSpy.mockClear();
     const w = mountCollection();
     await nextTick();
     await w.find('[data-testid="collection-tab-drafts"]').trigger("click");
     await flushPromises();
-    expect(w.find('[data-testid="collection-drafts-panel"]').exists()).toBe(true);
-    expect(w.find('[data-testid="collection-draft-d1"]').exists()).toBe(true);
-    expect(w.text()).toContain("Saved Draft");
-  });
-
-  it("drafts tab shows empty state when there are no drafts", async () => {
-    window.electronAPI = { draftList: vi.fn().mockResolvedValue({ code: 0, data: [] }) };
-    const w = mountCollection();
-    await nextTick();
-    await w.find('[data-testid="collection-tab-drafts"]').trigger("click");
-    await flushPromises();
-    expect(w.find('[data-testid="collection-drafts-empty"]').exists()).toBe(true);
-  });
-
-  it("drafts tab shows load error instead of pretending empty", async () => {
-    window.electronAPI = { draftList: vi.fn().mockResolvedValue({ code: -1, message: "存储不可用" }) };
-    const w = mountCollection();
-    await nextTick();
-    await w.find('[data-testid="collection-tab-drafts"]').trigger("click");
-    await flushPromises();
-    // 读取失败必须可见，不得伪装成「暂无草稿」
-    expect(w.find('[data-testid="drafts-load-error"]').exists()).toBe(true);
-    expect(w.find('[data-testid="collection-drafts-empty"]').exists()).toBe(false);
+    expect(pushSpy).toHaveBeenCalledWith("/publish?tab=drafts");
+    // 不得在本页渲染列表（原 CollectionDraftsPanel 已删除）
+    expect(w.find('[data-testid="collection-drafts-panel"]').exists()).toBe(false);
   });
 
   it("collectedItems accumulates after collectUrl", async () => {
